@@ -1,0 +1,26 @@
+[package]
+name = "fez-mesh-controller-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "fez-mesh-controller daemon service: connects to the MeshCore node and broadcasts state over IPC"
+
+[[bin]]
+name = "fez-mesh-controller-daemon"
+path = "src/main.rs"
+
+[dependencies]
+fez-mesh-controller-core = { workspace = true }
+meshcore-rs = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures = { workspace = true }
+tokio-util = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+
+tracing-appender = "0.2"
+daemonize = "0.5"

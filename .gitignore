@@ -1,0 +1,30 @@
+/target
+
+# Rust IDEs
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+*.code-workspace
+.vim/
+.helix/
+*.swp
+*.swo
+
+# rust-analyzer / RustRover local settings
+rust-project.json
+.rustc_info.json
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.DocumentRevisions-V100
+.TemporaryItems
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent

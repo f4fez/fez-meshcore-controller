@@ -1,0 +1,21 @@
+[package]
+name = "fez-mesh-controller-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared library (config, IPC protocol, MeshCore client) for fez-mesh-controller"
+
+[lib]
+name = "fez_mesh_controller_core"
+path = "src/lib.rs"
+
+[dependencies]
+meshcore-rs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+dirs = { workspace = true }
+futures = { workspace = true }
+chrono = { workspace = true }

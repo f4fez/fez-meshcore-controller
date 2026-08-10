@@ -1,0 +1,29 @@
+[package]
+name = "fez-mesh-controller-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "fez-mesh-controller CLI/TUI: setup wizard and real-time dashboard"
+
+[[bin]]
+name = "fez-mesh-controller"
+path = "src/main.rs"
+
+[dependencies]
+fez-mesh-controller-core = { workspace = true }
+meshcore-rs = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+futures = { workspace = true }
+tokio-util = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+
+clap = { workspace = true }
+dialoguer = "0.11"
+console = "0.15"
+indicatif = "0.17"
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+serialport = "4"
+names = { version = "0.14", default-features = false }
