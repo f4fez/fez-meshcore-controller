@@ -82,6 +82,10 @@ pub async fn run(existing: Option<&Config>) -> anyhow::Result<Config> {
         .map(|c| c.daemon.log_dir.clone())
         .unwrap_or_else(fez_mesh_controller_core::config::default_log_dir);
 
+    let managed_repeaters = existing
+        .map(|c| c.managed_repeaters.clone())
+        .unwrap_or_default();
+
     let config = Config {
         node_label,
         connection,
@@ -91,6 +95,7 @@ pub async fn run(existing: Option<&Config>) -> anyhow::Result<Config> {
             log_level,
             log_dir,
         },
+        managed_repeaters,
     };
 
     println!();

@@ -31,3 +31,9 @@ clap = { version = "4", features = ["derive"] }
 opt-level = 3
 lto = true
 strip = true
+
+# Temporary: use the local meshcore-rs checkout (with the RawData/LogData
+# decoding and tokio feature trim from PR #59) instead of the published
+# crates.io version, until it's merged and released.
+[patch.crates-io]
+meshcore-rs = { path = "../meshcore-rs" }

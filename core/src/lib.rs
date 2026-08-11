@@ -25,5 +25,5 @@ pub mod error;
 pub mod ipc;
 pub mod mesh;
 
-pub use config::{Config, ConnectionConfig, DaemonConfig};
+pub use config::{Config, ConnectionConfig, DaemonConfig, ManagedRepeater};
 pub use error::{Error, Result};

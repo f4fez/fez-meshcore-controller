@@ -82,13 +82,27 @@ async fn run_loop(
             Some(Ok(event)) = term_events.next() => {
                 if let Event::Key(key) = event {
                     if key.kind == KeyEventKind::Press {
+                        // Any key other than a repeated `d` cancels a pending
+                        // delete confirmation, so it can never be confirmed
+                        // against a contact the user has since moved away from.
+                        if !matches!(key.code, KeyCode::Char('d')) {
+                            app.pending_delete = None;
+                        }
+
                         match key.code {
                             KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
                             KeyCode::Char('r') => {
+                                app.last_status = None;
                                 let _ = cmd_tx.send(ClientMessage::RequestSnapshot).await;
                             }
                             KeyCode::Down => app.select_next_contact(),
                             KeyCode::Up => app.select_prev_contact(),
+                            KeyCode::Char('m') => {
+                                toggle_managed(app, cmd_tx).await;
+                            }
+                            KeyCode::Char('d') => {
+                                confirm_or_arm_delete(app, cmd_tx).await;
+                            }
                             _ => {}
                         }
                     }
@@ -98,6 +112,61 @@ async fn run_loop(
 
         if app.should_quit {
             return Ok(());
+        }
+    }
+}
+
+/// Handles an `m` key press: asks the daemon to add or remove the selected
+/// contact from the managed-repeater list. If it isn't already registered
+/// in the companion, the daemon registers it first — a managed repeater is
+/// always registered — using the full public key resolved from RF log
+/// data; this can fail if the repeater hasn't been heard yet.
+async fn toggle_managed(app: &mut App, cmd_tx: &mpsc::Sender<ClientMessage>) {
+    let Some((prefix, name, managed)) = app
+        .selected_contact()
+        .map(|c| (c.public_key_prefix_hex.clone(), c.name.clone(), !c.managed))
+    else {
+        app.last_status = Some("No contact selected".to_string());
+        return;
+    };
+
+    app.last_status = Some(if managed {
+        format!("🛰️  Marking {name} as managed…")
+    } else {
+        format!("🛰️  Unmarking {name}…")
+    });
+
+    let _ = cmd_tx
+        .send(ClientMessage::SetManagedRepeater {
+            public_key_prefix_hex: prefix,
+            name,
+            managed,
+        })
+        .await;
+}
+
+/// Handles a `d` key press: arms a delete confirmation for the selected
+/// contact, or, if already armed for that same contact, confirms it and
+/// sends the removal request to the daemon.
+async fn confirm_or_arm_delete(app: &mut App, cmd_tx: &mpsc::Sender<ClientMessage>) {
+    let selected = app
+        .selected_contact()
+        .map(|c| (c.public_key_prefix_hex.clone(), c.name.clone()));
+
+    match (app.pending_delete.take(), selected) {
+        (Some((armed_prefix, _)), Some((prefix, name))) if armed_prefix == prefix => {
+            app.last_status = Some(format!("🗑️  Removing {name}…"));
+            let _ = cmd_tx
+                .send(ClientMessage::RemoveContact {
+                    public_key_prefix_hex: prefix,
+                })
+                .await;
+        }
+        (_, Some((prefix, name))) => {
+            app.pending_delete = Some((prefix, name));
+        }
+        (_, None) => {
+            app.last_status = Some("No contact selected".to_string());
         }
     }
 }

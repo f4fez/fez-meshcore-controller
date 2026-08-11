@@ -15,6 +15,7 @@
 use std::collections::VecDeque;
 
 use fez_mesh_controller_core::ipc::{MeshEvent, Snapshot};
+use fez_mesh_controller_core::mesh::ContactDto;
 
 pub const MAX_EVENTS: usize = 200;
 
@@ -26,6 +27,10 @@ pub struct App {
     pub should_quit: bool,
     pub last_status: Option<String>,
     pub contacts_state: ratatui::widgets::TableState,
+    /// Set when the user has pressed the delete key once for the given
+    /// contact (public key prefix, name); a second press confirms. Cleared
+    /// by any other key press.
+    pub pending_delete: Option<(String, String)>,
 }
 
 impl App {
@@ -37,7 +42,22 @@ impl App {
             should_quit: false,
             last_status: None,
             contacts_state: ratatui::widgets::TableState::default(),
+            pending_delete: None,
         }
+    }
+
+    /// Contacts sorted the way they're displayed (most recently seen
+    /// first), so table row indices line up with selection/action logic.
+    pub fn sorted_contacts(&self) -> Vec<&ContactDto> {
+        let mut contacts: Vec<&ContactDto> = self.snapshot.contacts.iter().collect();
+        contacts.sort_by(|a, b| b.last_advert_unix.cmp(&a.last_advert_unix));
+        contacts
+    }
+
+    /// The currently-selected contact in the (sorted) table, if any.
+    pub fn selected_contact(&self) -> Option<&ContactDto> {
+        let index = self.contacts_state.selected()?;
+        self.sorted_contacts().get(index).copied()
     }
 
     pub fn push_event(&mut self, event: MeshEvent) {

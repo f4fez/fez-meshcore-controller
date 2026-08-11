@@ -14,16 +14,22 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use fez_mesh_controller_core::ipc::{ClientMessage, ServerMessage, PROTOCOL_VERSION};
 use futures::{SinkExt, StreamExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 use tracing::{debug, info, warn};
 
+use crate::command::DaemonCommand;
 use crate::state::AppState;
+
+/// How long an IPC client waits for a command's outcome before giving up
+/// (e.g. the mesh connection task is stuck reconnecting).
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Starts the IPC server: listens on the Unix socket and serves one client
 /// per accepted connection until the daemon shuts down.
@@ -85,11 +91,28 @@ async fn handle_client(stream: UnixStream, state: Arc<AppState>) -> Result<()> {
             }
             line = reader.next() => {
                 match line {
-                    Some(Ok(text)) => {
-                        if let Ok(ClientMessage::RequestSnapshot) = serde_json::from_str(&text) {
+                    Some(Ok(text)) => match serde_json::from_str::<ClientMessage>(&text) {
+                        Ok(ClientMessage::RequestSnapshot) => {
                             send(&mut writer, &ServerMessage::Snapshot(current_snapshot(&state).await)).await?;
                         }
-                    }
+                        Ok(ClientMessage::RemoveContact { public_key_prefix_hex }) => {
+                            let (reply, reply_rx) = oneshot::channel();
+                            let cmd = DaemonCommand::RemoveContact { public_key_prefix_hex, reply };
+                            if let Err(reason) = dispatch_command(&state, cmd, reply_rx).await {
+                                send(&mut writer, &ServerMessage::Error(reason)).await?;
+                            }
+                        }
+                        Ok(ClientMessage::SetManagedRepeater { public_key_prefix_hex, name, managed }) => {
+                            let (reply, reply_rx) = oneshot::channel();
+                            let cmd = DaemonCommand::SetManagedRepeater { public_key_prefix_hex, name, managed, reply };
+                            if let Err(reason) = dispatch_command(&state, cmd, reply_rx).await {
+                                send(&mut writer, &ServerMessage::Error(reason)).await?;
+                            }
+                        }
+                        Err(err) => {
+                            debug!(error = %err, "invalid IPC client message");
+                        }
+                    },
                     Some(Err(err)) => {
                         debug!(error = %err, "IPC client read error");
                         break;
@@ -101,6 +124,26 @@ async fn handle_client(stream: UnixStream, state: Arc<AppState>) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Forwards a command to the mesh connection task (the only one holding
+/// the live MeshCore connection) and waits for its outcome.
+async fn dispatch_command(
+    state: &Arc<AppState>,
+    cmd: DaemonCommand,
+    reply_rx: oneshot::Receiver<std::result::Result<(), String>>,
+) -> std::result::Result<(), String> {
+    state
+        .command_tx
+        .send(cmd)
+        .await
+        .map_err(|_| "mesh connection task is not running".to_string())?;
+
+    match tokio::time::timeout(COMMAND_TIMEOUT, reply_rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("mesh connection task dropped the reply".to_string()),
+        Err(_) => Err("timed out waiting for the mesh node (offline?)".to_string()),
+    }
 }
 
 async fn current_snapshot(state: &Arc<AppState>) -> fez_mesh_controller_core::ipc::Snapshot {

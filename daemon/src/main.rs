@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod command;
 mod mesh_task;
 mod server;
 mod state;
@@ -78,23 +79,29 @@ fn main() -> anyhow::Result<()> {
         "starting fez-mesh-controller-daemon"
     );
 
-    tokio::runtime::Runtime::new()?.block_on(run(config))
+    tokio::runtime::Runtime::new()?.block_on(run(config, config_path))
 }
 
-async fn run(config: Config) -> anyhow::Result<()> {
-    let state = Arc::new(AppState::new());
+async fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
+    let (command_tx, command_rx) = tokio::sync::mpsc::channel(8);
     let refresh_interval = Duration::from_secs(config.daemon.refresh_interval_secs.max(1));
+    let connection = config.connection.clone();
+    let socket_path = config.daemon.socket_path.clone();
+
+    let state = Arc::new(AppState::new(command_tx, config, config_path));
 
     let mesh_state = state.clone();
     let mesh_handle = tokio::spawn(mesh_task::run(
-        config.connection.clone(),
+        connection,
         refresh_interval,
+        command_rx,
         mesh_state,
     ));
 
     let server_state = state.clone();
-    let socket_path = config.daemon.socket_path.clone();
-    let server_handle = tokio::spawn(async move { server::run(&socket_path, server_state).await });
+    let server_socket_path = socket_path.clone();
+    let server_handle =
+        tokio::spawn(async move { server::run(&server_socket_path, server_state).await });
 
     tokio::select! {
         res = server_handle => {
@@ -110,7 +117,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         }
     }
 
-    let _ = std::fs::remove_file(&config.daemon.socket_path);
+    let _ = std::fs::remove_file(&socket_path);
     Ok(())
 }
 

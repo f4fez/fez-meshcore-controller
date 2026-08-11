@@ -127,11 +127,11 @@ fn field_line(label: &str, value: impl Into<String>) -> Line<'static> {
 }
 
 fn draw_contacts(frame: &mut Frame, app: &mut App, area: Rect) {
-    let mut contacts: Vec<_> = app.snapshot.contacts.iter().collect();
-    contacts.sort_by(|a, b| b.last_advert_unix.cmp(&a.last_advert_unix));
+    let contacts = app.sorted_contacts();
 
     let header = Row::new(vec![
         Cell::from("Name"),
+        Cell::from("Status"),
         Cell::from("Prefix"),
         Cell::from("Seen"),
         Cell::from("Position"),
@@ -140,8 +140,29 @@ fn draw_contacts(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let rows = contacts.iter().map(|c| {
         let prefix: String = c.public_key_prefix_hex.chars().take(8).collect();
+
+        let name_cell = if c.managed {
+            Cell::from(Line::from(vec![
+                Span::raw("🛰️ "),
+                Span::styled(
+                    c.name.clone(),
+                    Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+                ),
+            ]))
+        } else {
+            Cell::from(c.name.clone())
+        };
+
+        let (status_text, status_color) = match (c.registered, c.managed) {
+            (_, true) => ("🛰️ Managed", GREEN),
+            (true, false) => ("✅ Known", MUTED),
+            (false, false) => ("🔍 Discovered", YELLOW),
+        };
+        let status_cell = Cell::from(Span::styled(status_text, Style::default().fg(status_color)));
+
         Row::new(vec![
-            Cell::from(c.name.clone()),
+            name_cell,
+            status_cell,
             Cell::from(prefix),
             Cell::from(format_last_seen(c.last_advert_unix)),
             Cell::from(format_coords(c.lat, c.lon)),
@@ -151,10 +172,11 @@ fn draw_contacts(frame: &mut Frame, app: &mut App, area: Rect) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(35),
-            Constraint::Percentage(20),
-            Constraint::Percentage(15),
-            Constraint::Percentage(30),
+            Constraint::Percentage(28),
+            Constraint::Percentage(16),
+            Constraint::Percentage(16),
+            Constraint::Percentage(14),
+            Constraint::Percentage(26),
         ],
     )
     .header(header)
@@ -198,19 +220,74 @@ fn event_line(ev: &MeshEvent) -> Line<'static> {
         MeshEventKind::NewContact { name } => ("🆕", format!("New contact: {name}"), MAGENTA),
         MeshEventKind::ContactMessage {
             from_prefix_hex,
+            hops,
             text,
         } => (
             "💬",
             format!(
-                "[{}] {text}",
-                &from_prefix_hex[..from_prefix_hex.len().min(8)]
+                "[{}] ({hops} hop{}) {text}",
+                &from_prefix_hex[..from_prefix_hex.len().min(8)],
+                if *hops == 1 { "" } else { "s" }
             ),
             YELLOW,
         ),
-        MeshEventKind::ChannelMessage { channel, text } => {
-            ("📢", format!("Channel {channel}: {text}"), YELLOW)
-        }
+        MeshEventKind::ChannelMessage {
+            channel,
+            hops,
+            text,
+        } => (
+            "📢",
+            format!(
+                "Channel {channel} ({hops} hop{}): {text}",
+                if *hops == 1 { "" } else { "s" }
+            ),
+            YELLOW,
+        ),
         MeshEventKind::MessageSent => ("📤", "Message sent".to_string(), Color::Blue),
+        MeshEventKind::PathUpdate {
+            prefix_hex,
+            hops,
+            path_hex,
+        } => (
+            "🗺️",
+            format!(
+                "Path update for [{}]: {hops} hop(s) via {}",
+                &prefix_hex[..prefix_hex.len().min(8)],
+                if path_hex.is_empty() {
+                    "flood"
+                } else {
+                    path_hex
+                }
+            ),
+            CYAN,
+        ),
+        MeshEventKind::Ack { tag_hex } => ("✅", format!("Ack received [{tag_hex}]"), GREEN),
+        MeshEventKind::RfLog { snr, rssi } => (
+            "📡",
+            format!("RF packet: SNR {snr:.1} dB, RSSI {rssi} dBm"),
+            MUTED,
+        ),
+        MeshEventKind::ManagedRepeaterDeclared { name } => (
+            "🛰️",
+            format!("Declared managed repeater to the node: {name}"),
+            GREEN,
+        ),
+        MeshEventKind::RepeaterHeard { name, prefix_hex } => (
+            "🔍",
+            format!(
+                "Repeater heard: {name} [{}] — not yet registered",
+                &prefix_hex[..prefix_hex.len().min(8)]
+            ),
+            YELLOW,
+        ),
+        MeshEventKind::ContactRemoved { name, prefix_hex } => (
+            "🗑️",
+            format!(
+                "Contact removed: {name} [{}]",
+                &prefix_hex[..prefix_hex.len().min(8)]
+            ),
+            RED,
+        ),
         MeshEventKind::Other { label } => ("🔎", label.clone(), MUTED),
     };
 
@@ -222,6 +299,26 @@ fn event_line(ev: &MeshEvent) -> Line<'static> {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    if let Some((_, name)) = &app.pending_delete {
+        let warning = Line::from(vec![Span::styled(
+            format!(
+                "  ⚠️  Press [d] again to permanently remove \"{name}\" from the node, any other key cancels"
+            ),
+            Style::default().fg(RED).add_modifier(Modifier::BOLD),
+        )]);
+        frame.render_widget(Paragraph::new(warning), area);
+        return;
+    }
+
+    if let Some(status) = &app.last_status {
+        let line = Line::from(vec![Span::styled(
+            format!("  {status}"),
+            Style::default().fg(CYAN),
+        )]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
     let daemon_dot = if app.daemon_connected {
         ("🟢", "daemon connected", GREEN)
     } else {
@@ -241,7 +338,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(mesh_dot.1, Style::default().fg(mesh_dot.2)),
         Span::raw(format!("   ⏳ {}s", app.snapshot.uptime_secs)),
         Span::styled(
-            "   [q] Quit   [r] Refresh   [↑/↓] Contacts",
+            "   [q] Quit  [r] Refresh  [↑/↓] Select  [m] Toggle managed  [d] Delete contact",
             Style::default().fg(MUTED),
         ),
     ]);

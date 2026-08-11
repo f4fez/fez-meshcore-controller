@@ -32,6 +32,29 @@ pub struct Config {
     pub connection: ConnectionConfig,
     /// Settings for the daemon service.
     pub daemon: DaemonConfig,
+    /// Repeaters managed by this application, matched against mesh contacts
+    /// by public key so they can be highlighted in the UIs.
+    #[serde(default)]
+    pub managed_repeaters: Vec<ManagedRepeater>,
+}
+
+/// A repeater managed by this application, identified by name and public key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedRepeater {
+    /// Display name for this repeater.
+    pub name: String,
+    /// Public key (hex-encoded). May be the full 32-byte key or just a
+    /// prefix; matched against a contact's public key prefix.
+    pub public_key_hex: String,
+}
+
+impl ManagedRepeater {
+    /// Whether a contact's public key prefix (hex) belongs to this repeater.
+    pub fn matches(&self, contact_public_key_prefix_hex: &str) -> bool {
+        self.public_key_hex
+            .to_ascii_lowercase()
+            .starts_with(&contact_public_key_prefix_hex.to_ascii_lowercase())
+    }
 }
 
 /// Connection method used by the daemon to talk to the MeshCore node.

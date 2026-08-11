@@ -33,6 +33,26 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub enum ClientMessage {
     /// Explicit request for a full state snapshot.
     RequestSnapshot,
+    /// Remove a contact from the node's own contact list, identified by its
+    /// public key prefix (hex). On success, an updated [`Snapshot`] and a
+    /// [`crate::mesh::MeshEventKind::ContactRemoved`] event are broadcast to
+    /// all clients; on failure, a [`ServerMessage::Error`] is sent back to
+    /// the requesting client only.
+    RemoveContact { public_key_prefix_hex: String },
+    /// Add or remove a contact from the config's managed-repeater list,
+    /// identified by its public key prefix (hex). If `managed` is `true`
+    /// and the contact isn't already registered in the companion, the
+    /// daemon declares it first (using the full public key resolved from
+    /// overheard RF log data, see
+    /// [`crate::mesh::extract_discovered_node`]) — a managed repeater is
+    /// always registered. On success, an updated [`Snapshot`] is broadcast
+    /// to all clients; on failure, a [`ServerMessage::Error`] is sent back
+    /// to the requesting client only.
+    SetManagedRepeater {
+        public_key_prefix_hex: String,
+        name: String,
+        managed: bool,
+    },
 }
 
 /// Message sent by the daemon to a connected client.

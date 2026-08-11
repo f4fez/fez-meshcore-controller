@@ -1027,8 +1027,6 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "meshcore-rs"
 version = "0.1.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a14ea1ff575728b082f006bcb1c523a20b5c83fed4895aaad65455dee85a0ef9"
 dependencies = [
  "btleplug",
  "bytes",
@@ -1738,7 +1736,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
