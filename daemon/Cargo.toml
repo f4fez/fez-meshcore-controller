@@ -24,3 +24,4 @@ clap = { workspace = true }
 
 tracing-appender = "0.2"
 daemonize = "0.5"
+libc = "0.2"

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod command;
+mod lock;
 mod mesh_task;
 mod server;
 mod state;
@@ -59,8 +60,23 @@ fn main() -> anyhow::Result<()> {
         )
     })?;
 
+    // Acquired before any forking so a second instance (foreground or
+    // `--daemon`) fails fast instead of silently fighting the first one
+    // over the same IPC socket.
+    let lock_path = config.daemon.socket_path.with_extension("lock");
+    let mut instance_lock = lock::SingleInstanceLock::acquire(&lock_path).map_err(|err| {
+        anyhow::anyhow!(
+            "{err}\nis another fez-mesh-controller-daemon already running with this config ({})?",
+            config_path.display()
+        )
+    })?;
+
     if cli.daemon {
         run_in_background(&config.daemon.log_dir)?;
+        // The flock survives the fork (inherited fd), but the PID recorded
+        // above belongs to the pre-fork process, which just exited: record
+        // the surviving child's real PID instead.
+        instance_lock.write_current_pid()?;
     }
 
     // The tracing worker guard must stay alive for the process lifetime: it

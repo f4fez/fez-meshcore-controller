@@ -586,6 +586,7 @@ dependencies = [
  "daemonize",
  "fez-mesh-controller-core",
  "futures",
+ "libc",
  "meshcore-rs",
  "serde_json",
  "tokio",
