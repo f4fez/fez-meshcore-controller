@@ -53,6 +53,19 @@ pub enum ClientMessage {
         name: String,
         managed: bool,
     },
+    /// Declares a new contact directly from its full public key (hex),
+    /// without requiring it to have been overheard on the mesh first —
+    /// unlike [`ClientMessage::SetManagedRepeater`], which can only resolve
+    /// a full key for a node already known (registered or discovered). If
+    /// `managed` is `true`, it's also added to the config's
+    /// managed-repeater list. On success, an updated [`Snapshot`] is
+    /// broadcast to all clients; on failure, a [`ServerMessage::Error`] is
+    /// sent back to the requesting client only.
+    AddRepeater {
+        public_key_hex: String,
+        name: String,
+        managed: bool,
+    },
 }
 
 /// Message sent by the daemon to a connected client.

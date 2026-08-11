@@ -299,6 +299,15 @@ async fn handle_command(cmd: DaemonCommand, client: &MeshClient, state: &AppStat
                 set_managed_repeater(client, state, &public_key_prefix_hex, &name, managed).await;
             let _ = reply.send(result);
         }
+        DaemonCommand::AddRepeater {
+            public_key_hex,
+            name,
+            managed,
+            reply,
+        } => {
+            let result = add_repeater(client, state, &public_key_hex, &name, managed).await;
+            let _ = reply.send(result);
+        }
     }
 }
 
@@ -394,36 +403,114 @@ async fn set_managed_repeater(
         }
     }
 
-    {
-        let mut config = state.config.write().await;
-        let existing_index = config
-            .managed_repeaters
-            .iter()
-            .position(|r| r.matches(public_key_prefix_hex));
+    upsert_managed_repeater_config(
+        state,
+        public_key_prefix_hex,
+        name,
+        managed,
+        resolved_full_key_hex,
+    )
+    .await?;
 
-        match (managed, existing_index) {
-            (true, Some(index)) => {
-                config.managed_repeaters[index].name = name.to_string();
-                if let Some(full_key) = resolved_full_key_hex {
-                    config.managed_repeaters[index].public_key_hex = full_key;
-                }
-            }
-            (true, None) => config.managed_repeaters.push(ManagedRepeater {
+    refresh_snapshot_contacts(client, state).await;
+    Ok(())
+}
+
+/// Declares a new contact directly from a caller-supplied full public key,
+/// without requiring it to have been overheard on the mesh first (unlike
+/// [`set_managed_repeater`], which can only resolve a full key for a node
+/// already known). If `managed` is `true`, it's also added to the config's
+/// managed-repeater list.
+async fn add_repeater(
+    client: &MeshClient,
+    state: &AppState,
+    public_key_hex: &str,
+    name: &str,
+    managed: bool,
+) -> Result<(), String> {
+    if public_key_hex.len() != 64 || !public_key_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "\"{name}\" needs a full 32-byte public key (64 hex characters), got {} characters",
+            public_key_hex.len()
+        ));
+    }
+    let public_key_prefix_hex: String = public_key_hex.chars().take(12).collect();
+
+    let already_registered = client.contacts().await.iter().any(|c| {
+        c.public_key_prefix_hex
+            .eq_ignore_ascii_case(&public_key_prefix_hex)
+    });
+
+    if !already_registered {
+        let repeater = ManagedRepeater {
+            name: name.to_string(),
+            public_key_hex: public_key_hex.to_string(),
+        };
+        client
+            .declare_contact(&repeater)
+            .await
+            .map_err(|err| format!("failed to register \"{name}\": {err}"))?;
+
+        state.broadcast_event(MeshEvent {
+            at_unix: now_unix(),
+            kind: MeshEventKind::ManagedRepeaterDeclared {
                 name: name.to_string(),
-                public_key_hex: resolved_full_key_hex
-                    .unwrap_or_else(|| public_key_prefix_hex.to_string()),
-            }),
-            (false, Some(index)) => {
-                config.managed_repeaters.remove(index);
-            }
-            (false, None) => {}
-        }
+            },
+        });
+    }
 
-        config
-            .save_to(&state.config_path)
-            .map_err(|err| format!("failed to save config: {err}"))?;
+    if managed {
+        upsert_managed_repeater_config(
+            state,
+            &public_key_prefix_hex,
+            name,
+            true,
+            Some(public_key_hex.to_string()),
+        )
+        .await?;
     }
 
     refresh_snapshot_contacts(client, state).await;
     Ok(())
+}
+
+/// Adds, updates or removes a repeater's entry in the config's
+/// managed-repeater list and persists the config. `resolved_full_key_hex`,
+/// when available, is persisted instead of the bare prefix so the config
+/// alone is enough to re-declare this repeater later (e.g. after a
+/// companion reset).
+async fn upsert_managed_repeater_config(
+    state: &AppState,
+    public_key_prefix_hex: &str,
+    name: &str,
+    managed: bool,
+    resolved_full_key_hex: Option<String>,
+) -> Result<(), String> {
+    let mut config = state.config.write().await;
+    let existing_index = config
+        .managed_repeaters
+        .iter()
+        .position(|r| r.matches(public_key_prefix_hex));
+
+    match (managed, existing_index) {
+        (true, Some(index)) => {
+            config.managed_repeaters[index].name = name.to_string();
+            if let Some(full_key) = resolved_full_key_hex {
+                config.managed_repeaters[index].public_key_hex = full_key;
+            }
+        }
+        (true, None) => config.managed_repeaters.push(ManagedRepeater {
+            name: name.to_string(),
+            public_key_hex: resolved_full_key_hex
+                .unwrap_or_else(|| public_key_prefix_hex.to_string()),
+        }),
+        (false, Some(index)) => {
+            config.managed_repeaters.remove(index);
+        }
+        (false, None) => {}
+    }
+
+    config
+        .save_to(&state.config_path)
+        .map_err(|err| format!("failed to save config: {err}"))
 }

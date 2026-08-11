@@ -17,7 +17,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use fez_mesh_controller_core::ipc::{ClientMessage, ServerMessage};
+use fez_mesh_controller_core::ipc::{ClientMessage, ServerMessage, Snapshot};
 use futures::{SinkExt, StreamExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
@@ -53,4 +53,28 @@ impl IpcConnection {
         self.writer.send(text).await?;
         Ok(())
     }
+}
+
+/// Connects to the daemon and waits for its initial snapshot, printing a
+/// friendly error and exiting the process if the daemon isn't reachable.
+/// Shared by every one-off command (`status`, `repeater ...`).
+pub async fn connect_and_await_snapshot(socket_path: &Path) -> Result<(IpcConnection, Snapshot)> {
+    let mut conn = match IpcConnection::connect(socket_path).await {
+        Ok(conn) => conn,
+        Err(err) => {
+            crate::theme::error_line(&format!("could not reach the daemon: {err}"));
+            crate::theme::info_line("is the daemon running? (`fez-mesh-controller-daemon`)");
+            std::process::exit(1);
+        }
+    };
+
+    let snapshot = loop {
+        match conn.recv().await? {
+            Some(ServerMessage::Snapshot(s)) => break s,
+            Some(_) => continue,
+            None => anyhow::bail!("daemon closed the connection before sending a snapshot"),
+        }
+    };
+
+    Ok((conn, snapshot))
 }

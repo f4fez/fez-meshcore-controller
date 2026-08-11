@@ -29,4 +29,10 @@ pub enum DaemonCommand {
         managed: bool,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    AddRepeater {
+        public_key_hex: String,
+        name: String,
+        managed: bool,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
 }

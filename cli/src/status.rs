@@ -15,32 +15,17 @@
 //! `fez-mesh-controller status` command: a single, non-interactive snapshot.
 
 use console::style;
-use fez_mesh_controller_core::ipc::{ServerMessage, Snapshot};
+use fez_mesh_controller_core::ipc::Snapshot;
 use fez_mesh_controller_core::Config;
 
 use crate::format::{format_coords, format_last_seen};
-use crate::ipc_client::IpcConnection;
+use crate::ipc_client::connect_and_await_snapshot;
 use crate::theme::{self, accent, muted, primary};
 
 pub async fn run(config: &Config) -> anyhow::Result<()> {
     theme::section("Network status", "📊");
 
-    let mut conn = match IpcConnection::connect(&config.daemon.socket_path).await {
-        Ok(conn) => conn,
-        Err(err) => {
-            theme::error_line(&format!("could not reach the daemon: {err}"));
-            theme::info_line("is the daemon running? (`fez-mesh-controller-daemon`)");
-            std::process::exit(1);
-        }
-    };
-
-    let snapshot = loop {
-        match conn.recv().await? {
-            Some(ServerMessage::Snapshot(s)) => break s,
-            Some(_) => continue,
-            None => anyhow::bail!("daemon closed the connection before sending a snapshot"),
-        }
-    };
+    let (_conn, snapshot) = connect_and_await_snapshot(&config.daemon.socket_path).await?;
 
     print_snapshot(&snapshot);
     Ok(())

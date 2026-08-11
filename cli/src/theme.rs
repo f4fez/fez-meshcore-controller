@@ -37,6 +37,10 @@ pub fn muted() -> Style {
     Style::new().dim()
 }
 
+pub fn warning() -> Style {
+    Style::new().yellow().bold()
+}
+
 /// Banner printed when the CLI starts.
 pub fn print_banner() {
     println!();

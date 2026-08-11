@@ -14,6 +14,7 @@
 
 mod format;
 mod ipc_client;
+mod repeater;
 mod status;
 mod theme;
 mod tui;
@@ -45,6 +46,54 @@ enum Command {
     Setup,
     /// Prints a one-off snapshot of the network state, then exits
     Status,
+    /// Manage repeaters known to the node (same actions as the TUI's
+    /// contact list), then exits
+    Repeater {
+        #[command(subcommand)]
+        action: RepeaterCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum RepeaterCommand {
+    /// List known repeaters/contacts and their status
+    List,
+    /// Declares a new repeater directly from its full public key, without
+    /// requiring it to have been heard on the mesh first
+    Add {
+        /// Display name for this repeater
+        name: String,
+        /// Full public key (64 hex characters)
+        public_key_hex: String,
+        /// Also mark it as managed
+        #[arg(short, long)]
+        manage: bool,
+    },
+    /// Mark a repeater as managed, registering it with the node first if
+    /// needed (fails if it hasn't been heard on the mesh yet)
+    Manage {
+        /// Public key prefix (hex, see `repeater list`); may be
+        /// abbreviated as long as it's unambiguous
+        prefix: String,
+        /// Display name to use (defaults to the contact's current name)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Unmark a repeater as managed (it stays registered with the node)
+    Unmanage {
+        /// Public key prefix (hex, see `repeater list`); may be
+        /// abbreviated as long as it's unambiguous
+        prefix: String,
+    },
+    /// Permanently remove a repeater from the node's contact list
+    Remove {
+        /// Public key prefix (hex, see `repeater list`); may be
+        /// abbreviated as long as it's unambiguous
+        prefix: String,
+        /// Skip the confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
+    },
 }
 
 #[tokio::main]
@@ -78,6 +127,21 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(Command::Setup) => Ok(()),
         Some(Command::Status) => status::run(&config).await,
+        Some(Command::Repeater { action }) => match action {
+            RepeaterCommand::List => repeater::list(&config).await,
+            RepeaterCommand::Add {
+                name,
+                public_key_hex,
+                manage,
+            } => repeater::add(&config, &name, &public_key_hex, manage).await,
+            RepeaterCommand::Manage { prefix, name } => {
+                repeater::manage(&config, &prefix, name).await
+            }
+            RepeaterCommand::Unmanage { prefix } => repeater::unmanage(&config, &prefix).await,
+            RepeaterCommand::Remove { prefix, yes } => {
+                repeater::remove(&config, &prefix, yes).await
+            }
+        },
         None => tui::run(&config).await,
     }
 }

@@ -125,6 +125,13 @@ async fn handle_client(stream: UnixStream, state: Arc<AppState>) -> Result<()> {
                                 send(&mut writer, &ServerMessage::Error(reason)).await?;
                             }
                         }
+                        Ok(ClientMessage::AddRepeater { public_key_hex, name, managed }) => {
+                            let (reply, reply_rx) = oneshot::channel();
+                            let cmd = DaemonCommand::AddRepeater { public_key_hex, name, managed, reply };
+                            if let Err(reason) = dispatch_command(&state, cmd, reply_rx).await {
+                                send(&mut writer, &ServerMessage::Error(reason)).await?;
+                            }
+                        }
                         Err(err) => {
                             debug!(error = %err, "invalid IPC client message");
                         }
