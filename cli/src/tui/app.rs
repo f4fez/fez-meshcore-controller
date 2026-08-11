@@ -17,6 +17,8 @@ use std::collections::VecDeque;
 use fez_mesh_controller_core::ipc::{MeshEvent, Snapshot};
 use fez_mesh_controller_core::mesh::{ContactDto, PacketLogEntry};
 
+use super::packet_group::{group_packets, PacketGroup};
+
 pub const MAX_EVENTS: usize = 200;
 /// Client-side cap on the packet log buffer, kept generous compared to the
 /// daemon's default rotating cache (500) in case it's configured larger.
@@ -137,10 +139,17 @@ impl App {
         }
     }
 
-    /// The currently-selected packet in the visible (possibly frozen) list.
-    pub fn selected_packet(&self) -> Option<&PacketLogEntry> {
+    /// Packets in the visible (possibly frozen) list, grouped by
+    /// transmission: the same packet relayed and independently overheard
+    /// via several repeaters collapses into a single [`PacketGroup`].
+    pub fn packet_groups(&self) -> Vec<PacketGroup> {
+        group_packets(self.visible_packets())
+    }
+
+    /// The currently-selected packet group in the (grouped) table, if any.
+    pub fn selected_group(&self) -> Option<PacketGroup> {
         let index = self.packet_table_state.selected()?;
-        self.visible_packets().get(index)
+        self.packet_groups().into_iter().nth(index)
     }
 
     /// Replaces the packet log with the daemon's initial backlog (already
@@ -182,7 +191,7 @@ impl App {
     }
 
     pub fn select_next_packet(&mut self) {
-        let len = self.visible_packets().len();
+        let len = self.packet_groups().len();
         if len == 0 {
             return;
         }
@@ -195,7 +204,7 @@ impl App {
     }
 
     pub fn select_prev_packet(&mut self) {
-        let len = self.visible_packets().len();
+        let len = self.packet_groups().len();
         if len == 0 {
             return;
         }

@@ -25,6 +25,7 @@ use ratatui::Frame;
 
 use crate::format::{format_coords, format_last_seen};
 use crate::tui::app::{App, Page};
+use crate::tui::packet_group::PacketGroup;
 
 const CYAN: Color = Color::Rgb(0x4d, 0xd0, 0xe1);
 const MAGENTA: Color = Color::Rgb(0xe0, 0x67, 0xf2);
@@ -62,8 +63,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_footer(frame, app, root[2]);
 
     if app.page == Page::PacketLog && app.packet_detail_open {
-        if let Some(packet) = app.selected_packet() {
-            draw_packet_detail_popup(frame, packet);
+        if let Some(group) = app.selected_group() {
+            draw_packet_detail_popup(frame, &group);
         }
     }
 
@@ -358,37 +359,77 @@ fn packet_summary(entry: &PacketLogEntry) -> String {
     }
 }
 
-fn packet_row(entry: &PacketLogEntry) -> Row<'static> {
-    let time = Local
-        .timestamp_opt(entry.at_unix, 0)
+fn format_time_short(unix: i64) -> String {
+    Local
+        .timestamp_opt(unix, 0)
         .single()
         .map(|t| t.format("%H:%M:%S").to_string())
-        .unwrap_or_else(|| "--:--:--".to_string());
+        .unwrap_or_else(|| "--:--:--".to_string())
+}
 
-    let (route, ptype, hops, color) = match &entry.header {
+fn format_time_full(unix: i64) -> String {
+    Local
+        .timestamp_opt(unix, 0)
+        .single()
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Hop count across a group's receptions: a single value when every
+/// repeater reported the same, otherwise the observed range — itself a
+/// useful signal (the packet traveled different distances to reach us).
+fn hops_range(group: &PacketGroup) -> String {
+    let hops: Vec<u8> = group
+        .members
+        .iter()
+        .filter_map(|m| m.header.as_ref().map(|h| h.hops))
+        .collect();
+
+    match (hops.iter().min(), hops.iter().max()) {
+        (Some(min), Some(max)) if min == max => min.to_string(),
+        (Some(min), Some(max)) => format!("{min}-{max}"),
+        _ => "-".to_string(),
+    }
+}
+
+fn packet_group_row(group: &PacketGroup) -> Row<'static> {
+    let latest = group.latest();
+    let time = format_time_short(latest.at_unix);
+
+    let (route, ptype, color) = match &latest.header {
         Some(h) => (
             h.route_type.clone(),
             h.payload_type.clone(),
-            h.hops.to_string(),
             payload_type_color(&h.payload_type),
         ),
-        None => ("?".to_string(), "?".to_string(), "-".to_string(), MUTED),
+        None => ("?".to_string(), "?".to_string(), MUTED),
+    };
+
+    let count_cell = if group.count() > 1 {
+        Cell::from(Span::styled(
+            format!("×{}", group.count()),
+            Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Cell::from(Span::styled("·", Style::default().fg(MUTED)))
     };
 
     Row::new(vec![
         Cell::from(time),
-        Cell::from(format!("{:.1}/{}", entry.snr, entry.rssi)),
+        Cell::from(format!("{:.1}/{}", latest.snr, latest.rssi)),
         Cell::from(route),
         Cell::from(Span::styled(ptype, Style::default().fg(color))),
-        Cell::from(hops),
-        Cell::from(packet_summary(entry)),
+        Cell::from(hops_range(group)),
+        count_cell,
+        Cell::from(packet_summary(latest)),
     ])
 }
 
 fn draw_packet_log_page(frame: &mut Frame, app: &mut App, area: Rect) {
-    let packets = app.visible_packets();
-    let count = packets.len();
-    let rows: Vec<Row> = packets.iter().map(packet_row).collect();
+    let groups = app.packet_groups();
+    let group_count = groups.len();
+    let reception_count: usize = groups.iter().map(PacketGroup::count).sum();
+    let rows: Vec<Row> = groups.iter().map(packet_group_row).collect();
 
     let header = Row::new(vec![
         Cell::from("Time"),
@@ -396,6 +437,7 @@ fn draw_packet_log_page(frame: &mut Frame, app: &mut App, area: Rect) {
         Cell::from("Route"),
         Cell::from("Type"),
         Cell::from("Hops"),
+        Cell::from("×"),
         Cell::from("Summary"),
     ])
     .style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD));
@@ -406,6 +448,14 @@ fn draw_packet_log_page(frame: &mut Frame, app: &mut App, area: Rect) {
         " — ▶ LIVE".to_string()
     };
 
+    let title = if reception_count > group_count {
+        format!(
+            "📦 Raw packet log ({group_count} packets, {reception_count} receptions){lock_suffix}"
+        )
+    } else {
+        format!("📦 Raw packet log ({group_count}){lock_suffix}")
+    };
+
     let table = Table::new(
         rows,
         [
@@ -413,7 +463,8 @@ fn draw_packet_log_page(frame: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Length(9),
             Constraint::Length(16),
             Constraint::Length(10),
-            Constraint::Length(5),
+            Constraint::Length(7),
+            Constraint::Length(4),
             Constraint::Min(20),
         ],
     )
@@ -424,7 +475,7 @@ fn draw_packet_log_page(frame: &mut Frame, app: &mut App, area: Rect) {
             .add_modifier(Modifier::BOLD),
     )
     .highlight_symbol("➤ ")
-    .block(block(format!("📦 Raw packet log ({count}){lock_suffix}")));
+    .block(block(title));
 
     frame.render_stateful_widget(table, area, &mut app.packet_table_state);
 }
@@ -449,58 +500,94 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-/// Popup with the full detail of a packet, laid out differently depending
-/// on its payload type since e.g. an advert carries identity/position data
-/// that a plain data packet doesn't.
-fn draw_packet_detail_popup(frame: &mut Frame, entry: &PacketLogEntry) {
-    let area = centered_rect(70, 70, frame.area());
+fn section_title(text: impl Into<String>) -> Line<'static> {
+    Line::from(Span::styled(
+        text.into(),
+        Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// One line of the per-reception breakdown: the fields that genuinely
+/// differ between repeaters hearing the same packet (signal quality,
+/// route, hop count, path) — as opposed to the fields common to the whole
+/// group (payload type/version/content), shown once above.
+fn reception_line(m: &PacketLogEntry) -> Line<'static> {
+    let (route, hops, path) = match &m.header {
+        Some(h) => (
+            h.route_type.clone(),
+            h.hops.to_string(),
+            if h.path_hex.is_empty() {
+                "flood".to_string()
+            } else {
+                h.path_hex.clone()
+            },
+        ),
+        None => ("?".to_string(), "-".to_string(), "-".to_string()),
+    };
+    let snr_rssi = format!("{:.1}dB/{}dBm", m.snr, m.rssi);
+
+    Line::from(vec![
+        Span::styled(
+            format!("   {:<9}", format_time_short(m.at_unix)),
+            Style::default().fg(MUTED),
+        ),
+        Span::raw(format!("{snr_rssi:<16}")),
+        Span::styled(format!("{route:<16}"), Style::default().fg(MUTED)),
+        Span::raw(format!("{:<5}", format!("{hops}h"))),
+        Span::styled(path, Style::default().fg(MUTED)),
+    ])
+}
+
+fn reception_header_line() -> Line<'static> {
+    Line::from(Span::styled(
+        format!(
+            "   {:<9}{:<16}{:<16}{:<5}{}",
+            "Time", "SNR/RSSI", "Route", "Hop", "Path"
+        ),
+        Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// Popup with the full detail of a packet group, laid out differently
+/// depending on its payload type since e.g. an advert carries
+/// identity/position data that a plain data packet doesn't. Fields common
+/// to every reception (payload type/version/content) are shown once; the
+/// per-reception breakdown below covers what genuinely differs between the
+/// repeaters that relayed it (signal quality, route, hop count, path).
+fn draw_packet_detail_popup(frame: &mut Frame, group: &PacketGroup) {
+    let area = centered_rect(76, 80, frame.area());
     frame.render_widget(Clear, area);
 
-    let time = Local
-        .timestamp_opt(entry.at_unix, 0)
-        .single()
-        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    let latest = group.latest();
 
-    let mut lines = vec![
-        field_line("🆔 Packet #", entry.id.to_string()),
-        field_line("🕒 Time", time),
-        field_line(
-            "📶 SNR / RSSI",
-            format!("{:.1} dB / {} dBm", entry.snr, entry.rssi),
-        ),
-    ];
+    let mut lines = vec![field_line(
+        "🕒 Last heard",
+        format_time_full(latest.at_unix),
+    )];
+    if group.count() > 1 {
+        let first = group.members.last().expect("group is never empty");
+        lines.push(field_line(
+            "🔁 Receptions",
+            format!(
+                "{} repeaters/paths, first heard {}",
+                group.count(),
+                format_time_full(first.at_unix)
+            ),
+        ));
+    }
 
-    match &entry.header {
+    match &latest.header {
         Some(h) => {
-            lines.push(field_line("🧭 Route type", h.route_type.clone()));
             lines.push(field_line("📦 Payload type", h.payload_type.clone()));
             lines.push(field_line(
                 "🔢 Payload version",
                 h.payload_version.to_string(),
             ));
-            lines.push(field_line("🦘 Hops", h.hops.to_string()));
-            if h.path_hash_size > 0 || !h.path_hex.is_empty() {
-                lines.push(field_line(
-                    "🗺️  Path",
-                    if h.path_hex.is_empty() {
-                        "flood".to_string()
-                    } else {
-                        format!("{} (hash size {})", h.path_hex, h.path_hash_size)
-                    },
-                ));
-            }
-            if let Some(tc) = &h.transport_code_hex {
-                lines.push(field_line("🚚 Transport code", tc.clone()));
-            }
 
             match &h.advertisement {
                 Some(adv) => {
                     lines.push(Line::from(""));
-                    lines.push(Line::from(Span::styled(
-                        "— Advertised identity —",
-                        Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
-                    )));
+                    lines.push(section_title("— Advertised identity —"));
                     lines.push(field_line(
                         "🏷️  Name",
                         adv.name.clone().unwrap_or_else(|| "(unnamed)".to_string()),
@@ -518,8 +605,8 @@ fn draw_packet_detail_popup(frame: &mut Frame, entry: &PacketLogEntry) {
                         "📨 Payload",
                         format!(
                             "{} bytes: {}",
-                            entry.payload_len,
-                            truncate_hex(&entry.payload_hex)
+                            latest.payload_len,
+                            truncate_hex(&latest.payload_hex)
                         ),
                     ));
                 }
@@ -535,11 +622,25 @@ fn draw_packet_detail_popup(frame: &mut Frame, entry: &PacketLogEntry) {
                 "📨 Raw payload",
                 format!(
                     "{} bytes: {}",
-                    entry.payload_len,
-                    truncate_hex(&entry.payload_hex)
+                    latest.payload_len,
+                    truncate_hex(&latest.payload_hex)
                 ),
             ));
         }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(section_title(format!("— Receptions ({}) —", group.count())));
+    lines.push(reception_header_line());
+    const MAX_SHOWN_RECEPTIONS: usize = 12;
+    for member in group.members.iter().take(MAX_SHOWN_RECEPTIONS) {
+        lines.push(reception_line(member));
+    }
+    if group.count() > MAX_SHOWN_RECEPTIONS {
+        lines.push(Line::from(Span::styled(
+            format!("   … {} more", group.count() - MAX_SHOWN_RECEPTIONS),
+            Style::default().fg(MUTED),
+        )));
     }
 
     lines.push(Line::from(""));
@@ -586,7 +687,7 @@ fn help_content(
                 ("F1", "Toggle this help"),
                 ("F2", "Dashboard page"),
                 ("F3", "Packet log page (current)"),
-                ("↑ / ↓", "Select a packet"),
+                ("↑ / ↓", "Select a packet (repeated relays are grouped)"),
                 ("l", "Toggle scroll lock"),
                 ("Enter", "Open / close packet detail"),
                 ("Esc", "Close popup"),
@@ -680,4 +781,139 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     ]);
 
     frame.render_widget(Paragraph::new(line), area);
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use fez_mesh_controller_core::mesh::PacketHeaderInfo;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Three receptions: two relays of the same text message (identical
+    /// payload, a few seconds apart) and one unrelated Ack.
+    fn sample_entries() -> Vec<PacketLogEntry> {
+        vec![
+            PacketLogEntry {
+                id: 3,
+                at_unix: 20,
+                snr: 5.5,
+                rssi: -80,
+                header: Some(PacketHeaderInfo {
+                    route_type: "Flood".to_string(),
+                    payload_type: "TextMsg".to_string(),
+                    payload_version: 0,
+                    hops: 2,
+                    path_hash_size: 1,
+                    path_hex: "aabb".to_string(),
+                    transport_code_hex: None,
+                    advertisement: None,
+                }),
+                payload_hex: "deadbeef".to_string(),
+                payload_len: 4,
+            },
+            PacketLogEntry {
+                id: 2,
+                at_unix: 10,
+                snr: 3.0,
+                rssi: -95,
+                header: Some(PacketHeaderInfo {
+                    route_type: "Flood".to_string(),
+                    payload_type: "TextMsg".to_string(),
+                    payload_version: 0,
+                    hops: 1,
+                    path_hash_size: 1,
+                    path_hex: "cc".to_string(),
+                    transport_code_hex: None,
+                    advertisement: None,
+                }),
+                payload_hex: "deadbeef".to_string(),
+                payload_len: 4,
+            },
+            PacketLogEntry {
+                id: 1,
+                at_unix: 0,
+                snr: 1.0,
+                rssi: -100,
+                header: Some(PacketHeaderInfo {
+                    route_type: "Direct".to_string(),
+                    payload_type: "Ack".to_string(),
+                    payload_version: 0,
+                    hops: 0,
+                    path_hash_size: 1,
+                    path_hex: String::new(),
+                    transport_code_hex: None,
+                    advertisement: None,
+                }),
+                payload_hex: "01020304".to_string(),
+                payload_len: 4,
+            },
+        ]
+    }
+
+    fn render(app: &mut App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn packet_log_page_groups_repeated_relays_in_the_table() {
+        let mut app = App::new();
+        app.page = Page::PacketLog;
+        app.set_packet_log(sample_entries());
+        app.packet_table_state.select(Some(0));
+
+        let text = render(&mut app, 120, 20);
+
+        // Two distinct packets (the grouped text message + the ack), three
+        // raw receptions total.
+        assert!(text.contains("2 packets, 3 receptions"));
+        assert!(text.contains("×2"));
+        assert!(text.contains("TextMsg"));
+        assert!(text.contains("Ack"));
+    }
+
+    #[test]
+    fn packet_detail_popup_shows_common_fields_once_and_per_reception_breakdown() {
+        let mut app = App::new();
+        app.page = Page::PacketLog;
+        app.set_packet_log(sample_entries());
+        app.packet_table_state.select(Some(0)); // the grouped TextMsg (newest)
+        app.packet_detail_open = true;
+
+        let text = render(&mut app, 140, 40);
+
+        assert!(text.contains("Receptions (2)"));
+        assert!(text.contains("Payload type"));
+        // Per-reception rows: the two relays have different hop counts.
+        assert!(text.contains("1h"));
+        assert!(text.contains("2h"));
+    }
+
+    #[test]
+    fn packet_log_page_renders_without_grouping_when_singleton() {
+        let mut app = App::new();
+        app.page = Page::PacketLog;
+        app.set_packet_log(vec![sample_entries().pop().unwrap()]);
+
+        let text = render(&mut app, 120, 20);
+
+        assert!(text.contains("Raw packet log (1)"));
+        // A singleton group shows the "·" placeholder in the count
+        // column, not a "×N" badge (the "×" that does appear is just the
+        // column header).
+        assert!(text.contains('·'));
+        assert!(!text.contains("×1"));
+        assert!(!text.contains("×2"));
+    }
 }
