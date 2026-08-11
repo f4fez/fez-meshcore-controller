@@ -21,9 +21,14 @@ jobs:
   lint:
     name: Format & lint
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: fez-meshcore-controller
     steps:
       - name: Checkout fez-mesh-controller
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          path: fez-meshcore-controller
 
       # Temporary: meshcore-rs is patched in locally via
       # [patch.crates-io] in Cargo.toml (see the comment there) until PR #59
@@ -31,11 +36,11 @@ jobs:
       # so the relative `../meshcore-rs` path resolves the same way it does
       # in local development.
       - name: Checkout meshcore-rs (temporary local patch)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: f4fez/meshcore-rs
           ref: feature/raw-data-packet-handling
-          path: ../meshcore-rs
+          path: meshcore-rs
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -47,6 +52,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fez-meshcore-controller
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -57,6 +64,9 @@ jobs:
   test:
     name: Build & test (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: fez-meshcore-controller
     strategy:
       fail-fast: false
       matrix:
@@ -68,14 +78,16 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - name: Checkout fez-mesh-controller
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          path: fez-meshcore-controller
 
       - name: Checkout meshcore-rs (temporary local patch)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: f4fez/meshcore-rs
           ref: feature/raw-data-packet-handling
-          path: ../meshcore-rs
+          path: meshcore-rs
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -86,6 +98,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
+          workspaces: fez-meshcore-controller
           key: ${{ matrix.arch }}
 
       - name: Build
