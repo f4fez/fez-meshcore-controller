@@ -136,10 +136,8 @@ async fn run_loop(
                                         }
                                     }
                                     KeyCode::Char('l') => app.toggle_scroll_lock(),
-                                    KeyCode::Enter => {
-                                        if app.selected_packet().is_some() {
-                                            app.packet_detail_open = !app.packet_detail_open;
-                                        }
+                                    KeyCode::Enter if app.selected_packet().is_some() => {
+                                        app.packet_detail_open = !app.packet_detail_open;
                                     }
                                     _ => {}
                                 },
