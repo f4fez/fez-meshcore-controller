@@ -86,7 +86,7 @@ impl App {
     /// first), so table row indices line up with selection/action logic.
     pub fn sorted_contacts(&self) -> Vec<&ContactDto> {
         let mut contacts: Vec<&ContactDto> = self.snapshot.contacts.iter().collect();
-        contacts.sort_by(|a, b| b.last_advert_unix.cmp(&a.last_advert_unix));
+        contacts.sort_by_key(|c| std::cmp::Reverse(c.last_advert_unix));
         contacts
     }
 

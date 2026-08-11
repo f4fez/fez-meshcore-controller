@@ -96,7 +96,7 @@ fn print_snapshot(snap: &Snapshot) {
         println!(
             "   • {:<20} {} {last_seen}",
             accent().apply_to(&c.name),
-            muted().apply_to(format!("[{}]", &c.public_key_prefix_hex)),
+            muted().apply_to(format!("[{}]", c.public_key_prefix_hex)),
         );
     }
     println!();
