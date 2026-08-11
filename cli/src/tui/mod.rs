@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod app;
+mod packet_group;
 mod ui;
 
 use std::io::Stdout;
@@ -136,7 +137,7 @@ async fn run_loop(
                                         }
                                     }
                                     KeyCode::Char('l') => app.toggle_scroll_lock(),
-                                    KeyCode::Enter if app.selected_packet().is_some() => {
+                                    KeyCode::Enter if app.selected_group().is_some() => {
                                         app.packet_detail_open = !app.packet_detail_open;
                                     }
                                     _ => {}
