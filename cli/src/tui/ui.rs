@@ -66,6 +66,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             draw_packet_detail_popup(frame, packet);
         }
     }
+
+    if app.help_open {
+        draw_help_popup(frame, app.page);
+    }
 }
 
 fn page_tab(label: &str, active: bool) -> Span<'static> {
@@ -550,6 +554,78 @@ fn draw_packet_detail_popup(frame: &mut Frame, entry: &PacketLogEntry) {
     frame.render_widget(popup, area);
 }
 
+/// Content of the F1 help popup: a short header describing the page, plus
+/// its keyboard shortcuts. Kept per-page since Dashboard and Packet log
+/// don't share the same controls.
+fn help_content(
+    page: Page,
+) -> (
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+) {
+    match page {
+        Page::Dashboard => (
+            "Dashboard",
+            "Local node status, mesh contacts, and the live event log.",
+            &[
+                ("F1", "Toggle this help"),
+                ("F2", "Dashboard page (current)"),
+                ("F3", "Packet log page"),
+                ("↑ / ↓", "Select a contact"),
+                ("r", "Refresh snapshot"),
+                ("m", "Toggle managed repeater"),
+                ("d", "Delete contact (press twice to confirm)"),
+                ("q / Esc", "Quit"),
+            ],
+        ),
+        Page::PacketLog => (
+            "Packet log",
+            "Raw RF packets captured by the daemon (meshcore-rs LogData events).",
+            &[
+                ("F1", "Toggle this help"),
+                ("F2", "Dashboard page"),
+                ("F3", "Packet log page (current)"),
+                ("↑ / ↓", "Select a packet"),
+                ("l", "Toggle scroll lock"),
+                ("Enter", "Open / close packet detail"),
+                ("Esc", "Close popup"),
+                ("q", "Quit"),
+            ],
+        ),
+    }
+}
+
+fn draw_help_popup(frame: &mut Frame, page: Page) {
+    let area = centered_rect(60, 60, frame.area());
+    frame.render_widget(Clear, area);
+
+    let (page_name, header, shortcuts) = help_content(page);
+
+    let mut lines = vec![
+        Line::from(Span::styled(header, Style::default().fg(Color::White))),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Keyboard shortcuts",
+            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+        )),
+    ];
+    for (key, desc) in shortcuts {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {key:<10}"),
+                Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(*desc, Style::default().fg(Color::White)),
+        ]));
+    }
+
+    let popup = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(block(format!("❓ Help — {page_name}")));
+    frame.render_widget(popup, area);
+}
+
 fn truncate_hex(hex: &str) -> String {
     const MAX: usize = 96;
     if hex.len() > MAX {
@@ -559,16 +635,7 @@ fn truncate_hex(hex: &str) -> String {
     }
 }
 
-fn footer_key_hints(app: &App) -> &'static str {
-    match app.page {
-        Page::Dashboard => {
-            "   [q] Quit  [F2/F3] Page  [r] Refresh  [↑/↓] Select  [m] Toggle managed  [d] Delete contact"
-        }
-        Page::PacketLog => {
-            "   [q] Quit  [F2/F3] Page  [↑/↓] Select  [l] Scroll lock  [Enter] Details"
-        }
-    }
-}
+const FOOTER_KEY_HINTS: &str = "   [F1] Help  [F2] Dashboard  [F3] Packet log";
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     if let Some((_, name)) = &app.pending_delete {
@@ -609,7 +676,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(format!("{} ", mesh_dot.0)),
         Span::styled(mesh_dot.1, Style::default().fg(mesh_dot.2)),
         Span::raw(format!("   ⏳ {}s", app.snapshot.uptime_secs)),
-        Span::styled(footer_key_hints(app), Style::default().fg(MUTED)),
+        Span::styled(FOOTER_KEY_HINTS, Style::default().fg(MUTED)),
     ]);
 
     frame.render_widget(Paragraph::new(line), area);

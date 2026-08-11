@@ -57,6 +57,10 @@ pub struct App {
     /// Whether the packet detail popup is open for the currently selected
     /// packet.
     pub packet_detail_open: bool,
+
+    /// Whether the F1 help popup is open, showing shortcuts for the
+    /// current page.
+    pub help_open: bool,
 }
 
 impl App {
@@ -74,6 +78,7 @@ impl App {
             packet_table_state: ratatui::widgets::TableState::default(),
             locked_view: None,
             packet_detail_open: false,
+            help_open: false,
         }
     }
 

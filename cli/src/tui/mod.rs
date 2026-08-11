@@ -89,15 +89,25 @@ async fn run_loop(
                             app.pending_delete = None;
                         }
 
-                        // Page switches and quit work from anywhere.
+                        // Page switches, help and quit work from anywhere.
                         match key.code {
+                            KeyCode::F(1) => {
+                                app.help_open = !app.help_open;
+                                if app.help_open {
+                                    app.packet_detail_open = false;
+                                }
+                            }
                             KeyCode::F(2) => app.page = Page::Dashboard,
                             KeyCode::F(3) => app.page = Page::PacketLog,
                             KeyCode::Char('q') => app.should_quit = true,
+                            KeyCode::Esc if app.help_open => {
+                                app.help_open = false;
+                            }
                             KeyCode::Esc if app.packet_detail_open => {
                                 app.packet_detail_open = false;
                             }
                             KeyCode::Esc => app.should_quit = true,
+                            _ if app.help_open => {}
                             _ => match app.page {
                                 Page::Dashboard => match key.code {
                                     KeyCode::Char('r') => {
