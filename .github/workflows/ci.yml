@@ -1,0 +1,95 @@
+name: CI
+
+# OneFlow: main is the only long-lived branch; feature/release/hotfix
+# branches are short-lived and merge back into it via PR.
+on:
+  push:
+    branches:
+      - main
+      - "feature/**"
+      - "release/**"
+      - "hotfix/**"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Format & lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fez-mesh-controller
+        uses: actions/checkout@v4
+
+      # Temporary: meshcore-rs is patched in locally via
+      # [patch.crates-io] in Cargo.toml (see the comment there) until PR #59
+      # is merged upstream and released. Checked out as a sibling directory
+      # so the relative `../meshcore-rs` path resolves the same way it does
+      # in local development.
+      - name: Checkout meshcore-rs (temporary local patch)
+        uses: actions/checkout@v4
+        with:
+          repository: f4fez/meshcore-rs
+          ref: feature/raw-data-packet-handling
+          path: ../meshcore-rs
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev libdbus-1-dev
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: Build & test (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Native runners per architecture: no cross-compilation.
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout fez-mesh-controller
+        uses: actions/checkout@v4
+
+      - name: Checkout meshcore-rs (temporary local patch)
+        uses: actions/checkout@v4
+        with:
+          repository: f4fez/meshcore-rs
+          ref: feature/raw-data-packet-handling
+          path: ../meshcore-rs
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev libdbus-1-dev
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
