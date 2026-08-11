@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use fez_mesh_controller_core::ipc::MeshEvent;
 use fez_mesh_controller_core::mesh::{
-    extract_discovered_node, map_event, ContactDto, MeshClient, MeshEventKind,
+    build_packet_log_entry, extract_discovered_node, map_event, ContactDto, MeshClient,
+    MeshEventKind,
 };
 use fez_mesh_controller_core::{ConnectionConfig, ManagedRepeater};
 use futures::StreamExt;
@@ -75,6 +76,12 @@ pub async fn run(
                                         if node.is_repeater {
                                             handle_discovered_node(node, &client, &state).await;
                                         }
+                                    }
+
+                                    if let Some(entry) =
+                                        build_packet_log_entry(&raw, state.next_packet_id(), now_unix())
+                                    {
+                                        state.record_packet(entry).await;
                                     }
 
                                     let Some(kind) = map_event(&raw) else { continue };

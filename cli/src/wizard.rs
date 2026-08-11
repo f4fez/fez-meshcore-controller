@@ -94,6 +94,7 @@ pub async fn run(existing: Option<&Config>) -> anyhow::Result<Config> {
             refresh_interval_secs,
             log_level,
             log_dir,
+            packet_log_capacity: fez_mesh_controller_core::config::default_packet_log_capacity(),
         },
         managed_repeaters,
     };

@@ -14,15 +14,17 @@
 
 use chrono::{Local, TimeZone};
 use fez_mesh_controller_core::ipc::MeshEvent;
-use fez_mesh_controller_core::mesh::MeshEventKind;
+use fez_mesh_controller_core::mesh::{MeshEventKind, PacketLogEntry};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Cell, List, ListItem, Paragraph, Row, Table};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap,
+};
 use ratatui::Frame;
 
 use crate::format::{format_coords, format_last_seen};
-use crate::tui::app::App;
+use crate::tui::app::{App, Page};
 
 const CYAN: Color = Color::Rgb(0x4d, 0xd0, 0xe1);
 const MAGENTA: Color = Color::Rgb(0xe0, 0x67, 0xf2);
@@ -52,20 +54,43 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ])
         .split(frame.area());
 
-    draw_title(frame, root[0]);
-    draw_body(frame, app, root[1]);
+    draw_title(frame, app, root[0]);
+    match app.page {
+        Page::Dashboard => draw_body(frame, app, root[1]),
+        Page::PacketLog => draw_packet_log_page(frame, app, root[1]),
+    }
     draw_footer(frame, app, root[2]);
+
+    if app.page == Page::PacketLog && app.packet_detail_open {
+        if let Some(packet) = app.selected_packet() {
+            draw_packet_detail_popup(frame, packet);
+        }
+    }
 }
 
-fn draw_title(frame: &mut Frame, area: Rect) {
+fn page_tab(label: &str, active: bool) -> Span<'static> {
+    let style = if active {
+        Style::default()
+            .fg(Color::Black)
+            .bg(CYAN)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(MUTED)
+    };
+    Span::styled(format!(" {label} "), style)
+}
+
+fn draw_title(frame: &mut Frame, app: &App, area: Rect) {
     let title = Paragraph::new(Line::from(vec![
         Span::raw("📡 "),
         Span::styled(
             "fez-mesh-controller",
             Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  —  🕸️  "),
-        Span::styled("MeshCore Network Monitor", Style::default().fg(MUTED)),
+        Span::raw("   "),
+        page_tab("F2 Dashboard", app.page == Page::Dashboard),
+        Span::raw(" "),
+        page_tab("F3 Packet log", app.page == Page::PacketLog),
     ]))
     .alignment(Alignment::Center)
     .block(
@@ -298,6 +323,253 @@ fn event_line(ev: &MeshEvent) -> Line<'static> {
     ])
 }
 
+/// Color associated with a decoded payload type, for quick visual scanning.
+fn payload_type_color(payload_type: &str) -> Color {
+    match payload_type {
+        "Advert" => CYAN,
+        "TextMsg" | "GroupText" => YELLOW,
+        "Ack" => GREEN,
+        "Trace" | "Path" => MAGENTA,
+        _ => MUTED,
+    }
+}
+
+/// One-line, human-readable summary of a packet's content, tailored to its
+/// payload type since different types carry very different data.
+fn packet_summary(entry: &PacketLogEntry) -> String {
+    let Some(header) = &entry.header else {
+        return format!("undecodable header ({} byte payload)", entry.payload_len);
+    };
+
+    if let Some(adv) = &header.advertisement {
+        let name = adv.name.as_deref().unwrap_or("(unnamed)");
+        let pos = format_coords(adv.lat.unwrap_or(0.0), adv.lon.unwrap_or(0.0));
+        return format!("{} \"{name}\" @ {pos}", adv.adv_type_name);
+    }
+
+    match header.payload_type.as_str() {
+        "Ack" => "acknowledgement".to_string(),
+        "TextMsg" | "GroupText" => format!("{} bytes of (encrypted) text", entry.payload_len),
+        _ => format!("{} bytes payload", entry.payload_len),
+    }
+}
+
+fn packet_row(entry: &PacketLogEntry) -> Row<'static> {
+    let time = Local
+        .timestamp_opt(entry.at_unix, 0)
+        .single()
+        .map(|t| t.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|| "--:--:--".to_string());
+
+    let (route, ptype, hops, color) = match &entry.header {
+        Some(h) => (
+            h.route_type.clone(),
+            h.payload_type.clone(),
+            h.hops.to_string(),
+            payload_type_color(&h.payload_type),
+        ),
+        None => ("?".to_string(), "?".to_string(), "-".to_string(), MUTED),
+    };
+
+    Row::new(vec![
+        Cell::from(time),
+        Cell::from(format!("{:.1}/{}", entry.snr, entry.rssi)),
+        Cell::from(route),
+        Cell::from(Span::styled(ptype, Style::default().fg(color))),
+        Cell::from(hops),
+        Cell::from(packet_summary(entry)),
+    ])
+}
+
+fn draw_packet_log_page(frame: &mut Frame, app: &mut App, area: Rect) {
+    let packets = app.visible_packets();
+    let count = packets.len();
+    let rows: Vec<Row> = packets.iter().map(packet_row).collect();
+
+    let header = Row::new(vec![
+        Cell::from("Time"),
+        Cell::from("SNR/RSSI"),
+        Cell::from("Route"),
+        Cell::from("Type"),
+        Cell::from("Hops"),
+        Cell::from("Summary"),
+    ])
+    .style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD));
+
+    let lock_suffix = if app.locked_view.is_some() {
+        format!(" — 🔒 LOCKED (+{} new)", app.new_packets_since_lock())
+    } else {
+        " — ▶ LIVE".to_string()
+    };
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(8),
+            Constraint::Length(9),
+            Constraint::Length(16),
+            Constraint::Length(10),
+            Constraint::Length(5),
+            Constraint::Min(20),
+        ],
+    )
+    .header(header)
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::Rgb(0x2a, 0x2e, 0x3a))
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol("➤ ")
+    .block(block(format!("📦 Raw packet log ({count}){lock_suffix}")));
+
+    frame.render_stateful_widget(table, area, &mut app.packet_table_state);
+}
+
+/// Rect centered in `area`, sized to `percent_x` × `percent_y` of it.
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+/// Popup with the full detail of a packet, laid out differently depending
+/// on its payload type since e.g. an advert carries identity/position data
+/// that a plain data packet doesn't.
+fn draw_packet_detail_popup(frame: &mut Frame, entry: &PacketLogEntry) {
+    let area = centered_rect(70, 70, frame.area());
+    frame.render_widget(Clear, area);
+
+    let time = Local
+        .timestamp_opt(entry.at_unix, 0)
+        .single()
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let mut lines = vec![
+        field_line("🆔 Packet #", entry.id.to_string()),
+        field_line("🕒 Time", time),
+        field_line(
+            "📶 SNR / RSSI",
+            format!("{:.1} dB / {} dBm", entry.snr, entry.rssi),
+        ),
+    ];
+
+    match &entry.header {
+        Some(h) => {
+            lines.push(field_line("🧭 Route type", h.route_type.clone()));
+            lines.push(field_line("📦 Payload type", h.payload_type.clone()));
+            lines.push(field_line(
+                "🔢 Payload version",
+                h.payload_version.to_string(),
+            ));
+            lines.push(field_line("🦘 Hops", h.hops.to_string()));
+            if h.path_hash_size > 0 || !h.path_hex.is_empty() {
+                lines.push(field_line(
+                    "🗺️  Path",
+                    if h.path_hex.is_empty() {
+                        "flood".to_string()
+                    } else {
+                        format!("{} (hash size {})", h.path_hex, h.path_hash_size)
+                    },
+                ));
+            }
+            if let Some(tc) = &h.transport_code_hex {
+                lines.push(field_line("🚚 Transport code", tc.clone()));
+            }
+
+            match &h.advertisement {
+                Some(adv) => {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        "— Advertised identity —",
+                        Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(field_line(
+                        "🏷️  Name",
+                        adv.name.clone().unwrap_or_else(|| "(unnamed)".to_string()),
+                    ));
+                    lines.push(field_line("🔖 Advertiser type", adv.adv_type_name.clone()));
+                    lines.push(field_line("🔑 Public key", adv.public_key_hex.clone()));
+                    lines.push(field_line(
+                        "🌍 Position",
+                        format_coords(adv.lat.unwrap_or(0.0), adv.lon.unwrap_or(0.0)),
+                    ));
+                }
+                None => {
+                    lines.push(Line::from(""));
+                    lines.push(field_line(
+                        "📨 Payload",
+                        format!(
+                            "{} bytes: {}",
+                            entry.payload_len,
+                            truncate_hex(&entry.payload_hex)
+                        ),
+                    ));
+                }
+            }
+        }
+        None => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Header could not be decoded.",
+                Style::default().fg(YELLOW),
+            )));
+            lines.push(field_line(
+                "📨 Raw payload",
+                format!(
+                    "{} bytes: {}",
+                    entry.payload_len,
+                    truncate_hex(&entry.payload_hex)
+                ),
+            ));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[Enter/Esc] Close",
+        Style::default().fg(MUTED),
+    )));
+
+    let popup = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(block("🔍 Packet detail"));
+    frame.render_widget(popup, area);
+}
+
+fn truncate_hex(hex: &str) -> String {
+    const MAX: usize = 96;
+    if hex.len() > MAX {
+        format!("{}…", &hex[..MAX])
+    } else {
+        hex.to_string()
+    }
+}
+
+fn footer_key_hints(app: &App) -> &'static str {
+    match app.page {
+        Page::Dashboard => {
+            "   [q] Quit  [F2/F3] Page  [r] Refresh  [↑/↓] Select  [m] Toggle managed  [d] Delete contact"
+        }
+        Page::PacketLog => {
+            "   [q] Quit  [F2/F3] Page  [↑/↓] Select  [l] Scroll lock  [Enter] Details"
+        }
+    }
+}
+
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     if let Some((_, name)) = &app.pending_delete {
         let warning = Line::from(vec![Span::styled(
@@ -337,10 +609,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(format!("{} ", mesh_dot.0)),
         Span::styled(mesh_dot.1, Style::default().fg(mesh_dot.2)),
         Span::raw(format!("   ⏳ {}s", app.snapshot.uptime_secs)),
-        Span::styled(
-            "   [q] Quit  [r] Refresh  [↑/↓] Select  [m] Toggle managed  [d] Delete contact",
-            Style::default().fg(MUTED),
-        ),
+        Span::styled(footer_key_hints(app), Style::default().fg(MUTED)),
     ]);
 
     frame.render_widget(Paragraph::new(line), area);

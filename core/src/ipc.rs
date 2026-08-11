@@ -23,7 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::mesh::{ContactDto, MeshEventKind, SelfInfoDto};
+use crate::mesh::{ContactDto, MeshEventKind, PacketLogEntry, SelfInfoDto};
 
 /// IPC protocol version, to bump on incompatible changes.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -64,6 +64,11 @@ pub enum ServerMessage {
     Snapshot(Snapshot),
     /// Real-time mesh network event.
     Event(MeshEvent),
+    /// The current backlog of the raw packet log (TUI page F3), sent once
+    /// right after [`ServerMessage::Snapshot`] on connect.
+    PacketLog(Vec<PacketLogEntry>),
+    /// A single new raw packet, pushed as it's captured.
+    PacketLogEntry(PacketLogEntry),
     /// Non-fatal error to report to the client (e.g. lost mesh connection).
     Error(String),
 }

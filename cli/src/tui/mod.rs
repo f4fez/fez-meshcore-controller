@@ -33,14 +33,14 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use crate::ipc_client::IpcConnection;
-use app::App;
+use app::{App, Page};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
 enum UiEvent {
     DaemonConnected,
     DaemonDisconnected,
-    Server(ServerMessage),
+    Server(Box<ServerMessage>),
 }
 
 /// Launches the full-screen real-time dashboard.
@@ -89,21 +89,51 @@ async fn run_loop(
                             app.pending_delete = None;
                         }
 
+                        // Page switches and quit work from anywhere.
                         match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
-                            KeyCode::Char('r') => {
-                                app.last_status = None;
-                                let _ = cmd_tx.send(ClientMessage::RequestSnapshot).await;
+                            KeyCode::F(2) => app.page = Page::Dashboard,
+                            KeyCode::F(3) => app.page = Page::PacketLog,
+                            KeyCode::Char('q') => app.should_quit = true,
+                            KeyCode::Esc if app.packet_detail_open => {
+                                app.packet_detail_open = false;
                             }
-                            KeyCode::Down => app.select_next_contact(),
-                            KeyCode::Up => app.select_prev_contact(),
-                            KeyCode::Char('m') => {
-                                toggle_managed(app, cmd_tx).await;
-                            }
-                            KeyCode::Char('d') => {
-                                confirm_or_arm_delete(app, cmd_tx).await;
-                            }
-                            _ => {}
+                            KeyCode::Esc => app.should_quit = true,
+                            _ => match app.page {
+                                Page::Dashboard => match key.code {
+                                    KeyCode::Char('r') => {
+                                        app.last_status = None;
+                                        let _ = cmd_tx.send(ClientMessage::RequestSnapshot).await;
+                                    }
+                                    KeyCode::Down => app.select_next_contact(),
+                                    KeyCode::Up => app.select_prev_contact(),
+                                    KeyCode::Char('m') => {
+                                        toggle_managed(app, cmd_tx).await;
+                                    }
+                                    KeyCode::Char('d') => {
+                                        confirm_or_arm_delete(app, cmd_tx).await;
+                                    }
+                                    _ => {}
+                                },
+                                Page::PacketLog => match key.code {
+                                    KeyCode::Down => {
+                                        if !app.packet_detail_open {
+                                            app.select_next_packet();
+                                        }
+                                    }
+                                    KeyCode::Up => {
+                                        if !app.packet_detail_open {
+                                            app.select_prev_packet();
+                                        }
+                                    }
+                                    KeyCode::Char('l') => app.toggle_scroll_lock(),
+                                    KeyCode::Enter => {
+                                        if app.selected_packet().is_some() {
+                                            app.packet_detail_open = !app.packet_detail_open;
+                                        }
+                                    }
+                                    _ => {}
+                                },
+                            },
                         }
                     }
                 }
@@ -175,10 +205,14 @@ fn apply_ui_event(app: &mut App, event: UiEvent) {
     match event {
         UiEvent::DaemonConnected => app.daemon_connected = true,
         UiEvent::DaemonDisconnected => app.daemon_connected = false,
-        UiEvent::Server(ServerMessage::Snapshot(snapshot)) => app.snapshot = snapshot,
-        UiEvent::Server(ServerMessage::Event(event)) => app.push_event(event),
-        UiEvent::Server(ServerMessage::Error(message)) => app.last_status = Some(message),
-        UiEvent::Server(ServerMessage::Hello { .. }) => {}
+        UiEvent::Server(msg) => match *msg {
+            ServerMessage::Snapshot(snapshot) => app.snapshot = snapshot,
+            ServerMessage::Event(event) => app.push_event(event),
+            ServerMessage::PacketLog(backlog) => app.set_packet_log(backlog),
+            ServerMessage::PacketLogEntry(entry) => app.push_packet(entry),
+            ServerMessage::Error(message) => app.last_status = Some(message),
+            ServerMessage::Hello { .. } => {}
+        },
     }
 }
 
@@ -208,7 +242,7 @@ async fn ipc_task(
                 msg = conn.recv() => {
                     match msg {
                         Ok(Some(msg)) => {
-                            if ui_tx.send(UiEvent::Server(msg)).await.is_err() {
+                            if ui_tx.send(UiEvent::Server(Box::new(msg))).await.is_err() {
                                 return;
                             }
                         }

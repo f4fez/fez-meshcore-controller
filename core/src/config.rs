@@ -94,6 +94,10 @@ pub struct DaemonConfig {
     /// runs in the background (`--daemon`).
     #[serde(default = "default_log_dir")]
     pub log_dir: PathBuf,
+    /// Number of raw packets kept in the rotating packet-log cache (TUI
+    /// page F3), oldest evicted first.
+    #[serde(default = "default_packet_log_capacity")]
+    pub packet_log_capacity: usize,
 }
 
 impl Default for DaemonConfig {
@@ -103,6 +107,7 @@ impl Default for DaemonConfig {
             refresh_interval_secs: 5,
             log_level: "info".to_string(),
             log_dir: default_log_dir(),
+            packet_log_capacity: default_packet_log_capacity(),
         }
     }
 }
@@ -133,6 +138,11 @@ pub fn default_log_dir() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
         .join(APP_DIR_NAME)
         .join("logs")
+}
+
+/// Default number of entries kept in the rotating packet-log cache.
+pub fn default_packet_log_capacity() -> usize {
+    500
 }
 
 impl Config {

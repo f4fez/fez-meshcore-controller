@@ -63,6 +63,7 @@ async fn handle_client(stream: UnixStream, state: Arc<AppState>) -> Result<()> {
     let mut reader = FramedRead::new(read_half, LinesCodec::new());
     let mut writer = FramedWrite::new(write_half, LinesCodec::new());
     let mut events_rx = state.events_tx.subscribe();
+    let mut packet_log_rx = state.packet_log_tx.subscribe();
 
     send(
         &mut writer,
@@ -76,6 +77,11 @@ async fn handle_client(stream: UnixStream, state: Arc<AppState>) -> Result<()> {
         &ServerMessage::Snapshot(current_snapshot(&state).await),
     )
     .await?;
+    send(
+        &mut writer,
+        &ServerMessage::PacketLog(state.packet_log.read().await.iter().cloned().collect()),
+    )
+    .await?;
 
     loop {
         tokio::select! {
@@ -84,6 +90,16 @@ async fn handle_client(stream: UnixStream, state: Arc<AppState>) -> Result<()> {
                     Ok(event) => send(&mut writer, &ServerMessage::Event(event)).await?,
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         warn!(skipped, "IPC client too slow, events dropped");
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            entry = packet_log_rx.recv() => {
+                match entry {
+                    Ok(entry) => send(&mut writer, &ServerMessage::PacketLogEntry(entry)).await?,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(skipped, "IPC client too slow, packet log entries dropped");
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,

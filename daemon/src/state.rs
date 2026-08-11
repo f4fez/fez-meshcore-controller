@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use fez_mesh_controller_core::ipc::{MeshEvent, Snapshot};
-use fez_mesh_controller_core::mesh::DiscoveredNode;
+use fez_mesh_controller_core::mesh::{DiscoveredNode, PacketLogEntry};
 use fez_mesh_controller_core::Config;
 use tokio::sync::{broadcast, mpsc, RwLock};
 
@@ -40,6 +41,12 @@ pub struct AppState {
     /// which (unlike the plain `Advertisement` push) carries the full
     /// public key needed to register them.
     pub discovered_repeaters: RwLock<HashMap<String, DiscoveredNode>>,
+    /// Rotating cache of raw packets (newest first), for the TUI's packet
+    /// log page. Bounded to `packet_log_capacity` entries.
+    pub packet_log: RwLock<VecDeque<PacketLogEntry>>,
+    pub packet_log_capacity: usize,
+    pub packet_log_tx: broadcast::Sender<PacketLogEntry>,
+    next_packet_id: AtomicU64,
 }
 
 impl AppState {
@@ -49,6 +56,8 @@ impl AppState {
         config_path: PathBuf,
     ) -> Self {
         let (events_tx, _rx) = broadcast::channel(256);
+        let (packet_log_tx, _rx) = broadcast::channel(256);
+        let packet_log_capacity = config.daemon.packet_log_capacity.max(1);
         Self {
             snapshot: RwLock::new(Snapshot::default()),
             events_tx,
@@ -57,6 +66,10 @@ impl AppState {
             config: RwLock::new(config),
             config_path,
             discovered_repeaters: RwLock::new(HashMap::new()),
+            packet_log: RwLock::new(VecDeque::with_capacity(packet_log_capacity)),
+            packet_log_capacity,
+            packet_log_tx,
+            next_packet_id: AtomicU64::new(1),
         }
     }
 
@@ -68,5 +81,22 @@ impl AppState {
     /// nobody is listening).
     pub fn broadcast_event(&self, event: MeshEvent) {
         let _ = self.events_tx.send(event);
+    }
+
+    pub fn next_packet_id(&self) -> u64 {
+        self.next_packet_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Records a new raw packet in the rotating cache (evicting the oldest
+    /// if at capacity) and broadcasts it to connected clients.
+    pub async fn record_packet(&self, entry: PacketLogEntry) {
+        {
+            let mut log = self.packet_log.write().await;
+            if log.len() >= self.packet_log_capacity {
+                log.pop_back();
+            }
+            log.push_front(entry.clone());
+        }
+        let _ = self.packet_log_tx.send(entry);
     }
 }

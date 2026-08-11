@@ -132,6 +132,104 @@ pub fn extract_discovered_node(event: &MeshCoreEvent, now_unix: i64) -> Option<D
     })
 }
 
+/// A single raw RF packet, decoded from RF log data
+/// ([`EventType::LogData`], pushed for *every* packet the radio receives),
+/// for the packet log page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PacketLogEntry {
+    /// Monotonically increasing ID assigned by the daemon, stable even as
+    /// older entries are evicted from its rotating cache — used to detect
+    /// how many new packets arrived while the view is scroll-locked.
+    pub id: u64,
+    pub at_unix: i64,
+    pub snr: f32,
+    pub rssi: i16,
+    /// `None` if the payload was too short to contain a decodable header.
+    pub header: Option<PacketHeaderInfo>,
+    /// Inner payload (after the header and path), as hex. Opaque/encrypted
+    /// for message and channel payload types; empty for e.g. `Ack`.
+    pub payload_hex: String,
+    pub payload_len: usize,
+}
+
+/// Decoded over-the-air packet header, human-readable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PacketHeaderInfo {
+    pub route_type: String,
+    pub payload_type: String,
+    pub payload_version: u8,
+    pub hops: u8,
+    pub path_hash_size: u8,
+    pub path_hex: String,
+    pub transport_code_hex: Option<String>,
+    /// Populated when `payload_type` is `"Advert"` and the inner payload
+    /// could be decoded.
+    pub advertisement: Option<PacketAdvertInfo>,
+}
+
+/// Advertiser identity decoded from an ADVERT payload, only present on
+/// packets whose [`PacketHeaderInfo::payload_type`] is `"Advert"`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PacketAdvertInfo {
+    pub public_key_hex: String,
+    pub name: Option<String>,
+    /// Human-readable advertiser type: "Chat", "Repeater", "Room", "Sensor"
+    /// or "Unknown(N)".
+    pub adv_type_name: String,
+    pub lat: Option<f64>,
+    pub lon: Option<f64>,
+}
+
+fn adv_type_name(adv_type: u8) -> String {
+    match adv_type {
+        1 => "Chat".to_string(),
+        2 => "Repeater".to_string(),
+        3 => "Room".to_string(),
+        4 => "Sensor".to_string(),
+        other => format!("Unknown({other})"),
+    }
+}
+
+/// Builds a packet log entry from a raw `meshcore-rs` event, if it's RF log
+/// data. Returns `None` for anything else. Unlike [`extract_discovered_node`],
+/// this captures *every* decodable packet, not just advertisements.
+pub fn build_packet_log_entry(
+    event: &MeshCoreEvent,
+    id: u64,
+    now_unix: i64,
+) -> Option<PacketLogEntry> {
+    let EventPayload::LogData(log) = &event.payload else {
+        return None;
+    };
+
+    let header = log.header.as_ref().map(|h| PacketHeaderInfo {
+        route_type: format!("{:?}", h.route_type),
+        payload_type: format!("{:?}", h.payload_type),
+        payload_version: h.payload_version,
+        hops: h.path_len,
+        path_hash_size: h.path_hash_size,
+        path_hex: hex_encode(&h.path),
+        transport_code_hex: h.transport_code.map(|c| hex_encode(&c)),
+        advertisement: log.advertisement.as_ref().map(|a| PacketAdvertInfo {
+            public_key_hex: hex_encode(&a.public_key),
+            name: a.name.clone(),
+            adv_type_name: adv_type_name(a.adv_type),
+            lat: a.lat.map(|v| v as f64 / 1_000_000.0),
+            lon: a.lon.map(|v| v as f64 / 1_000_000.0),
+        }),
+    });
+
+    Some(PacketLogEntry {
+        id,
+        at_unix: now_unix,
+        snr: log.snr,
+        rssi: log.rssi,
+        header,
+        payload_hex: hex_encode(&log.payload),
+        payload_len: log.payload.len(),
+    })
+}
+
 /// Simplified, serializable version of a `meshcore-rs` event, as broadcast
 /// by the daemon to IPC clients.
 #[derive(Debug, Clone, Serialize, Deserialize)]
