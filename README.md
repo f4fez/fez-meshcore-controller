@@ -21,7 +21,7 @@ cargo run -p fez-mesh-controller-daemon
 cargo run -p fez-mesh-controller-cli
 ```
 
-Configuration is stored in `~/.config/fez-mesh-controller/config.toml` (re-run the wizard with `fez-mesh-controller setup`).
+Configuration is stored in `~/.config/fez-mesh-controller/config.toml` (re-run the wizard with `fez-mesh-controller setup`). See [`config.example.toml`](config.example.toml) for every available parameter, with comments.
 
 ## Daemon command-line options
 
