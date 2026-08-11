@@ -100,3 +100,114 @@ impl AppState {
         let _ = self.packet_log_tx.send(entry);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fez_mesh_controller_core::mesh::MeshEventKind;
+    use fez_mesh_controller_core::{Config, ConnectionConfig, DaemonConfig};
+
+    fn make_state(packet_log_capacity: usize) -> AppState {
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let config = Config {
+            node_label: "test-node".to_string(),
+            connection: ConnectionConfig::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: 5000,
+            },
+            daemon: DaemonConfig {
+                socket_path: PathBuf::from("/tmp/fez-mesh-controller-test.sock"),
+                refresh_interval_secs: 5,
+                log_level: "info".to_string(),
+                log_dir: PathBuf::from("/tmp/fez-mesh-controller-test/logs"),
+                packet_log_capacity,
+            },
+            managed_repeaters: vec![],
+        };
+        AppState::new(
+            command_tx,
+            config,
+            PathBuf::from("/tmp/fez-mesh-controller-test.toml"),
+        )
+    }
+
+    fn sample_packet(id: u64) -> PacketLogEntry {
+        PacketLogEntry {
+            id,
+            at_unix: 0,
+            snr: 1.0,
+            rssi: -90,
+            header: None,
+            payload_hex: String::new(),
+            payload_len: 0,
+        }
+    }
+
+    #[test]
+    fn next_packet_id_increments_starting_at_one() {
+        let state = make_state(500);
+        assert_eq!(state.next_packet_id(), 1);
+        assert_eq!(state.next_packet_id(), 2);
+        assert_eq!(state.next_packet_id(), 3);
+    }
+
+    #[test]
+    fn packet_log_capacity_is_at_least_one() {
+        // A misconfigured `packet_log_capacity = 0` must not make the cache
+        // unusable (and `VecDeque::with_capacity(0)` would be fine, but a
+        // capacity of 0 in `record_packet`'s eviction check would drop
+        // every entry immediately).
+        let (command_tx, _rx) = mpsc::channel(1);
+        let config = Config {
+            node_label: "test-node".to_string(),
+            connection: ConnectionConfig::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: 5000,
+            },
+            daemon: DaemonConfig {
+                socket_path: PathBuf::from("/tmp/fez-mesh-controller-test.sock"),
+                refresh_interval_secs: 5,
+                log_level: "info".to_string(),
+                log_dir: PathBuf::from("/tmp/fez-mesh-controller-test/logs"),
+                packet_log_capacity: 0,
+            },
+            managed_repeaters: vec![],
+        };
+        let state = AppState::new(command_tx, config, PathBuf::from("/tmp/x.toml"));
+        assert_eq!(state.packet_log_capacity, 1);
+    }
+
+    #[tokio::test]
+    async fn record_packet_keeps_newest_first_up_to_capacity() {
+        let state = make_state(2);
+
+        state.record_packet(sample_packet(1)).await;
+        state.record_packet(sample_packet(2)).await;
+        state.record_packet(sample_packet(3)).await;
+
+        let log = state.packet_log.read().await;
+        let ids: Vec<u64> = log.iter().map(|p| p.id).collect();
+        // Oldest (id 1) evicted; newest (id 3) at the front.
+        assert_eq!(ids, vec![3, 2]);
+    }
+
+    #[tokio::test]
+    async fn record_packet_broadcasts_to_subscribers() {
+        let state = make_state(500);
+        let mut rx = state.packet_log_tx.subscribe();
+
+        state.record_packet(sample_packet(1)).await;
+
+        let received = rx.try_recv().expect("should have received the packet");
+        assert_eq!(received.id, 1);
+    }
+
+    #[test]
+    fn broadcast_event_without_subscribers_does_not_panic() {
+        let state = make_state(500);
+        state.broadcast_event(MeshEvent {
+            at_unix: 0,
+            kind: MeshEventKind::Connected,
+        });
+    }
+}

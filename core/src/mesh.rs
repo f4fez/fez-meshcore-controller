@@ -470,3 +470,508 @@ impl MeshClient {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use meshcore_rs::events::{
+        AdvertisementData, ChannelMessage, ContactMessage, LogData, MeshPacketHeader,
+        PathUpdateData, RawAdvertisement, SelfInfo,
+    };
+    use meshcore_rs::packets::RouteType;
+    use std::collections::HashMap;
+
+    fn event(event_type: EventType, payload: EventPayload) -> MeshCoreEvent {
+        MeshCoreEvent {
+            event_type,
+            payload,
+            attributes: HashMap::new(),
+        }
+    }
+
+    fn advert_header(payload_type: PayloadType) -> MeshPacketHeader {
+        MeshPacketHeader {
+            route_type: RouteType::Flood,
+            payload_type,
+            payload_version: 1,
+            transport_code: None,
+            path_len: 2,
+            path_hash_size: 1,
+            path: vec![0x11, 0x22],
+        }
+    }
+
+    fn sample_advertisement(adv_type: u8) -> RawAdvertisement {
+        RawAdvertisement {
+            public_key: [0xab; 32],
+            timestamp: 1_700_000_000,
+            signature: [0u8; 64],
+            adv_type,
+            lat: Some(48_850_000),
+            lon: Some(2_350_000),
+            name: Some("Node A".to_string()),
+        }
+    }
+
+    // --- hex_encode ---------------------------------------------------
+
+    #[test]
+    fn hex_encode_formats_lowercase_padded() {
+        assert_eq!(hex_encode(&[0x00, 0xab, 0xff]), "00abff");
+        assert_eq!(hex_encode(&[]), "");
+    }
+
+    // --- extract_discovered_node ---------------------------------------
+
+    #[test]
+    fn extract_discovered_node_ignores_non_log_data_events() {
+        assert!(
+            extract_discovered_node(&event(EventType::Connected, EventPayload::None), 0).is_none()
+        );
+    }
+
+    #[test]
+    fn extract_discovered_node_ignores_log_data_without_header() {
+        let log = LogData {
+            snr: 4.0,
+            rssi: -90,
+            header: None,
+            advertisement: None,
+            payload: vec![],
+        };
+        assert!(
+            extract_discovered_node(&event(EventType::LogData, EventPayload::LogData(log)), 0)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn extract_discovered_node_ignores_non_advert_payload_type() {
+        let log = LogData {
+            snr: 4.0,
+            rssi: -90,
+            header: Some(advert_header(PayloadType::TextMsg)),
+            advertisement: None,
+            payload: vec![],
+        };
+        assert!(
+            extract_discovered_node(&event(EventType::LogData, EventPayload::LogData(log)), 0)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn extract_discovered_node_ignores_advert_header_without_decoded_advertisement() {
+        let log = LogData {
+            snr: 4.0,
+            rssi: -90,
+            header: Some(advert_header(PayloadType::Advert)),
+            advertisement: None,
+            payload: vec![],
+        };
+        assert!(
+            extract_discovered_node(&event(EventType::LogData, EventPayload::LogData(log)), 0)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn extract_discovered_node_resolves_full_identity_for_a_repeater() {
+        let log = LogData {
+            snr: 4.0,
+            rssi: -90,
+            header: Some(advert_header(PayloadType::Advert)),
+            advertisement: Some(sample_advertisement(2)),
+            payload: vec![],
+        };
+        let node = extract_discovered_node(
+            &event(EventType::LogData, EventPayload::LogData(log)),
+            1_700_000_042,
+        )
+        .expect("should resolve a discovered node");
+
+        assert_eq!(node.name, "Node A");
+        assert_eq!(node.public_key_hex, "ab".repeat(32));
+        assert_eq!(node.public_key_prefix_hex, "abababababab");
+        assert!(node.is_repeater);
+        assert_eq!(node.lat, 48.85);
+        assert_eq!(node.lon, 2.35);
+        assert_eq!(node.last_seen_unix, 1_700_000_042);
+    }
+
+    #[test]
+    fn extract_discovered_node_non_repeater_advert_type_is_not_a_repeater() {
+        let log = LogData {
+            snr: 4.0,
+            rssi: -90,
+            header: Some(advert_header(PayloadType::Advert)),
+            advertisement: Some(sample_advertisement(1)), // Chat, not Repeater
+            payload: vec![],
+        };
+        let node =
+            extract_discovered_node(&event(EventType::LogData, EventPayload::LogData(log)), 0)
+                .unwrap();
+        assert!(!node.is_repeater);
+    }
+
+    #[test]
+    fn extract_discovered_node_defaults_name_and_position_when_absent() {
+        let mut adv = sample_advertisement(2);
+        adv.name = None;
+        adv.lat = None;
+        adv.lon = None;
+        let log = LogData {
+            snr: 4.0,
+            rssi: -90,
+            header: Some(advert_header(PayloadType::Advert)),
+            advertisement: Some(adv),
+            payload: vec![],
+        };
+        let node =
+            extract_discovered_node(&event(EventType::LogData, EventPayload::LogData(log)), 0)
+                .unwrap();
+        assert_eq!(node.name, "");
+        assert_eq!(node.lat, 0.0);
+        assert_eq!(node.lon, 0.0);
+    }
+
+    // --- build_packet_log_entry -----------------------------------------
+
+    #[test]
+    fn build_packet_log_entry_ignores_non_log_data_events() {
+        assert!(
+            build_packet_log_entry(&event(EventType::Connected, EventPayload::None), 1, 0)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn build_packet_log_entry_handles_undecodable_header() {
+        let log = LogData {
+            snr: 1.5,
+            rssi: -80,
+            header: None,
+            advertisement: None,
+            payload: vec![0xde, 0xad],
+        };
+        let entry = build_packet_log_entry(
+            &event(EventType::LogData, EventPayload::LogData(log)),
+            7,
+            42,
+        )
+        .expect("entry should still be built without a header");
+
+        assert_eq!(entry.id, 7);
+        assert_eq!(entry.at_unix, 42);
+        assert_eq!(entry.snr, 1.5);
+        assert_eq!(entry.rssi, -80);
+        assert!(entry.header.is_none());
+        assert_eq!(entry.payload_hex, "dead");
+        assert_eq!(entry.payload_len, 2);
+    }
+
+    #[test]
+    fn build_packet_log_entry_decodes_header_without_advertisement() {
+        let mut header = advert_header(PayloadType::Ack);
+        header.transport_code = Some([1, 2, 3, 4]);
+        let log = LogData {
+            snr: 2.0,
+            rssi: -70,
+            header: Some(header),
+            advertisement: None,
+            payload: vec![],
+        };
+        let entry =
+            build_packet_log_entry(&event(EventType::LogData, EventPayload::LogData(log)), 1, 0)
+                .unwrap();
+        let header = entry.header.expect("header should be decoded");
+
+        assert_eq!(header.route_type, "Flood");
+        assert_eq!(header.payload_type, "Ack");
+        assert_eq!(header.hops, 2);
+        assert_eq!(header.path_hash_size, 1);
+        assert_eq!(header.path_hex, "1122");
+        assert_eq!(header.transport_code_hex.as_deref(), Some("01020304"));
+        assert!(header.advertisement.is_none());
+    }
+
+    #[test]
+    fn build_packet_log_entry_decodes_advertisement_with_human_readable_type() {
+        let log = LogData {
+            snr: 2.0,
+            rssi: -70,
+            header: Some(advert_header(PayloadType::Advert)),
+            advertisement: Some(sample_advertisement(4)), // Sensor
+            payload: vec![],
+        };
+        let entry =
+            build_packet_log_entry(&event(EventType::LogData, EventPayload::LogData(log)), 1, 0)
+                .unwrap();
+        let adv = entry
+            .header
+            .expect("header")
+            .advertisement
+            .expect("advertisement");
+
+        assert_eq!(adv.public_key_hex, "ab".repeat(32));
+        assert_eq!(adv.name.as_deref(), Some("Node A"));
+        assert_eq!(adv.adv_type_name, "Sensor");
+        assert_eq!(adv.lat, Some(48.85));
+        assert_eq!(adv.lon, Some(2.35));
+    }
+
+    #[test]
+    fn build_packet_log_entry_labels_unknown_advertiser_type() {
+        let log = LogData {
+            snr: 0.0,
+            rssi: 0,
+            header: Some(advert_header(PayloadType::Advert)),
+            advertisement: Some(sample_advertisement(9)),
+            payload: vec![],
+        };
+        let entry =
+            build_packet_log_entry(&event(EventType::LogData, EventPayload::LogData(log)), 1, 0)
+                .unwrap();
+        assert_eq!(
+            entry.header.unwrap().advertisement.unwrap().adv_type_name,
+            "Unknown(9)"
+        );
+    }
+
+    // --- map_event -------------------------------------------------------
+
+    #[test]
+    fn map_event_connected_and_disconnected() {
+        assert!(matches!(
+            map_event(&event(EventType::Connected, EventPayload::None)),
+            Some(MeshEventKind::Connected)
+        ));
+        assert!(matches!(
+            map_event(&event(EventType::Disconnected, EventPayload::None)),
+            Some(MeshEventKind::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn map_event_advertisement_converts_prefix_and_position() {
+        let adv = AdvertisementData {
+            prefix: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            name: "Repeater A".to_string(),
+            lat: 48_850_000,
+            lon: 2_350_000,
+        };
+        let mapped = map_event(&event(
+            EventType::Advertisement,
+            EventPayload::Advertisement(adv),
+        ))
+        .unwrap();
+        match mapped {
+            MeshEventKind::Advertisement {
+                name,
+                prefix_hex,
+                lat,
+                lon,
+            } => {
+                assert_eq!(name, "Repeater A");
+                assert_eq!(prefix_hex, "aabbccddeeff");
+                assert_eq!(lat, 48.85);
+                assert_eq!(lon, 2.35);
+            }
+            other => panic!("expected Advertisement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_event_contact_message() {
+        let msg = ContactMessage {
+            sender_prefix: [1, 2, 3, 4, 5, 6],
+            path_len: 3,
+            txt_type: 0,
+            sender_timestamp: 0,
+            text: "hello".to_string(),
+            snr: None,
+            signature: None,
+        };
+        let mapped = map_event(&event(
+            EventType::ContactMsgRecv,
+            EventPayload::ContactMessage(msg),
+        ))
+        .unwrap();
+        match mapped {
+            MeshEventKind::ContactMessage {
+                from_prefix_hex,
+                hops,
+                text,
+            } => {
+                assert_eq!(from_prefix_hex, "010203040506");
+                assert_eq!(hops, 3);
+                assert_eq!(text, "hello");
+            }
+            other => panic!("expected ContactMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_event_channel_message() {
+        let msg = ChannelMessage {
+            channel_idx: 2,
+            path_len: 1,
+            txt_type: 0,
+            sender_timestamp: 0,
+            text: "hi all".to_string(),
+            snr: None,
+        };
+        let mapped = map_event(&event(
+            EventType::ChannelMsgRecv,
+            EventPayload::ChannelMessage(msg),
+        ))
+        .unwrap();
+        match mapped {
+            MeshEventKind::ChannelMessage {
+                channel,
+                hops,
+                text,
+            } => {
+                assert_eq!(channel, 2);
+                assert_eq!(hops, 1);
+                assert_eq!(text, "hi all");
+            }
+            other => panic!("expected ChannelMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_event_path_update() {
+        let update = PathUpdateData {
+            prefix: [1, 2, 3, 4, 5, 6],
+            path_len: -1,
+            path: vec![0xaa, 0xbb],
+        };
+        let mapped = map_event(&event(
+            EventType::PathUpdate,
+            EventPayload::PathUpdate(update),
+        ))
+        .unwrap();
+        match mapped {
+            MeshEventKind::PathUpdate {
+                prefix_hex,
+                hops,
+                path_hex,
+            } => {
+                assert_eq!(prefix_hex, "010203040506");
+                assert_eq!(hops, -1);
+                assert_eq!(path_hex, "aabb");
+            }
+            other => panic!("expected PathUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_event_ack() {
+        let mapped = map_event(&event(
+            EventType::Ack,
+            EventPayload::Ack { tag: [1, 2, 3, 4] },
+        ))
+        .unwrap();
+        match mapped {
+            MeshEventKind::Ack { tag_hex } => assert_eq!(tag_hex, "01020304"),
+            other => panic!("expected Ack, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_event_log_data_becomes_rf_log() {
+        let log = LogData {
+            snr: 3.5,
+            rssi: -95,
+            header: None,
+            advertisement: None,
+            payload: vec![],
+        };
+        let mapped = map_event(&event(EventType::LogData, EventPayload::LogData(log))).unwrap();
+        match mapped {
+            MeshEventKind::RfLog { snr, rssi } => {
+                assert_eq!(snr, 3.5);
+                assert_eq!(rssi, -95);
+            }
+            other => panic!("expected RfLog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_event_ok_and_next_contact_are_filtered_out() {
+        assert!(map_event(&event(EventType::Ok, EventPayload::None)).is_none());
+        assert!(map_event(&event(EventType::NextContact, EventPayload::None)).is_none());
+    }
+
+    #[test]
+    fn map_event_unhandled_type_falls_back_to_other() {
+        let mapped = map_event(&event(EventType::Battery, EventPayload::None)).unwrap();
+        match mapped {
+            MeshEventKind::Other { label } => assert_eq!(label, "Battery"),
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    // --- DTO conversions --------------------------------------------------
+
+    #[test]
+    fn self_info_dto_converts_units() {
+        let info = SelfInfo {
+            adv_type: 1,
+            tx_power: 22,
+            max_tx_power: 22,
+            public_key: [0xcd; 32],
+            adv_lat: 48_850_000,
+            adv_lon: 2_350_000,
+            multi_acks: 0,
+            adv_loc_policy: 0,
+            telemetry_mode_base: 0,
+            telemetry_mode_loc: 0,
+            telemetry_mode_env: 0,
+            manual_add_contacts: false,
+            radio_freq: 869_525,
+            radio_bw: 250_000,
+            sf: 10,
+            cr: 5,
+            name: "Base station".to_string(),
+        };
+        let dto = SelfInfoDto::from(&info);
+
+        assert_eq!(dto.name, "Base station");
+        assert_eq!(dto.public_key_hex, "cd".repeat(32));
+        assert_eq!(dto.radio_freq_mhz, 869.525);
+        assert_eq!(dto.spreading_factor, 10);
+        assert_eq!(dto.coding_rate, 5);
+        assert_eq!(dto.tx_power_dbm, 22);
+        assert_eq!(dto.lat, 48.85);
+        assert_eq!(dto.lon, 2.35);
+    }
+
+    #[test]
+    fn contact_dto_from_contact_marks_registered_and_unmanaged() {
+        let mut public_key = [0u8; 32];
+        public_key[..6].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        let contact = Contact {
+            public_key,
+            contact_type: 2,
+            flags: 0,
+            path_len: -1,
+            out_path: vec![],
+            adv_name: "Repeater".to_string(),
+            last_advert: 1_700_000_000,
+            adv_lat: 48_850_000,
+            adv_lon: 2_350_000,
+            last_modification_timestamp: 0,
+        };
+        let dto = ContactDto::from(&contact);
+
+        assert_eq!(dto.name, "Repeater");
+        assert_eq!(dto.public_key_prefix_hex, "010203040506");
+        assert_eq!(dto.last_advert_unix, 1_700_000_000);
+        assert_eq!(dto.lat, 48.85);
+        assert_eq!(dto.lon, 2.35);
+        assert!(dto.registered);
+        assert!(!dto.managed);
+    }
+}

@@ -80,3 +80,83 @@ impl SingleInstanceLock {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acquire_writes_current_pid_to_the_lock_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("daemon.lock");
+
+        let _lock = SingleInstanceLock::acquire(&path).expect("should acquire an unheld lock");
+
+        let content = std::fs::read_to_string(&path).expect("read lock file");
+        assert_eq!(content, std::process::id().to_string());
+    }
+
+    #[test]
+    fn acquire_creates_missing_parent_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested/deeper/daemon.lock");
+
+        let _lock = SingleInstanceLock::acquire(&path).expect("should create parents and lock");
+
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn acquire_fails_while_another_guard_holds_the_same_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("daemon.lock");
+
+        let _first = SingleInstanceLock::acquire(&path).expect("first acquire should succeed");
+        let second = SingleInstanceLock::acquire(&path);
+
+        assert!(second.is_err());
+    }
+
+    #[test]
+    fn acquire_succeeds_again_once_the_previous_guard_is_dropped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("daemon.lock");
+
+        let first = SingleInstanceLock::acquire(&path).expect("first acquire should succeed");
+        drop(first);
+
+        assert!(SingleInstanceLock::acquire(&path).is_ok());
+    }
+
+    #[test]
+    fn failed_acquire_does_not_corrupt_the_existing_lock_file_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("daemon.lock");
+
+        let _holder = SingleInstanceLock::acquire(&path).expect("first acquire should succeed");
+        let before = std::fs::read_to_string(&path).expect("read lock file");
+
+        // A second, failing attempt must not truncate/wipe the first
+        // holder's recorded PID (regression test: `OpenOptions::truncate`
+        // would erase it as soon as the file is opened, before the flock
+        // check even runs).
+        assert!(SingleInstanceLock::acquire(&path).is_err());
+
+        let after = std::fs::read_to_string(&path).expect("read lock file");
+        assert_eq!(before, after);
+        assert_eq!(after, std::process::id().to_string());
+    }
+
+    #[test]
+    fn write_current_pid_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("daemon.lock");
+        let mut lock = SingleInstanceLock::acquire(&path).expect("acquire");
+
+        lock.write_current_pid().expect("rewrite pid");
+        lock.write_current_pid().expect("rewrite pid again");
+
+        let content = std::fs::read_to_string(&path).expect("read lock file");
+        assert_eq!(content, std::process::id().to_string());
+    }
+}

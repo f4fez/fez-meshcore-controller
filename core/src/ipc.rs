@@ -92,3 +92,68 @@ pub struct MeshEvent {
     pub at_unix: i64,
     pub kind: MeshEventKind,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mesh::PacketLogEntry;
+
+    /// Every message must round-trip through JSON, and must serialize to a
+    /// single line: the daemon <-> CLI transport is newline-delimited
+    /// (`LinesCodec`), so an embedded `\n` would corrupt the stream.
+    fn assert_roundtrips_as_single_line<T>(value: &T)
+    where
+        T: Serialize + for<'de> Deserialize<'de> + std::fmt::Debug,
+    {
+        let text = serde_json::to_string(value).expect("serialize");
+        assert!(
+            !text.contains('\n'),
+            "message must serialize to a single line, got: {text}"
+        );
+        let _: T = serde_json::from_str(&text).expect("deserialize");
+    }
+
+    #[test]
+    fn client_messages_roundtrip() {
+        assert_roundtrips_as_single_line(&ClientMessage::RequestSnapshot);
+        assert_roundtrips_as_single_line(&ClientMessage::RemoveContact {
+            public_key_prefix_hex: "aabbccddeeff".to_string(),
+        });
+        assert_roundtrips_as_single_line(&ClientMessage::SetManagedRepeater {
+            public_key_prefix_hex: "aabbccddeeff".to_string(),
+            name: "Repeater".to_string(),
+            managed: true,
+        });
+    }
+
+    #[test]
+    fn server_messages_roundtrip() {
+        assert_roundtrips_as_single_line(&ServerMessage::Hello {
+            version: PROTOCOL_VERSION,
+        });
+        assert_roundtrips_as_single_line(&ServerMessage::Snapshot(Snapshot::default()));
+        assert_roundtrips_as_single_line(&ServerMessage::Event(MeshEvent {
+            at_unix: 0,
+            kind: MeshEventKind::Connected,
+        }));
+        assert_roundtrips_as_single_line(&ServerMessage::PacketLog(vec![]));
+        assert_roundtrips_as_single_line(&ServerMessage::PacketLogEntry(PacketLogEntry {
+            id: 1,
+            at_unix: 0,
+            snr: 1.0,
+            rssi: -90,
+            header: None,
+            payload_hex: "abcd".to_string(),
+            payload_len: 2,
+        }));
+        assert_roundtrips_as_single_line(&ServerMessage::Error("oops".to_string()));
+    }
+
+    #[test]
+    fn snapshot_default_is_disconnected_and_empty() {
+        let snapshot = Snapshot::default();
+        assert!(!snapshot.mesh_connected);
+        assert!(snapshot.self_info.is_none());
+        assert!(snapshot.contacts.is_empty());
+    }
+}

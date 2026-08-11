@@ -178,3 +178,138 @@ impl Config {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_config() -> Config {
+        Config {
+            node_label: "test-node".to_string(),
+            connection: ConnectionConfig::Serial {
+                port: "/dev/ttyUSB0".to_string(),
+                baud_rate: 115_200,
+            },
+            daemon: DaemonConfig {
+                socket_path: PathBuf::from("/tmp/fez-mesh-controller.sock"),
+                refresh_interval_secs: 5,
+                log_level: "info".to_string(),
+                log_dir: PathBuf::from("/tmp/fez-mesh-controller/logs"),
+                packet_log_capacity: 500,
+            },
+            managed_repeaters: vec![ManagedRepeater {
+                name: "F4FEZ Repeater".to_string(),
+                public_key_hex: "ab".repeat(32),
+            }],
+        }
+    }
+
+    #[test]
+    fn managed_repeater_matches_is_case_insensitive_prefix() {
+        let repeater = ManagedRepeater {
+            name: "Repeater".to_string(),
+            public_key_hex: "AaBbCc0011223344556677889900aabbccddeeff00112233445566778899aa"
+                .to_string(),
+        };
+
+        assert!(repeater.matches("aabbcc001122"));
+        assert!(repeater.matches("AABBCC001122"));
+        assert!(repeater.matches(&repeater.public_key_hex));
+        assert!(!repeater.matches("ffffff"));
+        assert!(!repeater.matches("aabbcc001123"));
+    }
+
+    #[test]
+    fn managed_repeater_matches_empty_prefix() {
+        let repeater = ManagedRepeater {
+            name: "Repeater".to_string(),
+            public_key_hex: "ab".repeat(32),
+        };
+        // Every key starts with the empty prefix.
+        assert!(repeater.matches(""));
+    }
+
+    #[test]
+    fn connection_config_display() {
+        assert_eq!(
+            ConnectionConfig::Serial {
+                port: "/dev/ttyUSB0".to_string(),
+                baud_rate: 115_200,
+            }
+            .to_string(),
+            "serial /dev/ttyUSB0 @ 115200 baud"
+        );
+        assert_eq!(
+            ConnectionConfig::Tcp {
+                host: "192.168.1.42".to_string(),
+                port: 5000,
+            }
+            .to_string(),
+            "TCP 192.168.1.42:5000"
+        );
+        assert_eq!(
+            ConnectionConfig::Ble {
+                name: "MeshCore-XXXXXX".to_string(),
+            }
+            .to_string(),
+            "BLE \"MeshCore-XXXXXX\""
+        );
+    }
+
+    #[test]
+    fn daemon_config_default_uses_500_packet_log_capacity() {
+        assert_eq!(DaemonConfig::default().packet_log_capacity, 500);
+    }
+
+    #[test]
+    fn config_save_and_load_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let original = sample_config();
+
+        original.save_to(&path).expect("save_to");
+        let loaded = Config::load_from(&path).expect("load_from");
+
+        assert_eq!(loaded.node_label, original.node_label);
+        assert_eq!(loaded.daemon.packet_log_capacity, 500);
+        assert_eq!(loaded.managed_repeaters.len(), 1);
+        assert_eq!(loaded.managed_repeaters[0].name, "F4FEZ Repeater");
+        match loaded.connection {
+            ConnectionConfig::Serial { port, baud_rate } => {
+                assert_eq!(port, "/dev/ttyUSB0");
+                assert_eq!(baud_rate, 115_200);
+            }
+            other => panic!("expected Serial connection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_missing_managed_repeaters_defaults_to_empty() {
+        // Older config files predate `managed_repeaters`; loading one
+        // without the key must not fail.
+        let toml = r#"
+            node_label = "legacy-node"
+
+            [connection]
+            type = "tcp"
+            host = "127.0.0.1"
+            port = 5000
+
+            [daemon]
+            socket_path = "/tmp/fez-mesh-controller.sock"
+            refresh_interval_secs = 5
+            log_level = "info"
+        "#;
+        let config: Config = toml::from_str(toml).expect("parse legacy config");
+        assert!(config.managed_repeaters.is_empty());
+        assert_eq!(config.daemon.packet_log_capacity, 500);
+        assert_eq!(config.daemon.log_dir, default_log_dir());
+    }
+
+    #[test]
+    fn config_load_from_missing_file_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("does-not-exist.toml");
+        assert!(Config::load_from(&path).is_err());
+    }
+}
