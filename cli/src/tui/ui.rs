@@ -93,6 +93,8 @@ fn draw_title(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
         ),
         Span::raw("   "),
+        page_tab("F1 Help", app.help_open),
+        Span::raw(" "),
         page_tab("F2 Dashboard", app.page == Page::Dashboard),
         Span::raw(" "),
         page_tab("F3 Packet log", app.page == Page::PacketLog),
@@ -736,8 +738,6 @@ fn truncate_hex(hex: &str) -> String {
     }
 }
 
-const FOOTER_KEY_HINTS: &str = "   [F1] Help  [F2] Dashboard  [F3] Packet log";
-
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     if let Some((_, name)) = &app.pending_delete {
         let warning = Line::from(vec![Span::styled(
@@ -777,7 +777,6 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(format!("{} ", mesh_dot.0)),
         Span::styled(mesh_dot.1, Style::default().fg(mesh_dot.2)),
         Span::raw(format!("   ⏳ {}s", app.snapshot.uptime_secs)),
-        Span::styled(FOOTER_KEY_HINTS, Style::default().fg(MUTED)),
     ]);
 
     frame.render_widget(Paragraph::new(line), area);
