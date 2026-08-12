@@ -738,6 +738,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn adv_type_name_labels_known_types() {
+        assert_eq!(adv_type_name(1), "Chat");
+        assert_eq!(adv_type_name(2), "Repeater");
+        assert_eq!(adv_type_name(3), "Room");
+        assert_eq!(adv_type_name(4), "Sensor");
+        assert_eq!(adv_type_name(9), "Unknown(9)");
+    }
+
     // --- map_event -------------------------------------------------------
 
     #[test]
@@ -902,6 +911,39 @@ mod tests {
     fn map_event_ok_and_next_contact_are_filtered_out() {
         assert!(map_event(&event(EventType::Ok, EventPayload::None)).is_none());
         assert!(map_event(&event(EventType::NextContact, EventPayload::None)).is_none());
+    }
+
+    #[test]
+    fn map_event_new_contact() {
+        let mut public_key = [0u8; 32];
+        public_key[..6].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        let contact = Contact {
+            public_key,
+            contact_type: 2,
+            flags: 0,
+            path_len: -1,
+            out_path: vec![],
+            adv_name: "Repeater A".to_string(),
+            last_advert: 0,
+            adv_lat: 0,
+            adv_lon: 0,
+            last_modification_timestamp: 0,
+        };
+        let mapped = map_event(&event(
+            EventType::NewContact,
+            EventPayload::Contact(contact),
+        ))
+        .unwrap();
+        match mapped {
+            MeshEventKind::NewContact { name } => assert_eq!(name, "Repeater A"),
+            other => panic!("expected NewContact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_event_msg_sent() {
+        let mapped = map_event(&event(EventType::MsgSent, EventPayload::None)).unwrap();
+        assert!(matches!(mapped, MeshEventKind::MessageSent));
     }
 
     #[test]
