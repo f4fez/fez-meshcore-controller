@@ -514,3 +514,118 @@ async fn upsert_managed_repeater_config(
         .save_to(&state.config_path)
         .map_err(|err| format!("failed to save config: {err}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fez_mesh_controller_core::{Config, DaemonConfig};
+    use std::path::PathBuf;
+
+    /// Builds an `AppState` backed by a real (tempdir) config path, so
+    /// `save_to` actually persists and can be reloaded to verify.
+    fn make_state(managed_repeaters: Vec<ManagedRepeater>) -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let config = Config {
+            node_label: "test-node".to_string(),
+            connection: ConnectionConfig::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: 5000,
+            },
+            daemon: DaemonConfig {
+                socket_path: PathBuf::from("/tmp/fez-mesh-controller-test.sock"),
+                refresh_interval_secs: 5,
+                log_level: "info".to_string(),
+                log_dir: PathBuf::from("/tmp/fez-mesh-controller-test/logs"),
+                packet_log_capacity: 500,
+            },
+            managed_repeaters,
+        };
+        let state = AppState::new(command_tx, config, config_path);
+        (state, dir)
+    }
+
+    #[tokio::test]
+    async fn upsert_adds_a_new_managed_repeater() {
+        let (state, _dir) = make_state(vec![]);
+
+        upsert_managed_repeater_config(
+            &state,
+            "aabbccddeeff",
+            "Repeater A",
+            true,
+            Some("aa".repeat(32)),
+        )
+        .await
+        .unwrap();
+
+        let config = state.config.read().await;
+        assert_eq!(config.managed_repeaters.len(), 1);
+        assert_eq!(config.managed_repeaters[0].name, "Repeater A");
+        assert_eq!(config.managed_repeaters[0].public_key_hex, "aa".repeat(32));
+    }
+
+    #[tokio::test]
+    async fn upsert_updates_an_existing_managed_repeater() {
+        let (state, _dir) = make_state(vec![ManagedRepeater {
+            name: "Old Name".to_string(),
+            public_key_hex: "aabbccddeeff".to_string(),
+        }]);
+
+        upsert_managed_repeater_config(&state, "aabbccddeeff", "New Name", true, None)
+            .await
+            .unwrap();
+
+        let config = state.config.read().await;
+        assert_eq!(config.managed_repeaters.len(), 1);
+        assert_eq!(config.managed_repeaters[0].name, "New Name");
+        // No resolved full key given: the existing key is left untouched.
+        assert_eq!(config.managed_repeaters[0].public_key_hex, "aabbccddeeff");
+    }
+
+    #[tokio::test]
+    async fn upsert_removes_an_existing_managed_repeater() {
+        let (state, _dir) = make_state(vec![ManagedRepeater {
+            name: "Repeater A".to_string(),
+            public_key_hex: "aabbccddeeff".to_string(),
+        }]);
+
+        upsert_managed_repeater_config(&state, "aabbccddeeff", "Repeater A", false, None)
+            .await
+            .unwrap();
+
+        assert!(state.config.read().await.managed_repeaters.is_empty());
+    }
+
+    #[tokio::test]
+    async fn upsert_unmanaging_an_unknown_prefix_is_a_noop() {
+        let (state, _dir) = make_state(vec![]);
+
+        upsert_managed_repeater_config(&state, "aabbccddeeff", "Nobody", false, None)
+            .await
+            .unwrap();
+
+        assert!(state.config.read().await.managed_repeaters.is_empty());
+    }
+
+    #[tokio::test]
+    async fn upsert_persists_to_disk() {
+        let (state, _dir) = make_state(vec![]);
+        let config_path = state.config_path.clone();
+
+        upsert_managed_repeater_config(
+            &state,
+            "aabbccddeeff",
+            "Repeater A",
+            true,
+            Some("aa".repeat(32)),
+        )
+        .await
+        .unwrap();
+
+        let reloaded = Config::load_from(&config_path).expect("reload persisted config");
+        assert_eq!(reloaded.managed_repeaters.len(), 1);
+        assert_eq!(reloaded.managed_repeaters[0].name, "Repeater A");
+    }
+}

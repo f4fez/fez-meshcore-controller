@@ -183,3 +183,232 @@ where
     writer.send(text).await.context("sending IPC message")?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fez_mesh_controller_core::ipc::MeshEvent;
+    use fez_mesh_controller_core::mesh::{MeshEventKind, PacketLogEntry};
+    use fez_mesh_controller_core::{Config, ConnectionConfig, DaemonConfig};
+    use std::path::PathBuf;
+    use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+    use tokio::sync::mpsc;
+
+    fn make_state() -> (Arc<AppState>, mpsc::Receiver<DaemonCommand>) {
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let config = Config {
+            node_label: "test-node".to_string(),
+            connection: ConnectionConfig::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: 5000,
+            },
+            daemon: DaemonConfig {
+                socket_path: PathBuf::from("/tmp/fez-mesh-controller-test.sock"),
+                refresh_interval_secs: 5,
+                log_level: "info".to_string(),
+                log_dir: PathBuf::from("/tmp/fez-mesh-controller-test/logs"),
+                packet_log_capacity: 500,
+            },
+            managed_repeaters: vec![],
+        };
+        let state = Arc::new(AppState::new(
+            command_tx,
+            config,
+            PathBuf::from("/tmp/fez-mesh-controller-test.toml"),
+        ));
+        (state, command_rx)
+    }
+
+    /// Spawns `handle_client` on one end of an in-process socket pair (no
+    /// real socket file involved) and returns framed read/write halves for
+    /// the other end, so a test can drive the protocol directly.
+    fn spawn_client(
+        state: Arc<AppState>,
+    ) -> (
+        FramedRead<OwnedReadHalf, LinesCodec>,
+        FramedWrite<OwnedWriteHalf, LinesCodec>,
+    ) {
+        let (client_side, server_side) = UnixStream::pair().expect("socket pair");
+        tokio::spawn(async move {
+            let _ = handle_client(server_side, state).await;
+        });
+        let (read_half, write_half) = client_side.into_split();
+        (
+            FramedRead::new(read_half, LinesCodec::new()),
+            FramedWrite::new(write_half, LinesCodec::new()),
+        )
+    }
+
+    async fn recv(reader: &mut FramedRead<OwnedReadHalf, LinesCodec>) -> ServerMessage {
+        let line = tokio::time::timeout(Duration::from_secs(1), reader.next())
+            .await
+            .expect("timed out waiting for a server message")
+            .expect("stream closed")
+            .expect("line read error");
+        serde_json::from_str(&line).expect("invalid ServerMessage JSON")
+    }
+
+    async fn send_client_message(
+        writer: &mut FramedWrite<OwnedWriteHalf, LinesCodec>,
+        msg: &ClientMessage,
+    ) {
+        let text = serde_json::to_string(msg).unwrap();
+        writer.send(text).await.unwrap();
+    }
+
+    /// Drains the three handshake messages every connection starts with.
+    async fn drain_handshake(reader: &mut FramedRead<OwnedReadHalf, LinesCodec>) {
+        assert!(matches!(recv(reader).await, ServerMessage::Hello { .. }));
+        assert!(matches!(recv(reader).await, ServerMessage::Snapshot(_)));
+        assert!(matches!(recv(reader).await, ServerMessage::PacketLog(_)));
+    }
+
+    #[tokio::test]
+    async fn handshake_sends_hello_snapshot_then_packet_log() {
+        let (state, _command_rx) = make_state();
+        let (mut reader, _writer) = spawn_client(state);
+
+        match recv(&mut reader).await {
+            ServerMessage::Hello { version } => assert_eq!(version, PROTOCOL_VERSION),
+            other => panic!("expected Hello, got {other:?}"),
+        }
+        assert!(matches!(
+            recv(&mut reader).await,
+            ServerMessage::Snapshot(_)
+        ));
+        match recv(&mut reader).await {
+            ServerMessage::PacketLog(entries) => assert!(entries.is_empty()),
+            other => panic!("expected PacketLog, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_snapshot_returns_a_fresh_snapshot() {
+        let (state, _command_rx) = make_state();
+        let (mut reader, mut writer) = spawn_client(state);
+        drain_handshake(&mut reader).await;
+
+        send_client_message(&mut writer, &ClientMessage::RequestSnapshot).await;
+        assert!(matches!(
+            recv(&mut reader).await,
+            ServerMessage::Snapshot(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn broadcast_event_is_forwarded_to_the_client() {
+        let (state, _command_rx) = make_state();
+        let (mut reader, _writer) = spawn_client(state.clone());
+        drain_handshake(&mut reader).await;
+
+        state.broadcast_event(MeshEvent {
+            at_unix: 0,
+            kind: MeshEventKind::Connected,
+        });
+
+        assert!(matches!(recv(&mut reader).await, ServerMessage::Event(_)));
+    }
+
+    #[tokio::test]
+    async fn recorded_packet_is_forwarded_to_the_client() {
+        let (state, _command_rx) = make_state();
+        let (mut reader, _writer) = spawn_client(state.clone());
+        drain_handshake(&mut reader).await;
+
+        state
+            .record_packet(PacketLogEntry {
+                id: 1,
+                at_unix: 0,
+                snr: 1.0,
+                rssi: -90,
+                header: None,
+                payload_hex: String::new(),
+                payload_len: 0,
+            })
+            .await;
+
+        assert!(matches!(
+            recv(&mut reader).await,
+            ServerMessage::PacketLogEntry(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn mutating_command_success_sends_no_error() {
+        let (state, mut command_rx) = make_state();
+        let (mut reader, mut writer) = spawn_client(state);
+        drain_handshake(&mut reader).await;
+
+        tokio::spawn(async move {
+            if let Some(DaemonCommand::RemoveContact { reply, .. }) = command_rx.recv().await {
+                let _ = reply.send(Ok(()));
+            }
+        });
+
+        send_client_message(
+            &mut writer,
+            &ClientMessage::RemoveContact {
+                public_key_prefix_hex: "aabbccddeeff".to_string(),
+            },
+        )
+        .await;
+
+        // Success sends nothing back; confirm the connection is still
+        // healthy and processing in order by requesting a fresh snapshot
+        // right after — if an Error had been queued, it would arrive first.
+        send_client_message(&mut writer, &ClientMessage::RequestSnapshot).await;
+        assert!(matches!(
+            recv(&mut reader).await,
+            ServerMessage::Snapshot(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn mutating_command_failure_sends_an_error() {
+        let (state, mut command_rx) = make_state();
+        let (mut reader, mut writer) = spawn_client(state);
+        drain_handshake(&mut reader).await;
+
+        tokio::spawn(async move {
+            if let Some(DaemonCommand::RemoveContact { reply, .. }) = command_rx.recv().await {
+                let _ = reply.send(Err("boom".to_string()));
+            }
+        });
+
+        send_client_message(
+            &mut writer,
+            &ClientMessage::RemoveContact {
+                public_key_prefix_hex: "aabbccddeeff".to_string(),
+            },
+        )
+        .await;
+
+        match recv(&mut reader).await {
+            ServerMessage::Error(reason) => assert_eq!(reason, "boom"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mutating_command_without_a_consumer_fails_fast() {
+        let (state, command_rx) = make_state();
+        drop(command_rx); // nobody will ever receive the command
+        let (mut reader, mut writer) = spawn_client(state);
+        drain_handshake(&mut reader).await;
+
+        send_client_message(
+            &mut writer,
+            &ClientMessage::RemoveContact {
+                public_key_prefix_hex: "aabbccddeeff".to_string(),
+            },
+        )
+        .await;
+
+        match recv(&mut reader).await {
+            ServerMessage::Error(reason) => {
+                assert_eq!(reason, "mesh connection task is not running")
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+}

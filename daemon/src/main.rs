@@ -176,3 +176,28 @@ fn init_file_logging(default_level: &str, log_dir: &Path) -> anyhow::Result<Opti
 
     Ok(Some(guard))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_defaults_to_no_config_and_foreground() {
+        let cli = Cli::try_parse_from(["fez-mesh-controller-daemon"]).unwrap();
+        assert_eq!(cli.config, None);
+        assert!(!cli.daemon);
+    }
+
+    #[test]
+    fn cli_parses_config_path() {
+        let cli =
+            Cli::try_parse_from(["fez-mesh-controller-daemon", "--config", "/tmp/x.toml"]).unwrap();
+        assert_eq!(cli.config, Some(PathBuf::from("/tmp/x.toml")));
+    }
+
+    #[test]
+    fn cli_parses_daemon_flag() {
+        let cli = Cli::try_parse_from(["fez-mesh-controller-daemon", "--daemon"]).unwrap();
+        assert!(cli.daemon);
+    }
+}
