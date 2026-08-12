@@ -269,12 +269,6 @@ pub enum MeshEventKind {
     Ack {
         tag_hex: String,
     },
-    /// RF-level log emitted by the node's firmware for a received packet
-    /// (signal-to-noise ratio and received signal strength).
-    RfLog {
-        snr: f32,
-        rssi: i16,
-    },
     /// A managed repeater (from the config file) was declared to the node
     /// because it wasn't already a known contact.
     ManagedRepeaterDeclared {
@@ -339,11 +333,10 @@ pub fn map_event(event: &MeshCoreEvent) -> Option<MeshEventKind> {
         (EventType::Ack, EventPayload::Ack { tag }) => MeshEventKind::Ack {
             tag_hex: hex_encode(tag),
         },
-        (EventType::LogData, EventPayload::LogData(l)) => MeshEventKind::RfLog {
-            snr: l.snr,
-            rssi: l.rssi,
-        },
-        (EventType::Ok, _) | (EventType::NextContact, _) => return None,
+        // Every received packet is already captured, with far more detail,
+        // by the daemon's packet log (see `build_packet_log_entry`) — no
+        // need to also duplicate it as a dashboard event.
+        (EventType::Ok, _) | (EventType::NextContact, _) | (EventType::LogData, _) => return None,
         (other, _) => MeshEventKind::Other {
             label: format!("{other:?}"),
         },
@@ -889,7 +882,10 @@ mod tests {
     }
 
     #[test]
-    fn map_event_log_data_becomes_rf_log() {
+    fn map_event_log_data_is_filtered_out() {
+        // Every received packet already shows up, with far more detail, on
+        // the daemon's packet log (F3 page) — the dashboard event log must
+        // not also carry a duplicate, lower-detail entry for it.
         let log = LogData {
             snr: 3.5,
             rssi: -95,
@@ -897,14 +893,7 @@ mod tests {
             advertisement: None,
             payload: vec![],
         };
-        let mapped = map_event(&event(EventType::LogData, EventPayload::LogData(log))).unwrap();
-        match mapped {
-            MeshEventKind::RfLog { snr, rssi } => {
-                assert_eq!(snr, 3.5);
-                assert_eq!(rssi, -95);
-            }
-            other => panic!("expected RfLog, got {other:?}"),
-        }
+        assert!(map_event(&event(EventType::LogData, EventPayload::LogData(log))).is_none());
     }
 
     #[test]

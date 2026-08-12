@@ -294,11 +294,6 @@ fn event_line(ev: &MeshEvent) -> Line<'static> {
             CYAN,
         ),
         MeshEventKind::Ack { tag_hex } => ("✅", format!("Ack received [{tag_hex}]"), GREEN),
-        MeshEventKind::RfLog { snr, rssi } => (
-            "📡",
-            format!("RF packet: SNR {snr:.1} dB, RSSI {rssi} dBm"),
-            MUTED,
-        ),
         MeshEventKind::ManagedRepeaterDeclared { name } => (
             "🛰️",
             format!("Declared managed repeater to the node: {name}"),
