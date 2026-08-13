@@ -122,6 +122,8 @@ mod tests {
                 path_hash_size: 1,
                 path_hex: String::new(),
                 transport_code_hex: None,
+                dest_hash_hex: None,
+                src_hash_hex: None,
                 advertisement: None,
             }),
             payload_hex: payload_hex.to_string(),

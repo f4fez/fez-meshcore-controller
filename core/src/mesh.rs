@@ -162,6 +162,15 @@ pub struct PacketHeaderInfo {
     pub path_hash_size: u8,
     pub path_hex: String,
     pub transport_code_hex: Option<String>,
+    /// Destination node's address hash, present when `payload_type` is one
+    /// that addresses a specific node (`Req`, `Response`, `TextMsg`,
+    /// `Path`) and the payload is long enough to contain it. `path_hash_size`
+    /// bytes long, taken from the very front of the inner payload — see
+    /// `extract_dest_src_hashes`.
+    pub dest_hash_hex: Option<String>,
+    /// Sender node's address hash, same availability/sizing as
+    /// `dest_hash_hex`, immediately following it in the payload.
+    pub src_hash_hex: Option<String>,
     /// Populated when `payload_type` is `"Advert"` and the inner payload
     /// could be decoded.
     pub advertisement: Option<PacketAdvertInfo>,
@@ -190,6 +199,33 @@ fn adv_type_name(adv_type: u8) -> String {
     }
 }
 
+/// Extracts the destination/source address hashes from the front of a
+/// packet's inner payload, for payload types that carry them: `Req`,
+/// `Response`, `TextMsg` and `Path` are each prefixed with a destination
+/// hash followed by a source hash, `path_hash_size` bytes apiece (the same
+/// hash size the header's hop `path` uses). Other payload types either
+/// broadcast (`Advert`), address a channel rather than a node (`GroupText`,
+/// `GroupData`), or carry no addressing of their own (`Ack`) — those return
+/// `(None, None)`, as does a payload too short to hold both hashes.
+fn extract_dest_src_hashes(
+    payload_type: PayloadType,
+    hash_size: u8,
+    payload: &[u8],
+) -> (Option<String>, Option<String>) {
+    let addressed = matches!(
+        payload_type,
+        PayloadType::Req | PayloadType::Response | PayloadType::TextMsg | PayloadType::Path
+    );
+    let hash_size = hash_size as usize;
+    if !addressed || hash_size == 0 || payload.len() < hash_size * 2 {
+        return (None, None);
+    }
+
+    let dest_hash_hex = hex_encode(&payload[..hash_size]);
+    let src_hash_hex = hex_encode(&payload[hash_size..hash_size * 2]);
+    (Some(dest_hash_hex), Some(src_hash_hex))
+}
+
 /// Builds a packet log entry from a raw `meshcore-rs` event, if it's RF log
 /// data. Returns `None` for anything else. Unlike [`extract_discovered_node`],
 /// this captures *every* decodable packet, not just advertisements.
@@ -202,21 +238,27 @@ pub fn build_packet_log_entry(
         return None;
     };
 
-    let header = log.header.as_ref().map(|h| PacketHeaderInfo {
-        route_type: format!("{:?}", h.route_type),
-        payload_type: format!("{:?}", h.payload_type),
-        payload_version: h.payload_version,
-        hops: h.path_len,
-        path_hash_size: h.path_hash_size,
-        path_hex: hex_encode(&h.path),
-        transport_code_hex: h.transport_code.map(|c| hex_encode(&c)),
-        advertisement: log.advertisement.as_ref().map(|a| PacketAdvertInfo {
-            public_key_hex: hex_encode(&a.public_key),
-            name: a.name.clone(),
-            adv_type_name: adv_type_name(a.adv_type),
-            lat: a.lat.map(|v| v as f64 / 1_000_000.0),
-            lon: a.lon.map(|v| v as f64 / 1_000_000.0),
-        }),
+    let header = log.header.as_ref().map(|h| {
+        let (dest_hash_hex, src_hash_hex) =
+            extract_dest_src_hashes(h.payload_type, h.path_hash_size, &log.payload);
+        PacketHeaderInfo {
+            route_type: format!("{:?}", h.route_type),
+            payload_type: format!("{:?}", h.payload_type),
+            payload_version: h.payload_version,
+            hops: h.path_len,
+            path_hash_size: h.path_hash_size,
+            path_hex: hex_encode(&h.path),
+            transport_code_hex: h.transport_code.map(|c| hex_encode(&c)),
+            dest_hash_hex,
+            src_hash_hex,
+            advertisement: log.advertisement.as_ref().map(|a| PacketAdvertInfo {
+                public_key_hex: hex_encode(&a.public_key),
+                name: a.name.clone(),
+                adv_type_name: adv_type_name(a.adv_type),
+                lat: a.lat.map(|v| v as f64 / 1_000_000.0),
+                lon: a.lon.map(|v| v as f64 / 1_000_000.0),
+            }),
+        }
     });
 
     Some(PacketLogEntry {
@@ -686,6 +728,88 @@ mod tests {
         assert_eq!(header.path_hex, "1122");
         assert_eq!(header.transport_code_hex.as_deref(), Some("01020304"));
         assert!(header.advertisement.is_none());
+        // Ack doesn't address a specific node, so no dest/src hashes.
+        assert!(header.dest_hash_hex.is_none());
+        assert!(header.src_hash_hex.is_none());
+    }
+
+    #[test]
+    fn build_packet_log_entry_decodes_dest_and_src_hashes_for_addressed_payload_types() {
+        let mut header = advert_header(PayloadType::TextMsg);
+        header.path_hash_size = 1;
+        let log = LogData {
+            snr: 2.0,
+            rssi: -70,
+            header: Some(header),
+            advertisement: None,
+            payload: vec![0xde, 0xad, 0xbe, 0xef],
+        };
+        let entry =
+            build_packet_log_entry(&event(EventType::LogData, EventPayload::LogData(log)), 1, 0)
+                .unwrap();
+        let header = entry.header.expect("header should be decoded");
+
+        assert_eq!(header.dest_hash_hex.as_deref(), Some("de"));
+        assert_eq!(header.src_hash_hex.as_deref(), Some("ad"));
+    }
+
+    #[test]
+    fn build_packet_log_entry_dest_and_src_hashes_use_the_header_path_hash_size() {
+        let mut header = advert_header(PayloadType::Path);
+        header.path_hash_size = 2;
+        let log = LogData {
+            snr: 2.0,
+            rssi: -70,
+            header: Some(header),
+            advertisement: None,
+            payload: vec![0x11, 0x22, 0x33, 0x44, 0x55],
+        };
+        let entry =
+            build_packet_log_entry(&event(EventType::LogData, EventPayload::LogData(log)), 1, 0)
+                .unwrap();
+        let header = entry.header.expect("header should be decoded");
+
+        assert_eq!(header.dest_hash_hex.as_deref(), Some("1122"));
+        assert_eq!(header.src_hash_hex.as_deref(), Some("3344"));
+    }
+
+    #[test]
+    fn build_packet_log_entry_no_dest_src_hashes_when_payload_too_short() {
+        let mut header = advert_header(PayloadType::TextMsg);
+        header.path_hash_size = 2;
+        let log = LogData {
+            snr: 2.0,
+            rssi: -70,
+            header: Some(header),
+            advertisement: None,
+            // Only 3 bytes, but two 2-byte hashes need 4.
+            payload: vec![0x11, 0x22, 0x33],
+        };
+        let entry =
+            build_packet_log_entry(&event(EventType::LogData, EventPayload::LogData(log)), 1, 0)
+                .unwrap();
+        let header = entry.header.expect("header should be decoded");
+
+        assert!(header.dest_hash_hex.is_none());
+        assert!(header.src_hash_hex.is_none());
+    }
+
+    #[test]
+    fn build_packet_log_entry_no_dest_src_hashes_for_broadcast_payload_types() {
+        let log = LogData {
+            snr: 2.0,
+            rssi: -70,
+            header: Some(advert_header(PayloadType::GroupText)),
+            advertisement: None,
+            payload: vec![0xde, 0xad, 0xbe, 0xef],
+        };
+        let entry =
+            build_packet_log_entry(&event(EventType::LogData, EventPayload::LogData(log)), 1, 0)
+                .unwrap();
+        let header = entry.header.expect("header should be decoded");
+
+        assert!(header.dest_hash_hex.is_none());
+        assert!(header.src_hash_hex.is_none());
     }
 
     #[test]

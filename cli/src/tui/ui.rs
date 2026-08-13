@@ -389,17 +389,32 @@ fn hops_range(group: &PacketGroup) -> String {
     }
 }
 
+/// `dest_hash_hex`/`src_hash_hex` as displayed in the packet log: the hex
+/// hash, or a dash for payload types that don't carry per-node addressing
+/// (see `PacketHeaderInfo::dest_hash_hex`).
+fn hash_or_dash(hash_hex: &Option<String>) -> String {
+    hash_hex.clone().unwrap_or_else(|| "-".to_string())
+}
+
 fn packet_group_row(group: &PacketGroup) -> Row<'static> {
     let latest = group.latest();
     let time = format_time_short(latest.at_unix);
 
-    let (route, ptype, color) = match &latest.header {
+    let (route, ptype, color, dest, src) = match &latest.header {
         Some(h) => (
             h.route_type.clone(),
             h.payload_type.clone(),
             payload_type_color(&h.payload_type),
+            hash_or_dash(&h.dest_hash_hex),
+            hash_or_dash(&h.src_hash_hex),
         ),
-        None => ("?".to_string(), "?".to_string(), MUTED),
+        None => (
+            "?".to_string(),
+            "?".to_string(),
+            MUTED,
+            "-".to_string(),
+            "-".to_string(),
+        ),
     };
 
     let count_cell = if group.count() > 1 {
@@ -416,6 +431,8 @@ fn packet_group_row(group: &PacketGroup) -> Row<'static> {
         Cell::from(format!("{:.1}/{}", latest.snr, latest.rssi)),
         Cell::from(route),
         Cell::from(Span::styled(ptype, Style::default().fg(color))),
+        Cell::from(src),
+        Cell::from(dest),
         Cell::from(hops_range(group)),
         count_cell,
         Cell::from(packet_summary(latest)),
@@ -433,6 +450,8 @@ fn draw_packet_log_page(frame: &mut Frame, app: &mut App, area: Rect) {
         Cell::from("SNR/RSSI"),
         Cell::from("Route"),
         Cell::from("Type"),
+        Cell::from("Src"),
+        Cell::from("Dst"),
         Cell::from("Hops"),
         Cell::from("×"),
         Cell::from("Summary"),
@@ -460,6 +479,8 @@ fn draw_packet_log_page(frame: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Length(9),
             Constraint::Length(16),
             Constraint::Length(10),
+            Constraint::Length(9),
+            Constraint::Length(9),
             Constraint::Length(7),
             Constraint::Length(4),
             Constraint::Min(20),
@@ -580,6 +601,10 @@ fn draw_packet_detail_popup(frame: &mut Frame, group: &PacketGroup) {
                 "🔢 Payload version",
                 h.payload_version.to_string(),
             ));
+            if let (Some(src), Some(dest)) = (&h.src_hash_hex, &h.dest_hash_hex) {
+                lines.push(field_line("📤 Source", src.clone()));
+                lines.push(field_line("🎯 Destination", dest.clone()));
+            }
 
             match &h.advertisement {
                 Some(adv) => {
@@ -801,6 +826,8 @@ mod render_tests {
                     path_hash_size: 1,
                     path_hex: "aabb".to_string(),
                     transport_code_hex: None,
+                    dest_hash_hex: Some("de".to_string()),
+                    src_hash_hex: Some("ad".to_string()),
                     advertisement: None,
                 }),
                 payload_hex: "deadbeef".to_string(),
@@ -819,6 +846,8 @@ mod render_tests {
                     path_hash_size: 1,
                     path_hex: "cc".to_string(),
                     transport_code_hex: None,
+                    dest_hash_hex: Some("de".to_string()),
+                    src_hash_hex: Some("ad".to_string()),
                     advertisement: None,
                 }),
                 payload_hex: "deadbeef".to_string(),
@@ -837,6 +866,8 @@ mod render_tests {
                     path_hash_size: 1,
                     path_hex: String::new(),
                     transport_code_hex: None,
+                    dest_hash_hex: None,
+                    src_hash_hex: None,
                     advertisement: None,
                 }),
                 payload_hex: "01020304".to_string(),
@@ -875,6 +906,38 @@ mod render_tests {
         assert!(text.contains("×2"));
         assert!(text.contains("TextMsg"));
         assert!(text.contains("Ack"));
+    }
+
+    #[test]
+    fn packet_log_table_shows_source_and_destination_hash_columns() {
+        let mut app = App::new();
+        app.page = Page::PacketLog;
+        app.set_packet_log(sample_entries());
+        app.packet_table_state.select(Some(0));
+
+        let text = render(&mut app, 120, 20);
+
+        assert!(text.contains("Src"));
+        assert!(text.contains("Dst"));
+        // The grouped TextMsg row shows its dest/src hashes...
+        assert!(text.contains("de"));
+        assert!(text.contains("ad"));
+        // ...while the Ack row (no per-node addressing) shows a dash.
+        assert!(text.contains("-"));
+    }
+
+    #[test]
+    fn packet_detail_popup_shows_source_and_destination_when_present() {
+        let mut app = App::new();
+        app.page = Page::PacketLog;
+        app.set_packet_log(sample_entries());
+        app.packet_table_state.select(Some(0)); // the grouped TextMsg (newest)
+        app.open_packet_detail();
+
+        let text = render(&mut app, 140, 40);
+
+        assert!(text.contains("Source"));
+        assert!(text.contains("Destination"));
     }
 
     #[test]
@@ -920,6 +983,8 @@ mod render_tests {
                 path_hash_size: 1,
                 path_hex: String::new(),
                 transport_code_hex: None,
+                dest_hash_hex: None,
+                src_hash_hex: None,
                 advertisement: None,
             }),
             payload_hex: "ff".to_string(),
