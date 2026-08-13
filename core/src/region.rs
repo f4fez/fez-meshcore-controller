@@ -129,6 +129,8 @@ mod tests {
             dest_hash_hex: None,
             src_hash_hex: None,
             channel_hash_hex: None,
+            anon_req_sender_public_key_hex: None,
+            control: None,
             advertisement: None,
         }
     }

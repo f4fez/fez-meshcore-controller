@@ -199,9 +199,54 @@ pub struct PacketHeaderInfo {
     /// it must never be matched against a managed repeater's public key
     /// (see `cli/src/tui/packet_group.rs`).
     pub channel_hash_hex: Option<String>,
+    /// The sender's full public key, present only on `AnonReq` payloads —
+    /// see [`extract_anon_req_sender_public_key`]. Unlike the encrypted
+    /// body that follows it (a pairwise ECDH secret between the sender
+    /// and recipient identities, unreadable to a passive RF observer),
+    /// this is sent in the clear.
+    pub anon_req_sender_public_key_hex: Option<String>,
     /// Populated when `payload_type` is `"Advert"` and the inner payload
     /// could be decoded.
     pub advertisement: Option<PacketAdvertInfo>,
+    /// Decoded `Control` payload, for the two sub-types documented in
+    /// `docs/payloads.md` (`docs.meshcore.io/payloads`) — see
+    /// [`decode_control_payload`]. Unlike `Req`/`Response`/`Path`/
+    /// `AnonReq`, `Control` data is plaintext, not ECDH-encrypted.
+    pub control: Option<ControlPayloadInfo>,
+}
+
+/// A decoded `Control` payload — see [`PacketHeaderInfo::control`] and
+/// [`decode_control_payload`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum ControlPayloadInfo {
+    /// A node discovery request, broadcast zero-hop
+    /// (`CTL_TYPE_NODE_DISCOVER_REQ` = `0x8` sub-type,
+    /// `examples/simple_repeater/MyMesh.cpp`).
+    DiscoverReq {
+        /// If set, a `DiscoverResp` should reply with an 8-byte public key
+        /// prefix instead of the full 32 bytes.
+        prefix_only: bool,
+        /// Bitmask over advertiser types (see [`adv_type_name`]) the
+        /// sender is looking for — bit `N` set means type `N` matches.
+        type_filter: u8,
+        tag_hex: String,
+        /// Only nodes modified since this Unix timestamp should reply;
+        /// `None` when the (optional) field was omitted (matches any).
+        since_unix: Option<u32>,
+    },
+    /// A reply to a `DiscoverReq`, echoing its tag
+    /// (`CTL_TYPE_NODE_DISCOVER_RESP` = `0x9` sub-type).
+    DiscoverResp {
+        /// Human-readable advertiser type of the responding node.
+        node_type_name: String,
+        /// Signal quality of the request as heard by the responder.
+        snr: f32,
+        tag_hex: String,
+        /// The responding node's public key — full 32 bytes, or an
+        /// 8-byte prefix if the request set `prefix_only`.
+        pubkey_hex: String,
+    },
 }
 
 /// Advertiser identity decoded from an ADVERT payload, only present on
@@ -235,6 +280,9 @@ fn adv_type_name(adv_type: u8) -> String {
 /// hashes and can be 1-4 bytes. A future `PAYLOAD_VER_2` may widen this,
 /// which is why extraction is gated on `payload_version == 0` below.
 const ADDRESS_HASH_SIZE: usize = 1;
+
+/// Size in bytes of a full MeshCore public key (`PUB_KEY_SIZE`, `src/MeshCore.h`).
+const PUB_KEY_SIZE: usize = 32;
 
 /// Extracts the destination/source address hashes from the front of a
 /// packet's inner payload, for payload types that carry them: `Req`,
@@ -299,6 +347,93 @@ fn extract_channel_hash(
     Some(hex_encode(&payload[..ADDRESS_HASH_SIZE]))
 }
 
+/// Extracts the sender's full public key from an `AnonReq` payload — the
+/// only payload type where it's sent in the clear (verified against
+/// `Mesh.cpp::onRecvPacket`'s `PAYLOAD_TYPE_ANON_REQ` case: `uint8_t*
+/// sender_pub_key = &pkt->payload[i]; i += PUB_KEY_SIZE;`, right after the
+/// 1-byte destination hash, unlike `Req`/`Response`/`TextMsg`/`Path`
+/// which reference an already-known contact instead). This is metadata,
+/// not decrypted content: the rest of the payload (MAC + ciphertext) is
+/// encrypted with an ECDH secret pairwise between the sender and
+/// recipient identities, which a passive RF observer never has access to
+/// — see [`PacketHeaderInfo::anon_req_sender_public_key_hex`].
+///
+/// `None` for any other payload type, a too-short payload, or a
+/// non-`PAYLOAD_VER_1` payload version (same sizing caveat as
+/// [`extract_dest_src_hashes`]).
+fn extract_anon_req_sender_public_key(
+    payload_type: PayloadType,
+    payload_version: u8,
+    payload: &[u8],
+) -> Option<String> {
+    if payload_type != PayloadType::AnonReq || payload_version != 0 {
+        return None;
+    }
+    if payload.len() < ADDRESS_HASH_SIZE + PUB_KEY_SIZE {
+        return None;
+    }
+    Some(hex_encode(
+        &payload[ADDRESS_HASH_SIZE..ADDRESS_HASH_SIZE + PUB_KEY_SIZE],
+    ))
+}
+
+/// Decodes a `Control` payload's two documented sub-types
+/// (`docs/payloads.md`, cross-checked against `examples/simple_repeater/MyMesh.cpp`'s
+/// `onControlDataRecv`): the sub-type is the upper 4 bits of the first
+/// byte (`0x8` = `DiscoverReq`, `0x9` = `DiscoverResp`).
+///
+/// ```text
+/// DiscoverReq:  [flags: 1 (0x8_ | prefix_only)][type_filter: 1][tag: 4 LE][since: 4 LE, optional]
+/// DiscoverResp: [flags: 1 (0x9_ | node_type)][snr: 1 (i8, *4)][tag: 4 LE][pubkey: 8 or 32]
+/// ```
+///
+/// Returns `None` for any other payload type, a non-`PAYLOAD_VER_1`
+/// payload version, an unrecognized sub-type, or a payload too short to
+/// hold its sub-type's fixed fields.
+fn decode_control_payload(
+    payload_type: PayloadType,
+    payload_version: u8,
+    payload: &[u8],
+) -> Option<ControlPayloadInfo> {
+    if payload_type != PayloadType::Control || payload_version != 0 {
+        return None;
+    }
+    if payload.len() < 6 {
+        return None;
+    }
+    let flags = payload[0];
+    let tag_hex = hex_encode(&payload[2..6]);
+
+    match flags & 0xF0 {
+        0x80 => {
+            let since_unix = (payload.len() >= 10)
+                .then(|| u32::from_le_bytes(payload[6..10].try_into().expect("checked length")));
+            Some(ControlPayloadInfo::DiscoverReq {
+                prefix_only: flags & 0x01 != 0,
+                type_filter: payload[1],
+                tag_hex,
+                since_unix,
+            })
+        }
+        0x90 => {
+            let pubkey = if payload.len() >= 6 + PUB_KEY_SIZE {
+                &payload[6..6 + PUB_KEY_SIZE]
+            } else if payload.len() >= 6 + 8 {
+                &payload[6..14]
+            } else {
+                return None;
+            };
+            Some(ControlPayloadInfo::DiscoverResp {
+                node_type_name: adv_type_name(flags & 0x0F),
+                snr: (payload[1] as i8) as f32 / 4.0,
+                tag_hex,
+                pubkey_hex: hex_encode(pubkey),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Builds a packet log entry from a raw `meshcore-rs` event, if it's RF log
 /// data. Returns `None` for anything else. Unlike [`extract_discovered_node`],
 /// this captures *every* decodable packet, not just advertisements.
@@ -316,6 +451,9 @@ pub fn build_packet_log_entry(
             extract_dest_src_hashes(h.payload_type, h.payload_version, &log.payload);
         let channel_hash_hex =
             extract_channel_hash(h.payload_type, h.payload_version, &log.payload);
+        let anon_req_sender_public_key_hex =
+            extract_anon_req_sender_public_key(h.payload_type, h.payload_version, &log.payload);
+        let control = decode_control_payload(h.payload_type, h.payload_version, &log.payload);
         PacketHeaderInfo {
             route_type: format!("{:?}", h.route_type),
             payload_type: format!("{:?}", h.payload_type),
@@ -328,6 +466,7 @@ pub fn build_packet_log_entry(
             dest_hash_hex,
             src_hash_hex,
             channel_hash_hex,
+            anon_req_sender_public_key_hex,
             advertisement: log.advertisement.as_ref().map(|a| PacketAdvertInfo {
                 public_key_hex: hex_encode(&a.public_key),
                 name: a.name.clone(),
@@ -335,6 +474,7 @@ pub fn build_packet_log_entry(
                 lat: a.lat.map(|v| v as f64 / 1_000_000.0),
                 lon: a.lon.map(|v| v as f64 / 1_000_000.0),
             }),
+            control,
         }
     });
 
@@ -956,6 +1096,196 @@ mod tests {
 
         assert_eq!(header.dest_hash_hex.as_deref(), Some("de"));
         assert!(header.src_hash_hex.is_none());
+        // Too short to also contain the sender's full 32-byte public key.
+        assert!(header.anon_req_sender_public_key_hex.is_none());
+    }
+
+    #[test]
+    fn build_packet_log_entry_decodes_the_anon_req_sender_public_key() {
+        let mut header = advert_header(PayloadType::AnonReq);
+        header.payload_version = 0;
+        let mut payload = vec![0xde]; // dest hash
+        payload.extend_from_slice(&[0xab; 32]); // sender's full public key
+        payload.extend_from_slice(&[0x11, 0x22]); // mac
+        payload.extend_from_slice(&[0x33, 0x44]); // ciphertext (opaque)
+        let log = LogData {
+            snr: 2.0,
+            rssi: -70,
+            header: Some(header),
+            advertisement: None,
+            payload,
+        };
+        let entry =
+            build_packet_log_entry(&event(EventType::LogData, EventPayload::LogData(log)), 1, 0)
+                .unwrap();
+        let header = entry.header.expect("header should be decoded");
+
+        assert_eq!(header.dest_hash_hex.as_deref(), Some("de"));
+        assert_eq!(
+            header.anon_req_sender_public_key_hex.as_deref(),
+            Some("ab".repeat(32).as_str())
+        );
+    }
+
+    // --- decode_control_payload ------------------------------------------
+
+    #[test]
+    fn decode_control_payload_decodes_a_discover_req() {
+        // Mirrors `MyMesh::sendNodeDiscoverReq()`
+        // (examples/simple_repeater/MyMesh.cpp): flags=0x80 (prefix_only=0),
+        // type_filter=(1<<ADV_TYPE_REPEATER)=0x04, tag, since=0.
+        let payload = [0x80, 0x04, 0x11, 0x22, 0x33, 0x44, 0x00, 0x00, 0x00, 0x00];
+
+        let decoded =
+            decode_control_payload(PayloadType::Control, 0, &payload).expect("should decode");
+
+        assert_eq!(
+            decoded,
+            ControlPayloadInfo::DiscoverReq {
+                prefix_only: false,
+                type_filter: 0x04,
+                tag_hex: "11223344".to_string(),
+                since_unix: Some(0),
+            }
+        );
+    }
+
+    #[test]
+    fn decode_control_payload_discover_req_prefix_only_flag_and_missing_since() {
+        let payload = [0x81, 0x04, 0x11, 0x22, 0x33, 0x44]; // no optional `since`
+
+        let decoded =
+            decode_control_payload(PayloadType::Control, 0, &payload).expect("should decode");
+
+        assert_eq!(
+            decoded,
+            ControlPayloadInfo::DiscoverReq {
+                prefix_only: true,
+                type_filter: 0x04,
+                tag_hex: "11223344".to_string(),
+                since_unix: None,
+            }
+        );
+    }
+
+    #[test]
+    fn decode_control_payload_decodes_a_discover_resp_with_a_full_public_key() {
+        // Mirrors the repeater's reply construction: flags=0x90|ADV_TYPE_REPEATER(2),
+        // snr raw byte 20 (-> 20/4 = 5.0), tag echoed, full 32-byte pubkey.
+        let mut payload = vec![0x92, 20, 0x11, 0x22, 0x33, 0x44];
+        payload.extend_from_slice(&[0xcd; 32]);
+
+        let decoded =
+            decode_control_payload(PayloadType::Control, 0, &payload).expect("should decode");
+
+        assert_eq!(
+            decoded,
+            ControlPayloadInfo::DiscoverResp {
+                node_type_name: "Repeater".to_string(),
+                snr: 5.0,
+                tag_hex: "11223344".to_string(),
+                pubkey_hex: "cd".repeat(32),
+            }
+        );
+    }
+
+    #[test]
+    fn decode_control_payload_discover_resp_with_a_prefix_only_public_key() {
+        let mut payload = vec![
+            0x91, 0xEC, /* -20 as i8 -> -5.0 */
+            0x11, 0x22, 0x33, 0x44,
+        ];
+        payload.extend_from_slice(&[0xcd; 8]);
+
+        let decoded =
+            decode_control_payload(PayloadType::Control, 0, &payload).expect("should decode");
+
+        assert_eq!(
+            decoded,
+            ControlPayloadInfo::DiscoverResp {
+                node_type_name: "Chat".to_string(),
+                snr: -5.0,
+                tag_hex: "11223344".to_string(),
+                pubkey_hex: "cd".repeat(8),
+            }
+        );
+    }
+
+    #[test]
+    fn decode_control_payload_none_for_unrecognized_sub_type_too_short_payload_or_wrong_type() {
+        // Unknown sub-type (upper nibble 0x0).
+        assert!(decode_control_payload(
+            PayloadType::Control,
+            0,
+            &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        )
+        .is_none());
+        // Too short even for the common 6-byte prefix.
+        assert!(decode_control_payload(PayloadType::Control, 0, &[0x80, 0x00]).is_none());
+        // Not a Control payload at all.
+        assert!(decode_control_payload(
+            PayloadType::TextMsg,
+            0,
+            &[0x80, 0x00, 0x00, 0x00, 0x00, 0x00]
+        )
+        .is_none());
+        // Non-PAYLOAD_VER_1.
+        assert!(decode_control_payload(
+            PayloadType::Control,
+            1,
+            &[0x80, 0x00, 0x00, 0x00, 0x00, 0x00]
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn build_packet_log_entry_decodes_control_discover_req() {
+        let mut header = advert_header(PayloadType::Control);
+        header.payload_version = 0;
+        let log = LogData {
+            snr: 2.0,
+            rssi: -70,
+            header: Some(header),
+            advertisement: None,
+            payload: vec![0x80, 0x04, 0x11, 0x22, 0x33, 0x44, 0x00, 0x00, 0x00, 0x00],
+        };
+        let entry =
+            build_packet_log_entry(&event(EventType::LogData, EventPayload::LogData(log)), 1, 0)
+                .unwrap();
+
+        assert_eq!(
+            entry.header.expect("header should be decoded").control,
+            Some(ControlPayloadInfo::DiscoverReq {
+                prefix_only: false,
+                type_filter: 0x04,
+                tag_hex: "11223344".to_string(),
+                since_unix: Some(0),
+            })
+        );
+    }
+
+    #[test]
+    fn build_packet_log_entry_no_anon_req_sender_public_key_for_other_payload_types() {
+        let mut header = advert_header(PayloadType::TextMsg);
+        header.payload_version = 0;
+        let mut payload = vec![0xde, 0xad]; // dest + src hash
+        payload.extend_from_slice(&[0xab; 32]);
+        let log = LogData {
+            snr: 2.0,
+            rssi: -70,
+            header: Some(header),
+            advertisement: None,
+            payload,
+        };
+        let entry =
+            build_packet_log_entry(&event(EventType::LogData, EventPayload::LogData(log)), 1, 0)
+                .unwrap();
+
+        assert!(entry
+            .header
+            .expect("header should be decoded")
+            .anon_req_sender_public_key_hex
+            .is_none());
     }
 
     #[test]

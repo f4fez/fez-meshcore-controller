@@ -15,7 +15,9 @@
 use chrono::{Local, TimeZone};
 use fez_mesh_controller_core::channel;
 use fez_mesh_controller_core::ipc::MeshEvent;
-use fez_mesh_controller_core::mesh::{ContactDto, MeshEventKind, PacketHeaderInfo, PacketLogEntry};
+use fez_mesh_controller_core::mesh::{
+    ContactDto, ControlPayloadInfo, MeshEventKind, PacketHeaderInfo, PacketLogEntry,
+};
 use fez_mesh_controller_core::region;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -25,7 +27,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::format::{format_coords, format_last_seen};
+use crate::format::{format_coords, format_last_seen, strip_flag_emoji};
 use crate::tui::app::{App, Page};
 use crate::tui::packet_group::{path_hop_hashes, PacketGroup};
 
@@ -222,22 +224,23 @@ fn draw_repeaters(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let rows = contacts.iter().map(|c| {
         let prefix: String = c.public_key_prefix_hex.chars().take(8).collect();
+        let name = strip_flag_emoji(&c.name);
 
         let name_cell = if c.managed {
             Cell::from(Line::from(vec![
                 Span::raw("🛰️ "),
                 Span::styled(
-                    c.name.clone(),
+                    name,
                     Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
                 ),
             ]))
         } else {
-            Cell::from(c.name.clone())
+            Cell::from(name)
         };
 
         let (status_text, status_color) = match (c.registered, c.managed) {
             (_, true) => ("🛰️ Managed", GREEN),
-            (true, false) => ("✅ Known", MUTED),
+            (true, false) => ("📟 Known", MUTED),
             (false, false) => ("🔍 Discovered", YELLOW),
         };
         let status_cell = Cell::from(Span::styled(status_text, Style::default().fg(status_color)));
@@ -293,10 +296,16 @@ fn event_line(ev: &MeshEvent) -> Line<'static> {
     let (emoji, text, color) = match &ev.kind {
         MeshEventKind::Connected => ("🔌", "Connected to MeshCore node".to_string(), GREEN),
         MeshEventKind::Disconnected => ("🔌", "Disconnected from MeshCore node".to_string(), RED),
-        MeshEventKind::Advertisement { name, .. } => {
-            ("📶", format!("Advertisement received from {name}"), CYAN)
-        }
-        MeshEventKind::NewContact { name } => ("🆕", format!("New contact: {name}"), MAGENTA),
+        MeshEventKind::Advertisement { name, .. } => (
+            "📶",
+            format!("Advertisement received from {}", strip_flag_emoji(name)),
+            CYAN,
+        ),
+        MeshEventKind::NewContact { name } => (
+            "🆕",
+            format!("New contact: {}", strip_flag_emoji(name)),
+            MAGENTA,
+        ),
         MeshEventKind::ContactMessage {
             from_prefix_hex,
             hops,
@@ -343,13 +352,17 @@ fn event_line(ev: &MeshEvent) -> Line<'static> {
         MeshEventKind::Ack { tag_hex } => ("✅", format!("Ack received [{tag_hex}]"), GREEN),
         MeshEventKind::ManagedRepeaterDeclared { name } => (
             "🛰️",
-            format!("Declared managed repeater to the node: {name}"),
+            format!(
+                "Declared managed repeater to the node: {}",
+                strip_flag_emoji(name)
+            ),
             GREEN,
         ),
         MeshEventKind::RepeaterHeard { name, prefix_hex } => (
             "🔍",
             format!(
-                "Repeater heard: {name} [{}] — not yet registered",
+                "Repeater heard: {} [{}] — not yet registered",
+                strip_flag_emoji(name),
                 &prefix_hex[..prefix_hex.len().min(8)]
             ),
             YELLOW,
@@ -357,7 +370,8 @@ fn event_line(ev: &MeshEvent) -> Line<'static> {
         MeshEventKind::ContactRemoved { name, prefix_hex } => (
             "🗑️",
             format!(
-                "Contact removed: {name} [{}]",
+                "Contact removed: {} [{}]",
+                strip_flag_emoji(name),
                 &prefix_hex[..prefix_hex.len().min(8)]
             ),
             RED,
@@ -450,7 +464,11 @@ fn packet_summary(entry: &PacketLogEntry, channel_keys: &[(String, [u8; 32], u8)
     };
 
     if let Some(adv) = &header.advertisement {
-        let name = adv.name.as_deref().unwrap_or("(unnamed)");
+        let name = adv.name.as_deref().map(strip_flag_emoji);
+        let name = name
+            .as_deref()
+            .filter(|n| !n.is_empty())
+            .unwrap_or("(unnamed)");
         let pos = format_coords(adv.lat.unwrap_or(0.0), adv.lon.unwrap_or(0.0));
         return format!("{} \"{name}\" @ {pos}", adv.adv_type_name);
     }
@@ -459,10 +477,34 @@ fn packet_summary(entry: &PacketLogEntry, channel_keys: &[(String, [u8; 32], u8)
         return format!("{}: {}", decoded.channel_name, decoded.text);
     }
 
+    if let Some(key) = &header.anon_req_sender_public_key_hex {
+        let short: String = key.chars().take(12).collect();
+        return format!("AnonReq from {short}…");
+    }
+
+    if let Some(control) = &header.control {
+        return control_summary(control);
+    }
+
     match header.payload_type.as_str() {
         "Ack" => "acknowledgement".to_string(),
         "TextMsg" | "GroupText" => format!("{} bytes of (encrypted) text", entry.payload_len),
         _ => format!("{} bytes payload", entry.payload_len),
+    }
+}
+
+/// One-line summary of a decoded `Control` payload (see
+/// [`ControlPayloadInfo`]), for [`packet_summary`].
+fn control_summary(control: &ControlPayloadInfo) -> String {
+    match control {
+        ControlPayloadInfo::DiscoverReq { type_filter, .. } => {
+            format!("Discover request (type filter 0x{type_filter:02x})")
+        }
+        ControlPayloadInfo::DiscoverResp {
+            node_type_name,
+            snr,
+            ..
+        } => format!("Discover response: {node_type_name} @ {snr:.1} dB"),
     }
 }
 
@@ -850,9 +892,11 @@ fn draw_packet_detail_popup(
             if let Some(adv) = &h.advertisement {
                 lines.push(Line::from(""));
                 lines.push(section_title("— Advertised identity —"));
+                let name = adv.name.as_deref().map(strip_flag_emoji);
                 lines.push(field_line(
                     "🏷️  Name",
-                    adv.name.clone().unwrap_or_else(|| "(unnamed)".to_string()),
+                    name.filter(|n| !n.is_empty())
+                        .unwrap_or_else(|| "(unnamed)".to_string()),
                 ));
                 lines.push(field_line("🔖 Advertiser type", adv.adv_type_name.clone()));
                 lines.push(field_line("🔑 Public key", adv.public_key_hex.clone()));
@@ -865,9 +909,52 @@ fn draw_packet_detail_popup(
                 lines.push(section_title("— Payload —"));
                 lines.push(field_line("📡 Channel", decoded.channel_name));
                 lines.push(field_line("💬 Message", decoded.text));
+            } else if let Some(control) = &h.control {
+                lines.push(Line::from(""));
+                lines.push(section_title("— Payload —"));
+                match control {
+                    ControlPayloadInfo::DiscoverReq {
+                        prefix_only,
+                        type_filter,
+                        tag_hex,
+                        since_unix,
+                    } => {
+                        lines.push(field_line("🔍 Sub-type", "Discover request"));
+                        lines.push(field_line(
+                            "🏷️  Type filter",
+                            format!("0x{type_filter:02x}"),
+                        ));
+                        lines.push(field_line("🔖 Tag", tag_hex.clone()));
+                        lines.push(field_line(
+                            "🕒 Since",
+                            since_unix
+                                .map(|t| format_time_full(t as i64))
+                                .unwrap_or_else(|| "any".to_string()),
+                        ));
+                        lines.push(field_line(
+                            "🔒 Prefix only",
+                            if *prefix_only { "yes" } else { "no" },
+                        ));
+                    }
+                    ControlPayloadInfo::DiscoverResp {
+                        node_type_name,
+                        snr,
+                        tag_hex,
+                        pubkey_hex,
+                    } => {
+                        lines.push(field_line("🔍 Sub-type", "Discover response"));
+                        lines.push(field_line("🔖 Node type", node_type_name.clone()));
+                        lines.push(field_line("📶 SNR", format!("{snr:.1} dB")));
+                        lines.push(field_line("🔖 Tag", tag_hex.clone()));
+                        lines.push(field_line("🔑 Public key", pubkey_hex.clone()));
+                    }
+                }
             } else {
                 lines.push(Line::from(""));
                 lines.push(section_title("— Payload —"));
+                if let Some(sender_key) = &h.anon_req_sender_public_key_hex {
+                    lines.push(field_line("🔑 Sender key", sender_key.clone()));
+                }
                 lines.push(field_line(
                     "📏 Size",
                     format!("{} bytes", latest.payload_len),
@@ -1105,6 +1192,8 @@ mod render_tests {
                 dest_hash_hex: None,
                 src_hash_hex: None,
                 channel_hash_hex: Some("11".to_string()),
+                anon_req_sender_public_key_hex: None,
+                control: None,
                 advertisement: None,
             }),
             payload_hex: "11ece6f1d59f9d82b89139e8f514be20fe914ab3d762d29a9a22438cb69d8789f99ce3"
@@ -1129,6 +1218,8 @@ mod render_tests {
             dest_hash_hex: Some("de".to_string()),
             src_hash_hex: None,
             channel_hash_hex: None,
+            anon_req_sender_public_key_hex: None,
+            control: None,
             advertisement: None,
         });
         // One contact matches the destination, another matches the relay
@@ -1155,6 +1246,8 @@ mod render_tests {
             dest_hash_hex: None,
             src_hash_hex: None,
             channel_hash_hex: None,
+            anon_req_sender_public_key_hex: None,
+            control: None,
             advertisement: None,
         });
         let contacts = vec![contact("aabbccddeeff", true)];
@@ -1179,6 +1272,8 @@ mod render_tests {
             dest_hash_hex: Some("de".to_string()),
             src_hash_hex: None,
             channel_hash_hex: None,
+            anon_req_sender_public_key_hex: None,
+            control: None,
             advertisement: None,
         });
         let contacts = vec![contact("112233445566", true)];
@@ -1226,6 +1321,8 @@ mod render_tests {
                     dest_hash_hex: Some("de".to_string()),
                     src_hash_hex: Some("ad".to_string()),
                     channel_hash_hex: None,
+                    anon_req_sender_public_key_hex: None,
+                    control: None,
                     advertisement: None,
                 }),
                 payload_hex: "deadbeef".to_string(),
@@ -1248,6 +1345,8 @@ mod render_tests {
                     dest_hash_hex: Some("de".to_string()),
                     src_hash_hex: Some("ad".to_string()),
                     channel_hash_hex: None,
+                    anon_req_sender_public_key_hex: None,
+                    control: None,
                     advertisement: None,
                 }),
                 payload_hex: "deadbeef".to_string(),
@@ -1270,6 +1369,8 @@ mod render_tests {
                     dest_hash_hex: None,
                     src_hash_hex: None,
                     channel_hash_hex: None,
+                    anon_req_sender_public_key_hex: None,
+                    control: None,
                     advertisement: None,
                 }),
                 payload_hex: "01020304".to_string(),
@@ -1334,6 +1435,42 @@ mod render_tests {
             }
         }
         None
+    }
+
+    // --- Event log -------------------------------------------------------
+
+    #[test]
+    fn event_log_strips_flag_emoji_from_remotely_supplied_names() {
+        // Flag emoji (paired Regional Indicator Symbols) trigger a
+        // ratatui rendering bug (ratatui/ratatui#75) that shifts
+        // everything after them on the line — see `strip_flag_emoji`.
+        // Node names are remotely supplied and can't be controlled, so
+        // they're sanitized before display.
+        let mut app = App::new();
+        app.push_event(MeshEvent {
+            at_unix: 0,
+            kind: MeshEventKind::Advertisement {
+                name: "🇨🇵30 Depot".to_string(),
+                prefix_hex: "aabbccddeeff".to_string(),
+                lat: 0.0,
+                lon: 0.0,
+            },
+        });
+        app.push_event(MeshEvent {
+            at_unix: 0,
+            kind: MeshEventKind::NewContact {
+                name: "🇫🇷Repeater".to_string(),
+            },
+        });
+
+        let text = render(&mut app, 140, 20);
+
+        assert!(text.contains("Advertisement received from 30 Depot"));
+        assert!(text.contains("New contact: Repeater"));
+        // No leftover regional-indicator codepoints anywhere on screen.
+        assert!(!text
+            .chars()
+            .any(|c| ('\u{1F1E6}'..='\u{1F1FF}').contains(&c)));
     }
 
     // --- Dashboard layout ----------------------------------------------------
@@ -1439,6 +1576,22 @@ mod render_tests {
 
         assert!(text.contains("Repeaters ("));
         assert!(!text.contains("Contacts ("));
+    }
+
+    #[test]
+    fn draw_repeaters_panel_strips_flag_emoji_from_the_name_column() {
+        let mut app = App::new();
+        app.snapshot.contacts = vec![ContactDto {
+            name: "🇨🇵30 Depot".to_string(),
+            ..contact("aabbccddeeff", false)
+        }];
+
+        let text = render(&mut app, 140, 20);
+
+        assert!(text.contains("30 Depot"));
+        assert!(!text
+            .chars()
+            .any(|c| ('\u{1F1E6}'..='\u{1F1FF}').contains(&c)));
     }
 
     #[test]
@@ -1553,6 +1706,8 @@ mod render_tests {
                 dest_hash_hex: None,
                 src_hash_hex: None,
                 channel_hash_hex: Some("61".to_string()),
+                anon_req_sender_public_key_hex: None,
+                control: None,
                 advertisement: None,
             }),
             payload_hex: "6197dfa79aead70a65177d5a0b785700bae78c".to_string(),
@@ -1586,6 +1741,8 @@ mod render_tests {
                 dest_hash_hex: None,
                 src_hash_hex: None,
                 channel_hash_hex: Some("61".to_string()),
+                anon_req_sender_public_key_hex: None,
+                control: None,
                 advertisement: None,
             }),
             payload_hex: "6197dfa79aead70a65177d5a0b785700bae78c".to_string(),
@@ -1636,6 +1793,8 @@ mod render_tests {
                 dest_hash_hex: Some("de".to_string()),
                 src_hash_hex: None,
                 channel_hash_hex: None,
+                anon_req_sender_public_key_hex: None,
+                control: None,
                 advertisement: None,
             }),
             payload_hex: "deadbeef".to_string(),
@@ -1649,6 +1808,170 @@ mod render_tests {
         assert!(text.contains("Destination"));
         assert!(text.contains("de"));
         assert!(!text.contains("Source"));
+    }
+
+    fn anon_req_entry() -> PacketLogEntry {
+        PacketLogEntry {
+            id: 1,
+            at_unix: 0,
+            snr: 1.0,
+            rssi: -90,
+            header: Some(PacketHeaderInfo {
+                route_type: "Flood".to_string(),
+                payload_type: "AnonReq".to_string(),
+                payload_type_raw: 7,
+                payload_version: 0,
+                hops: 1,
+                path_hash_size: 1,
+                path_hex: String::new(),
+                transport_code_hex: None,
+                dest_hash_hex: Some("de".to_string()),
+                src_hash_hex: None,
+                channel_hash_hex: None,
+                anon_req_sender_public_key_hex: Some("ab".repeat(32)),
+                control: None,
+                advertisement: None,
+            }),
+            payload_hex: "deadbeef".to_string(),
+            payload_len: 4,
+        }
+    }
+
+    #[test]
+    fn packet_log_table_shows_the_anon_req_senders_public_key_prefix() {
+        let mut app = App::new();
+        app.page = Page::PacketLog;
+        app.set_packet_log(vec![anon_req_entry()]);
+        app.packet_table_state.select(Some(0));
+
+        let text = render(&mut app, 140, 20);
+
+        assert!(text.contains("AnonReq from abababababab"));
+    }
+
+    #[test]
+    fn packet_detail_popup_shows_the_anon_req_senders_full_public_key() {
+        let mut app = App::new();
+        app.page = Page::PacketLog;
+        app.set_packet_log(vec![anon_req_entry()]);
+        app.packet_table_state.select(Some(0));
+        app.open_packet_detail();
+
+        let text = render(&mut app, 140, 40);
+
+        assert!(text.contains("Sender key"));
+        assert!(text.contains(&"ab".repeat(32)));
+    }
+
+    fn control_entry(control: ControlPayloadInfo) -> PacketLogEntry {
+        PacketLogEntry {
+            id: 1,
+            at_unix: 0,
+            snr: 1.0,
+            rssi: -90,
+            header: Some(PacketHeaderInfo {
+                route_type: "Direct".to_string(),
+                payload_type: "Control".to_string(),
+                payload_type_raw: 11,
+                payload_version: 0,
+                hops: 0,
+                path_hash_size: 1,
+                path_hex: String::new(),
+                transport_code_hex: None,
+                dest_hash_hex: None,
+                src_hash_hex: None,
+                channel_hash_hex: None,
+                anon_req_sender_public_key_hex: None,
+                control: Some(control),
+                advertisement: None,
+            }),
+            payload_hex: "80000000000000".to_string(),
+            payload_len: 7,
+        }
+    }
+
+    #[test]
+    fn packet_log_table_shows_a_discover_req_summary() {
+        let mut app = App::new();
+        app.page = Page::PacketLog;
+        app.set_packet_log(vec![control_entry(ControlPayloadInfo::DiscoverReq {
+            prefix_only: false,
+            type_filter: 0x04,
+            tag_hex: "11223344".to_string(),
+            since_unix: Some(0),
+        })]);
+        app.packet_table_state.select(Some(0));
+
+        let text = render(&mut app, 140, 20);
+
+        assert!(text.contains("Discover request (type filter 0x04)"));
+    }
+
+    #[test]
+    fn packet_log_table_shows_a_discover_resp_summary() {
+        let mut app = App::new();
+        app.page = Page::PacketLog;
+        app.set_packet_log(vec![control_entry(ControlPayloadInfo::DiscoverResp {
+            node_type_name: "Repeater".to_string(),
+            snr: 5.0,
+            tag_hex: "11223344".to_string(),
+            pubkey_hex: "cd".repeat(32),
+        })]);
+        app.packet_table_state.select(Some(0));
+
+        let text = render(&mut app, 140, 20);
+
+        assert!(text.contains("Discover response: Repeater @ 5.0 dB"));
+    }
+
+    #[test]
+    fn packet_detail_popup_shows_discover_req_fields() {
+        let mut app = App::new();
+        app.page = Page::PacketLog;
+        app.set_packet_log(vec![control_entry(ControlPayloadInfo::DiscoverReq {
+            prefix_only: true,
+            type_filter: 0x04,
+            tag_hex: "11223344".to_string(),
+            since_unix: None,
+        })]);
+        app.packet_table_state.select(Some(0));
+        app.open_packet_detail();
+
+        let text = render(&mut app, 140, 40);
+
+        assert!(text.contains("Discover request"));
+        assert!(text.contains("Type filter"));
+        assert!(text.contains("0x04"));
+        assert!(text.contains("Tag"));
+        assert!(text.contains("11223344"));
+        assert!(text.contains("Since"));
+        assert!(text.contains("any"));
+        assert!(text.contains("Prefix only"));
+        assert!(text.contains("yes"));
+    }
+
+    #[test]
+    fn packet_detail_popup_shows_discover_resp_fields() {
+        let mut app = App::new();
+        app.page = Page::PacketLog;
+        app.set_packet_log(vec![control_entry(ControlPayloadInfo::DiscoverResp {
+            node_type_name: "Repeater".to_string(),
+            snr: 5.0,
+            tag_hex: "11223344".to_string(),
+            pubkey_hex: "cd".repeat(32),
+        })]);
+        app.packet_table_state.select(Some(0));
+        app.open_packet_detail();
+
+        let text = render(&mut app, 140, 40);
+
+        assert!(text.contains("Discover response"));
+        assert!(text.contains("Node type"));
+        assert!(text.contains("Repeater"));
+        assert!(text.contains("SNR"));
+        assert!(text.contains("5.0 dB"));
+        assert!(text.contains("Public key"));
+        assert!(text.contains(&"cd".repeat(32)));
     }
 
     #[test]
@@ -1672,6 +1995,8 @@ mod render_tests {
                 dest_hash_hex: None,
                 src_hash_hex: None,
                 channel_hash_hex: Some("ab".to_string()),
+                anon_req_sender_public_key_hex: None,
+                control: None,
                 advertisement: None,
             }),
             payload_hex: "abcd".to_string(),
@@ -1705,6 +2030,8 @@ mod render_tests {
                 dest_hash_hex: None,
                 src_hash_hex: None,
                 channel_hash_hex: Some("ab".to_string()),
+                anon_req_sender_public_key_hex: None,
+                control: None,
                 advertisement: None,
             }),
             payload_hex: "abcd".to_string(),
@@ -1760,6 +2087,8 @@ mod render_tests {
                 dest_hash_hex: None,
                 src_hash_hex: None,
                 channel_hash_hex: None,
+                anon_req_sender_public_key_hex: None,
+                control: None,
                 advertisement: None,
             }),
             payload_hex: "deadbeef".to_string(),
@@ -1800,6 +2129,8 @@ mod render_tests {
                 dest_hash_hex: None,
                 src_hash_hex: None,
                 channel_hash_hex: None,
+                anon_req_sender_public_key_hex: None,
+                control: None,
                 advertisement: None,
             }),
             payload_hex: "deadbeef".to_string(),
@@ -2000,6 +2331,8 @@ mod render_tests {
                 dest_hash_hex: None,
                 src_hash_hex: None,
                 channel_hash_hex: None,
+                anon_req_sender_public_key_hex: None,
+                control: None,
                 advertisement: None,
             }),
             payload_hex: "ff".to_string(),
