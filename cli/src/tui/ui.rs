@@ -14,7 +14,7 @@
 
 use chrono::{Local, TimeZone};
 use fez_mesh_controller_core::ipc::MeshEvent;
-use fez_mesh_controller_core::mesh::{ContactDto, MeshEventKind, PacketLogEntry};
+use fez_mesh_controller_core::mesh::{ContactDto, MeshEventKind, PacketHeaderInfo, PacketLogEntry};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -455,11 +455,31 @@ fn hops_range(group: &PacketGroup) -> String {
     }
 }
 
-/// `dest_hash_hex`/`src_hash_hex` as displayed in the packet log: the hex
-/// hash, or a dash for payload types that don't carry per-node addressing
-/// (see `PacketHeaderInfo::dest_hash_hex`).
+/// `src_hash_hex` as displayed in the packet log: the hex hash, or a dash
+/// for payload types that don't carry per-node addressing (see
+/// `PacketHeaderInfo::dest_hash_hex`).
 fn hash_or_dash(hash_hex: &Option<String>) -> String {
     hash_hex.clone().unwrap_or_else(|| "-".to_string())
+}
+
+/// The packet log table's Dst cell: a real node's destination hash (plain
+/// text, as-is), a channel hash for `GroupText`/`GroupData` (wrapped in
+/// braces and styled muted/italic so it can't be mistaken for a node hash
+/// at a glance — see `PacketHeaderInfo::channel_hash_hex`), or a dash.
+fn destination_cell(header: Option<&PacketHeaderInfo>) -> Cell<'static> {
+    let Some(h) = header else {
+        return Cell::from("-");
+    };
+    if let Some(dest) = &h.dest_hash_hex {
+        return Cell::from(dest.clone());
+    }
+    if let Some(channel) = &h.channel_hash_hex {
+        return Cell::from(Span::styled(
+            format!("{{{channel}}}"),
+            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+        ));
+    }
+    Cell::from("-")
 }
 
 /// Row background for a packet group, flagging its involvement with a
@@ -481,22 +501,16 @@ fn packet_group_row(group: &PacketGroup, contacts: &[ContactDto]) -> Row<'static
     let latest = group.latest();
     let time = format_time_short(latest.at_unix);
 
-    let (route, ptype, color, dest, src) = match &latest.header {
+    let (route, ptype, color, src) = match &latest.header {
         Some(h) => (
             h.route_type.clone(),
             h.payload_type.clone(),
             payload_type_color(&h.payload_type),
-            hash_or_dash(&h.dest_hash_hex),
             hash_or_dash(&h.src_hash_hex),
         ),
-        None => (
-            "?".to_string(),
-            "?".to_string(),
-            MUTED,
-            "-".to_string(),
-            "-".to_string(),
-        ),
+        None => ("?".to_string(), "?".to_string(), MUTED, "-".to_string()),
     };
+    let dest_cell = destination_cell(latest.header.as_ref());
 
     let count_cell = if group.count() > 1 {
         Cell::from(Span::styled(
@@ -513,7 +527,7 @@ fn packet_group_row(group: &PacketGroup, contacts: &[ContactDto]) -> Row<'static
         Cell::from(route),
         Cell::from(Span::styled(ptype, Style::default().fg(color))),
         Cell::from(src),
-        Cell::from(dest),
+        dest_cell,
         Cell::from(hops_range(group)),
         count_cell,
         Cell::from(packet_summary(latest)),
@@ -690,9 +704,22 @@ fn draw_packet_detail_popup(frame: &mut Frame, group: &PacketGroup) {
                 "🔢 Payload version",
                 h.payload_version.to_string(),
             ));
-            if let (Some(src), Some(dest)) = (&h.src_hash_hex, &h.dest_hash_hex) {
-                lines.push(field_line("📤 Source", src.clone()));
+            if let Some(dest) = &h.dest_hash_hex {
                 lines.push(field_line("🎯 Destination", dest.clone()));
+            } else if let Some(channel) = &h.channel_hash_hex {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:<16}", "🎯 Destination"),
+                        Style::default().fg(MUTED),
+                    ),
+                    Span::styled(
+                        format!("{{{channel}}} (channel)"),
+                        Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                    ),
+                ]));
+            }
+            if let Some(src) = &h.src_hash_hex {
+                lines.push(field_line("📤 Source", src.clone()));
             }
 
             lines.push(Line::from(""));
@@ -901,7 +928,6 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 #[cfg(test)]
 mod render_tests {
     use super::*;
-    use fez_mesh_controller_core::mesh::PacketHeaderInfo;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -945,6 +971,7 @@ mod render_tests {
             transport_code_hex: None,
             dest_hash_hex: Some("de".to_string()),
             src_hash_hex: None,
+            channel_hash_hex: None,
             advertisement: None,
         });
         // One contact matches the destination, another matches the relay
@@ -969,6 +996,7 @@ mod render_tests {
             transport_code_hex: None,
             dest_hash_hex: None,
             src_hash_hex: None,
+            channel_hash_hex: None,
             advertisement: None,
         });
         let contacts = vec![contact("aabbccddeeff", true)];
@@ -991,6 +1019,7 @@ mod render_tests {
             transport_code_hex: None,
             dest_hash_hex: Some("de".to_string()),
             src_hash_hex: None,
+            channel_hash_hex: None,
             advertisement: None,
         });
         let contacts = vec![contact("112233445566", true)];
@@ -1017,6 +1046,7 @@ mod render_tests {
                     transport_code_hex: None,
                     dest_hash_hex: Some("de".to_string()),
                     src_hash_hex: Some("ad".to_string()),
+                    channel_hash_hex: None,
                     advertisement: None,
                 }),
                 payload_hex: "deadbeef".to_string(),
@@ -1037,6 +1067,7 @@ mod render_tests {
                     transport_code_hex: None,
                     dest_hash_hex: Some("de".to_string()),
                     src_hash_hex: Some("ad".to_string()),
+                    channel_hash_hex: None,
                     advertisement: None,
                 }),
                 payload_hex: "deadbeef".to_string(),
@@ -1057,6 +1088,7 @@ mod render_tests {
                     transport_code_hex: None,
                     dest_hash_hex: None,
                     src_hash_hex: None,
+                    channel_hash_hex: None,
                     advertisement: None,
                 }),
                 payload_hex: "01020304".to_string(),
@@ -1147,6 +1179,110 @@ mod render_tests {
 
         assert!(text.contains("Source"));
         assert!(text.contains("Destination"));
+    }
+
+    #[test]
+    fn packet_detail_popup_shows_destination_without_requiring_source() {
+        // AnonReq-shaped: a destination hash but no source hash (the
+        // requester's full public key stands in for it instead).
+        let mut app = App::new();
+        app.page = Page::PacketLog;
+        app.set_packet_log(vec![PacketLogEntry {
+            id: 1,
+            at_unix: 0,
+            snr: 1.0,
+            rssi: -90,
+            header: Some(PacketHeaderInfo {
+                route_type: "Flood".to_string(),
+                payload_type: "AnonReq".to_string(),
+                payload_version: 0,
+                hops: 1,
+                path_hash_size: 1,
+                path_hex: String::new(),
+                transport_code_hex: None,
+                dest_hash_hex: Some("de".to_string()),
+                src_hash_hex: None,
+                channel_hash_hex: None,
+                advertisement: None,
+            }),
+            payload_hex: "deadbeef".to_string(),
+            payload_len: 4,
+        }]);
+        app.packet_table_state.select(Some(0));
+        app.open_packet_detail();
+
+        let text = render(&mut app, 140, 40);
+
+        assert!(text.contains("Destination"));
+        assert!(text.contains("de"));
+        assert!(!text.contains("Source"));
+    }
+
+    #[test]
+    fn packet_log_table_shows_a_channel_hash_in_braces_for_group_messages() {
+        let mut app = App::new();
+        app.page = Page::PacketLog;
+        app.set_packet_log(vec![PacketLogEntry {
+            id: 1,
+            at_unix: 0,
+            snr: 1.0,
+            rssi: -90,
+            header: Some(PacketHeaderInfo {
+                route_type: "Flood".to_string(),
+                payload_type: "GroupText".to_string(),
+                payload_version: 0,
+                hops: 1,
+                path_hash_size: 1,
+                path_hex: String::new(),
+                transport_code_hex: None,
+                dest_hash_hex: None,
+                src_hash_hex: None,
+                channel_hash_hex: Some("ab".to_string()),
+                advertisement: None,
+            }),
+            payload_hex: "abcd".to_string(),
+            payload_len: 2,
+        }]);
+        app.packet_table_state.select(Some(0));
+
+        let text = render(&mut app, 120, 20);
+
+        assert!(text.contains("{ab}"));
+    }
+
+    #[test]
+    fn packet_detail_popup_shows_the_channel_hash_for_group_messages() {
+        let mut app = App::new();
+        app.page = Page::PacketLog;
+        app.set_packet_log(vec![PacketLogEntry {
+            id: 1,
+            at_unix: 0,
+            snr: 1.0,
+            rssi: -90,
+            header: Some(PacketHeaderInfo {
+                route_type: "Flood".to_string(),
+                payload_type: "GroupText".to_string(),
+                payload_version: 0,
+                hops: 1,
+                path_hash_size: 1,
+                path_hex: String::new(),
+                transport_code_hex: None,
+                dest_hash_hex: None,
+                src_hash_hex: None,
+                channel_hash_hex: Some("ab".to_string()),
+                advertisement: None,
+            }),
+            payload_hex: "abcd".to_string(),
+            payload_len: 2,
+        }]);
+        app.packet_table_state.select(Some(0));
+        app.open_packet_detail();
+
+        let text = render(&mut app, 140, 40);
+
+        assert!(text.contains("Destination"));
+        assert!(text.contains("{ab}"));
+        assert!(text.contains("channel"));
     }
 
     #[test]
@@ -1241,6 +1377,7 @@ mod render_tests {
                 transport_code_hex: None,
                 dest_hash_hex: None,
                 src_hash_hex: None,
+                channel_hash_hex: None,
                 advertisement: None,
             }),
             payload_hex: "ff".to_string(),

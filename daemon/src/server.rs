@@ -97,7 +97,9 @@ async fn handle_client(stream: UnixStream, state: Arc<AppState>) -> Result<()> {
             }
             entry = packet_log_rx.recv() => {
                 match entry {
-                    Ok(entry) => send(&mut writer, &ServerMessage::PacketLogEntry(entry)).await?,
+                    Ok(entry) => {
+                        send(&mut writer, &ServerMessage::PacketLogEntry(Box::new(entry))).await?
+                    }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         warn!(skipped, "IPC client too slow, packet log entries dropped");
                         continue;

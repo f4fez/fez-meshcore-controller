@@ -164,13 +164,21 @@ pub struct PacketHeaderInfo {
     pub transport_code_hex: Option<String>,
     /// Destination node's address hash, present when `payload_type` is one
     /// that addresses a specific node (`Req`, `Response`, `TextMsg`,
-    /// `Path`) and the payload is long enough to contain it. `path_hash_size`
-    /// bytes long, taken from the very front of the inner payload — see
-    /// `extract_dest_src_hashes`.
+    /// `Path`, `AnonReq`) and the payload is long enough to contain it.
+    /// Always exactly 1 byte, per the firmware's `PAYLOAD_VER_1` wire
+    /// format — independent of the header's `path_hash_size`, which only
+    /// sizes the path's own hop hashes. See `extract_dest_src_hashes`.
     pub dest_hash_hex: Option<String>,
-    /// Sender node's address hash, same availability/sizing as
-    /// `dest_hash_hex`, immediately following it in the payload.
+    /// Sender node's address hash, immediately following `dest_hash_hex` in
+    /// the payload — same 1-byte sizing, but absent for `AnonReq` (the
+    /// sender's full public key follows instead of a compact hash).
     pub src_hash_hex: Option<String>,
+    /// Channel hash for `GroupText`/`GroupData` payloads — identifies which
+    /// channel the message was sent to, *not* a node. Deliberately a
+    /// separate field from `dest_hash_hex`: unlike a node's address hash,
+    /// it must never be matched against a managed repeater's public key
+    /// (see `cli/src/tui/packet_group.rs`).
+    pub channel_hash_hex: Option<String>,
     /// Populated when `payload_type` is `"Advert"` and the inner payload
     /// could be decoded.
     pub advertisement: Option<PacketAdvertInfo>,
@@ -199,31 +207,76 @@ fn adv_type_name(adv_type: u8) -> String {
     }
 }
 
+/// Size in bytes of the destination/source/channel address hash prefixing
+/// certain payload types. Fixed by the firmware's `PAYLOAD_VER_1` wire
+/// format (`Mesh.cpp`: `uint8_t dest_hash = pkt->payload[i++];` etc., read
+/// as single bytes, never scaled by `getPathHashSize()`) — *not* the same
+/// as the header's `path_hash_size`, which only sizes the path's own hop
+/// hashes and can be 1-4 bytes. A future `PAYLOAD_VER_2` may widen this,
+/// which is why extraction is gated on `payload_version == 0` below.
+const ADDRESS_HASH_SIZE: usize = 1;
+
 /// Extracts the destination/source address hashes from the front of a
 /// packet's inner payload, for payload types that carry them: `Req`,
-/// `Response`, `TextMsg` and `Path` are each prefixed with a destination
-/// hash followed by a source hash, `path_hash_size` bytes apiece (the same
-/// hash size the header's hop `path` uses). Other payload types either
-/// broadcast (`Advert`), address a channel rather than a node (`GroupText`,
-/// `GroupData`), or carry no addressing of their own (`Ack`) — those return
-/// `(None, None)`, as does a payload too short to hold both hashes.
+/// `Response`, `TextMsg` and `Path` are each prefixed with a 1-byte
+/// destination hash followed by a 1-byte source hash. `AnonReq` carries
+/// only a destination hash — the sender's full public key follows instead
+/// of a compact source hash. Every other payload type either broadcasts
+/// (`Advert`), addresses a channel rather than a node (`GroupText`,
+/// `GroupData` — see `extract_channel_hash`), or carries no addressing of
+/// its own (`Ack`) — those return `(None, None)`, as does a payload too
+/// short to hold the hash(es) or a non-`PAYLOAD_VER_1` payload version.
 fn extract_dest_src_hashes(
     payload_type: PayloadType,
-    hash_size: u8,
+    payload_version: u8,
     payload: &[u8],
 ) -> (Option<String>, Option<String>) {
-    let addressed = matches!(
-        payload_type,
-        PayloadType::Req | PayloadType::Response | PayloadType::TextMsg | PayloadType::Path
-    );
-    let hash_size = hash_size as usize;
-    if !addressed || hash_size == 0 || payload.len() < hash_size * 2 {
+    if payload_version != 0 {
         return (None, None);
     }
 
-    let dest_hash_hex = hex_encode(&payload[..hash_size]);
-    let src_hash_hex = hex_encode(&payload[hash_size..hash_size * 2]);
-    (Some(dest_hash_hex), Some(src_hash_hex))
+    match payload_type {
+        PayloadType::Req | PayloadType::Response | PayloadType::TextMsg | PayloadType::Path => {
+            if payload.len() < ADDRESS_HASH_SIZE * 2 {
+                return (None, None);
+            }
+            let dest_hash_hex = hex_encode(&payload[..ADDRESS_HASH_SIZE]);
+            let src_hash_hex = hex_encode(&payload[ADDRESS_HASH_SIZE..ADDRESS_HASH_SIZE * 2]);
+            (Some(dest_hash_hex), Some(src_hash_hex))
+        }
+        PayloadType::AnonReq => {
+            if payload.len() < ADDRESS_HASH_SIZE {
+                return (None, None);
+            }
+            (Some(hex_encode(&payload[..ADDRESS_HASH_SIZE])), None)
+        }
+        _ => (None, None),
+    }
+}
+
+/// Extracts the channel hash from the front of a `GroupText`/`GroupData`
+/// packet's inner payload — see [`PacketHeaderInfo::channel_hash_hex`].
+/// `None` for any other payload type, a too-short payload, or a
+/// non-`PAYLOAD_VER_1` payload version (same sizing caveat as
+/// [`extract_dest_src_hashes`]).
+fn extract_channel_hash(
+    payload_type: PayloadType,
+    payload_version: u8,
+    payload: &[u8],
+) -> Option<String> {
+    if payload_version != 0 {
+        return None;
+    }
+    if !matches!(
+        payload_type,
+        PayloadType::GroupText | PayloadType::GroupData
+    ) {
+        return None;
+    }
+    if payload.len() < ADDRESS_HASH_SIZE {
+        return None;
+    }
+    Some(hex_encode(&payload[..ADDRESS_HASH_SIZE]))
 }
 
 /// Builds a packet log entry from a raw `meshcore-rs` event, if it's RF log
@@ -240,7 +293,9 @@ pub fn build_packet_log_entry(
 
     let header = log.header.as_ref().map(|h| {
         let (dest_hash_hex, src_hash_hex) =
-            extract_dest_src_hashes(h.payload_type, h.path_hash_size, &log.payload);
+            extract_dest_src_hashes(h.payload_type, h.payload_version, &log.payload);
+        let channel_hash_hex =
+            extract_channel_hash(h.payload_type, h.payload_version, &log.payload);
         PacketHeaderInfo {
             route_type: format!("{:?}", h.route_type),
             payload_type: format!("{:?}", h.payload_type),
@@ -251,6 +306,7 @@ pub fn build_packet_log_entry(
             transport_code_hex: h.transport_code.map(|c| hex_encode(&c)),
             dest_hash_hex,
             src_hash_hex,
+            channel_hash_hex,
             advertisement: log.advertisement.as_ref().map(|a| PacketAdvertInfo {
                 public_key_hex: hex_encode(&a.public_key),
                 name: a.name.clone(),
@@ -736,7 +792,7 @@ mod tests {
     #[test]
     fn build_packet_log_entry_decodes_dest_and_src_hashes_for_addressed_payload_types() {
         let mut header = advert_header(PayloadType::TextMsg);
-        header.path_hash_size = 1;
+        header.payload_version = 0; // PAYLOAD_VER_1: dest/src hashes present
         let log = LogData {
             snr: 2.0,
             rssi: -70,
@@ -751,39 +807,45 @@ mod tests {
 
         assert_eq!(header.dest_hash_hex.as_deref(), Some("de"));
         assert_eq!(header.src_hash_hex.as_deref(), Some("ad"));
+        assert!(header.channel_hash_hex.is_none());
     }
 
     #[test]
-    fn build_packet_log_entry_dest_and_src_hashes_use_the_header_path_hash_size() {
+    fn build_packet_log_entry_dest_and_src_hashes_are_always_one_byte_regardless_of_path_hash_size()
+    {
+        // The firmware fixes dest/src hashes at 1 byte each (PAYLOAD_VER_1),
+        // independent of the header's path_hash_size, which only sizes the
+        // path's own hop hashes and can be 1-4 bytes.
         let mut header = advert_header(PayloadType::Path);
+        header.payload_version = 0;
         header.path_hash_size = 2;
         let log = LogData {
             snr: 2.0,
             rssi: -70,
             header: Some(header),
             advertisement: None,
-            payload: vec![0x11, 0x22, 0x33, 0x44, 0x55],
+            payload: vec![0x11, 0x22, 0x33],
         };
         let entry =
             build_packet_log_entry(&event(EventType::LogData, EventPayload::LogData(log)), 1, 0)
                 .unwrap();
         let header = entry.header.expect("header should be decoded");
 
-        assert_eq!(header.dest_hash_hex.as_deref(), Some("1122"));
-        assert_eq!(header.src_hash_hex.as_deref(), Some("3344"));
+        assert_eq!(header.dest_hash_hex.as_deref(), Some("11"));
+        assert_eq!(header.src_hash_hex.as_deref(), Some("22"));
     }
 
     #[test]
     fn build_packet_log_entry_no_dest_src_hashes_when_payload_too_short() {
         let mut header = advert_header(PayloadType::TextMsg);
-        header.path_hash_size = 2;
+        header.payload_version = 0;
         let log = LogData {
             snr: 2.0,
             rssi: -70,
             header: Some(header),
             advertisement: None,
-            // Only 3 bytes, but two 2-byte hashes need 4.
-            payload: vec![0x11, 0x22, 0x33],
+            // Only 1 byte, but two 1-byte hashes need 2.
+            payload: vec![0x11],
         };
         let entry =
             build_packet_log_entry(&event(EventType::LogData, EventPayload::LogData(log)), 1, 0)
@@ -795,11 +857,13 @@ mod tests {
     }
 
     #[test]
-    fn build_packet_log_entry_no_dest_src_hashes_for_broadcast_payload_types() {
+    fn build_packet_log_entry_no_dest_src_hashes_for_non_addressed_payload_types() {
+        let mut header = advert_header(PayloadType::GroupText);
+        header.payload_version = 0;
         let log = LogData {
             snr: 2.0,
             rssi: -70,
-            header: Some(advert_header(PayloadType::GroupText)),
+            header: Some(header),
             advertisement: None,
             payload: vec![0xde, 0xad, 0xbe, 0xef],
         };
@@ -810,6 +874,140 @@ mod tests {
 
         assert!(header.dest_hash_hex.is_none());
         assert!(header.src_hash_hex.is_none());
+    }
+
+    #[test]
+    fn build_packet_log_entry_no_dest_src_hashes_for_a_non_payload_ver_1_packet() {
+        // advert_header defaults to payload_version 1 (not PAYLOAD_VER_1 /
+        // 0), so the 1-byte hash layout assumed by extract_dest_src_hashes
+        // isn't guaranteed — must not guess.
+        let header = advert_header(PayloadType::TextMsg);
+        assert_eq!(header.payload_version, 1);
+        let log = LogData {
+            snr: 2.0,
+            rssi: -70,
+            header: Some(header),
+            advertisement: None,
+            payload: vec![0xde, 0xad, 0xbe, 0xef],
+        };
+        let entry =
+            build_packet_log_entry(&event(EventType::LogData, EventPayload::LogData(log)), 1, 0)
+                .unwrap();
+        let header = entry.header.expect("header should be decoded");
+
+        assert!(header.dest_hash_hex.is_none());
+        assert!(header.src_hash_hex.is_none());
+    }
+
+    #[test]
+    fn build_packet_log_entry_anon_req_has_a_destination_hash_but_no_source_hash() {
+        let mut header = advert_header(PayloadType::AnonReq);
+        header.payload_version = 0;
+        let log = LogData {
+            snr: 2.0,
+            rssi: -70,
+            header: Some(header),
+            advertisement: None,
+            payload: vec![0xde, 0xad, 0xbe, 0xef],
+        };
+        let entry =
+            build_packet_log_entry(&event(EventType::LogData, EventPayload::LogData(log)), 1, 0)
+                .unwrap();
+        let header = entry.header.expect("header should be decoded");
+
+        assert_eq!(header.dest_hash_hex.as_deref(), Some("de"));
+        assert!(header.src_hash_hex.is_none());
+    }
+
+    #[test]
+    fn build_packet_log_entry_decodes_channel_hash_for_group_payload_types() {
+        for payload_type in [PayloadType::GroupText, PayloadType::GroupData] {
+            let mut header = advert_header(payload_type);
+            header.payload_version = 0;
+            let log = LogData {
+                snr: 2.0,
+                rssi: -70,
+                header: Some(header),
+                advertisement: None,
+                payload: vec![0xab, 0xcd],
+            };
+            let entry = build_packet_log_entry(
+                &event(EventType::LogData, EventPayload::LogData(log)),
+                1,
+                0,
+            )
+            .unwrap();
+            let header = entry.header.expect("header should be decoded");
+
+            assert_eq!(
+                header.channel_hash_hex.as_deref(),
+                Some("ab"),
+                "{payload_type:?}"
+            );
+            // A channel isn't a node: no dest/src hash alongside it.
+            assert!(header.dest_hash_hex.is_none());
+            assert!(header.src_hash_hex.is_none());
+        }
+    }
+
+    #[test]
+    fn build_packet_log_entry_no_channel_hash_when_payload_empty_or_wrong_version() {
+        let mut too_short = advert_header(PayloadType::GroupText);
+        too_short.payload_version = 0;
+        let log = LogData {
+            snr: 2.0,
+            rssi: -70,
+            header: Some(too_short),
+            advertisement: None,
+            payload: vec![],
+        };
+        let entry =
+            build_packet_log_entry(&event(EventType::LogData, EventPayload::LogData(log)), 1, 0)
+                .unwrap();
+        assert!(entry
+            .header
+            .expect("header should be decoded")
+            .channel_hash_hex
+            .is_none());
+
+        // payload_version 1 (not PAYLOAD_VER_1) — default from advert_header.
+        let wrong_version = advert_header(PayloadType::GroupText);
+        let log = LogData {
+            snr: 2.0,
+            rssi: -70,
+            header: Some(wrong_version),
+            advertisement: None,
+            payload: vec![0xab],
+        };
+        let entry =
+            build_packet_log_entry(&event(EventType::LogData, EventPayload::LogData(log)), 1, 0)
+                .unwrap();
+        assert!(entry
+            .header
+            .expect("header should be decoded")
+            .channel_hash_hex
+            .is_none());
+    }
+
+    #[test]
+    fn build_packet_log_entry_addressed_payload_types_never_get_a_channel_hash() {
+        let mut header = advert_header(PayloadType::TextMsg);
+        header.payload_version = 0;
+        let log = LogData {
+            snr: 2.0,
+            rssi: -70,
+            header: Some(header),
+            advertisement: None,
+            payload: vec![0xde, 0xad, 0xbe, 0xef],
+        };
+        let entry =
+            build_packet_log_entry(&event(EventType::LogData, EventPayload::LogData(log)), 1, 0)
+                .unwrap();
+        assert!(entry
+            .header
+            .expect("header should be decoded")
+            .channel_hash_hex
+            .is_none());
     }
 
     #[test]

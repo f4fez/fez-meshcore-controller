@@ -222,7 +222,7 @@ fn apply_ui_event(app: &mut App, event: UiEvent) {
             ServerMessage::Snapshot(snapshot) => app.snapshot = snapshot,
             ServerMessage::Event(event) => app.push_event(event),
             ServerMessage::PacketLog(backlog) => app.set_packet_log(backlog),
-            ServerMessage::PacketLogEntry(entry) => app.push_packet(entry),
+            ServerMessage::PacketLogEntry(entry) => app.push_packet(*entry),
             ServerMessage::Error(message) => app.last_status = Some(message),
             ServerMessage::Hello { .. } => {}
         },

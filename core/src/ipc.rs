@@ -80,8 +80,11 @@ pub enum ServerMessage {
     /// The current backlog of the raw packet log (TUI page F3), sent once
     /// right after [`ServerMessage::Snapshot`] on connect.
     PacketLog(Vec<PacketLogEntry>),
-    /// A single new raw packet, pushed as it's captured.
-    PacketLogEntry(PacketLogEntry),
+    /// A single new raw packet, pushed as it's captured. Boxed: `Snapshot`
+    /// and `PacketLogEntry` are otherwise the largest variants by far,
+    /// bloating every `ServerMessage` to their size regardless of which
+    /// variant is actually in play.
+    PacketLogEntry(Box<PacketLogEntry>),
     /// Non-fatal error to report to the client (e.g. lost mesh connection).
     Error(String),
 }
@@ -150,15 +153,17 @@ mod tests {
             kind: MeshEventKind::Connected,
         }));
         assert_roundtrips_as_single_line(&ServerMessage::PacketLog(vec![]));
-        assert_roundtrips_as_single_line(&ServerMessage::PacketLogEntry(PacketLogEntry {
-            id: 1,
-            at_unix: 0,
-            snr: 1.0,
-            rssi: -90,
-            header: None,
-            payload_hex: "abcd".to_string(),
-            payload_len: 2,
-        }));
+        assert_roundtrips_as_single_line(&ServerMessage::PacketLogEntry(Box::new(
+            PacketLogEntry {
+                id: 1,
+                at_unix: 0,
+                snr: 1.0,
+                rssi: -90,
+                header: None,
+                payload_hex: "abcd".to_string(),
+                payload_len: 2,
+            },
+        )));
         assert_roundtrips_as_single_line(&ServerMessage::Error("oops".to_string()));
     }
 

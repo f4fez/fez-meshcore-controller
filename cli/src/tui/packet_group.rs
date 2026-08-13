@@ -196,6 +196,7 @@ mod tests {
                 transport_code_hex: None,
                 dest_hash_hex: None,
                 src_hash_hex: None,
+                channel_hash_hex: None,
                 advertisement: None,
             }),
             payload_hex: payload_hex.to_string(),
@@ -317,6 +318,19 @@ mod tests {
         let group = PacketGroup { members: vec![e] };
 
         assert!(!group.endpoint_is_managed_repeater(&[contact("deadbeefcafe", false)]));
+    }
+
+    #[test]
+    fn endpoint_is_managed_repeater_ignores_a_channel_hash_matching_a_managed_repeater() {
+        // GroupText/GroupData carry a channel hash, not a node address hash
+        // — even if it happens to share its prefix with a managed
+        // repeater's public key, that's a coincidence in a different hash
+        // space and must not trigger a false-positive endpoint match.
+        let mut e = entry(1, 0, "GroupText", "deadbeef");
+        e.header.as_mut().unwrap().channel_hash_hex = Some("de".to_string());
+        let group = PacketGroup { members: vec![e] };
+
+        assert!(!group.endpoint_is_managed_repeater(&[contact("deadbeefcafe", true)]));
     }
 
     // --- relayed_by_managed_repeater -------------------------------------
