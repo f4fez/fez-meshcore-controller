@@ -95,7 +95,7 @@ async fn run_loop(
                             KeyCode::F(1) => {
                                 app.help_open = !app.help_open;
                                 if app.help_open {
-                                    app.packet_detail_open = false;
+                                    app.close_packet_detail();
                                 }
                             }
                             KeyCode::F(2) => app.page = Page::Dashboard,
@@ -104,8 +104,8 @@ async fn run_loop(
                             KeyCode::Esc if app.help_open => {
                                 app.help_open = false;
                             }
-                            KeyCode::Esc if app.packet_detail_open => {
-                                app.packet_detail_open = false;
+                            KeyCode::Esc if app.packet_detail.is_some() => {
+                                app.close_packet_detail();
                             }
                             KeyCode::Esc => app.should_quit = true,
                             _ if app.help_open => {}
@@ -127,18 +127,22 @@ async fn run_loop(
                                 },
                                 Page::PacketLog => match key.code {
                                     KeyCode::Down => {
-                                        if !app.packet_detail_open {
+                                        if app.packet_detail.is_none() {
                                             app.select_next_packet();
                                         }
                                     }
                                     KeyCode::Up => {
-                                        if !app.packet_detail_open {
+                                        if app.packet_detail.is_none() {
                                             app.select_prev_packet();
                                         }
                                     }
                                     KeyCode::Char('l') => app.toggle_scroll_lock(),
                                     KeyCode::Enter if app.selected_group().is_some() => {
-                                        app.packet_detail_open = !app.packet_detail_open;
+                                        if app.packet_detail.is_some() {
+                                            app.close_packet_detail();
+                                        } else {
+                                            app.open_packet_detail();
+                                        }
                                     }
                                     _ => {}
                                 },

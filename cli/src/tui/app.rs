@@ -56,9 +56,10 @@ pub struct App {
     /// user can scroll through it undisturbed while `packets` keeps
     /// growing in the background ("scroll lock").
     pub locked_view: Option<Vec<PacketLogEntry>>,
-    /// Whether the packet detail popup is open for the currently selected
-    /// packet.
-    pub packet_detail_open: bool,
+    /// The packet detail popup's content, snapshotted at the moment it was
+    /// opened so it stays stable even as new packets keep arriving in the
+    /// background. `None` when the popup is closed.
+    pub packet_detail: Option<PacketGroup>,
 
     /// Whether the F1 help popup is open, showing shortcuts for the
     /// current page.
@@ -79,7 +80,7 @@ impl App {
             packets: Vec::new(),
             packet_table_state: ratatui::widgets::TableState::default(),
             locked_view: None,
-            packet_detail_open: false,
+            packet_detail: None,
             help_open: false,
         }
     }
@@ -213,5 +214,16 @@ impl App {
             Some(i) => i - 1,
         };
         self.packet_table_state.select(Some(prev));
+    }
+
+    /// Opens the detail popup for the currently selected packet,
+    /// snapshotting its content so it stays stable even as new packets
+    /// keep arriving in the background.
+    pub fn open_packet_detail(&mut self) {
+        self.packet_detail = self.selected_group();
+    }
+
+    pub fn close_packet_detail(&mut self) {
+        self.packet_detail = None;
     }
 }

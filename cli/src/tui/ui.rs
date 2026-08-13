@@ -62,9 +62,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     draw_footer(frame, app, root[2]);
 
-    if app.page == Page::PacketLog && app.packet_detail_open {
-        if let Some(group) = app.selected_group() {
-            draw_packet_detail_popup(frame, &group);
+    if app.page == Page::PacketLog {
+        if let Some(group) = &app.packet_detail {
+            draw_packet_detail_popup(frame, group);
         }
     }
 
@@ -883,13 +883,52 @@ mod render_tests {
         app.page = Page::PacketLog;
         app.set_packet_log(sample_entries());
         app.packet_table_state.select(Some(0)); // the grouped TextMsg (newest)
-        app.packet_detail_open = true;
+        app.open_packet_detail();
 
         let text = render(&mut app, 140, 40);
 
         assert!(text.contains("Receptions (2)"));
         assert!(text.contains("Payload type"));
         // Per-reception rows: the two relays have different hop counts.
+        assert!(text.contains("1h"));
+        assert!(text.contains("2h"));
+    }
+
+    #[test]
+    fn packet_detail_popup_stays_on_the_selected_packet_after_new_packets_arrive() {
+        let mut app = App::new();
+        app.page = Page::PacketLog;
+        app.set_packet_log(sample_entries());
+        app.packet_table_state.select(Some(0)); // the grouped TextMsg (newest)
+        app.open_packet_detail();
+
+        // A brand new packet arrives and is inserted at the front of the
+        // live list, shifting every existing entry's index — before the
+        // fix, this made the popup (which re-resolved the selection by
+        // index on every frame) silently swap to showing this new packet
+        // instead of staying on the one the user opened.
+        app.push_packet(PacketLogEntry {
+            id: 4,
+            at_unix: 30,
+            snr: 2.0,
+            rssi: -90,
+            header: Some(PacketHeaderInfo {
+                route_type: "Direct".to_string(),
+                payload_type: "Battery".to_string(),
+                payload_version: 0,
+                hops: 0,
+                path_hash_size: 1,
+                path_hex: String::new(),
+                transport_code_hex: None,
+                advertisement: None,
+            }),
+            payload_hex: "ff".to_string(),
+            payload_len: 1,
+        });
+
+        let text = render(&mut app, 140, 40);
+
+        assert!(text.contains("Receptions (2)"));
         assert!(text.contains("1h"));
         assert!(text.contains("2h"));
     }
