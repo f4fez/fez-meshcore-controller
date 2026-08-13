@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 
-use fez_mesh_controller_core::mesh::PacketLogEntry;
+use fez_mesh_controller_core::mesh::{ContactDto, PacketLogEntry};
 
 /// Receptions of the same packet more than this many seconds apart are
 /// treated as unrelated (e.g. a coincidentally identical payload much
@@ -45,6 +45,66 @@ impl PacketGroup {
     pub fn count(&self) -> usize {
         self.members.len()
     }
+
+    /// Whether this packet's destination or source hash belongs to a
+    /// managed repeater. Checked against [`Self::latest`] only: the
+    /// endpoint hashes are part of the inner payload, which is identical
+    /// across every member of the group by construction (see
+    /// [`group_key`]).
+    pub fn endpoint_is_managed_repeater(&self, contacts: &[ContactDto]) -> bool {
+        let Some(header) = &self.latest().header else {
+            return false;
+        };
+        [&header.dest_hash_hex, &header.src_hash_hex]
+            .into_iter()
+            .flatten()
+            .any(|hash| hash_matches_a_managed_repeater(hash, contacts))
+    }
+
+    /// Whether any repeater that relayed this packet — across *every*
+    /// reception in the group, since each one may have taken a different
+    /// path — is a managed repeater.
+    pub fn relayed_by_managed_repeater(&self, contacts: &[ContactDto]) -> bool {
+        self.members.iter().any(|member| {
+            let Some(header) = &member.header else {
+                return false;
+            };
+            path_hop_hashes(&header.path_hex, header.path_hash_size)
+                .iter()
+                .any(|hop| hash_matches_a_managed_repeater(hop, contacts))
+        })
+    }
+}
+
+/// Whether `hash_hex` (a truncated node address hash, as decoded onto
+/// [`fez_mesh_controller_core::mesh::PacketHeaderInfo`]) is a prefix of a
+/// managed contact's public key — the same "starts_with" matching
+/// `ManagedRepeater::matches` uses, just against a shorter hash than a full
+/// 6-byte contact prefix.
+fn hash_matches_a_managed_repeater(hash_hex: &str, contacts: &[ContactDto]) -> bool {
+    let hash_hex = hash_hex.to_ascii_lowercase();
+    contacts.iter().any(|c| {
+        c.managed
+            && c.public_key_prefix_hex
+                .to_ascii_lowercase()
+                .starts_with(&hash_hex)
+    })
+}
+
+/// Splits a header's concatenated hop-hash path into its individual
+/// `hash_size`-byte hashes (hex-encoded), newest-hop-first as stored.
+/// Empty if `hash_size` is zero or `path_hex` doesn't divide evenly (a
+/// malformed/undecodable path).
+fn path_hop_hashes(path_hex: &str, hash_size: u8) -> Vec<&str> {
+    let chunk_len = hash_size as usize * 2;
+    if chunk_len == 0 || !path_hex.len().is_multiple_of(chunk_len) {
+        return Vec::new();
+    }
+    path_hex
+        .as_bytes()
+        .chunks(chunk_len)
+        .map(|c| std::str::from_utf8(c).expect("hex string is always ASCII"))
+        .collect()
 }
 
 /// Groups a newest-first packet list into [`PacketGroup`]s, preserving
@@ -107,6 +167,18 @@ fn group_key(entry: &PacketLogEntry) -> Option<String> {
 mod tests {
     use super::*;
     use fez_mesh_controller_core::mesh::PacketHeaderInfo;
+
+    fn contact(public_key_prefix_hex: &str, managed: bool) -> ContactDto {
+        ContactDto {
+            name: "Node".to_string(),
+            public_key_prefix_hex: public_key_prefix_hex.to_string(),
+            last_advert_unix: 0,
+            lat: 0.0,
+            lon: 0.0,
+            registered: true,
+            managed,
+        }
+    }
 
     fn entry(id: u64, at_unix: i64, payload_type: &str, payload_hex: &str) -> PacketLogEntry {
         PacketLogEntry {
@@ -212,5 +284,89 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].latest().id, 3);
         assert_eq!(groups[1].latest().id, 2);
+    }
+
+    // --- endpoint_is_managed_repeater -----------------------------------
+
+    #[test]
+    fn endpoint_is_managed_repeater_matches_dest_or_src_hash() {
+        let mut e = entry(1, 0, "TextMsg", "deadbeef");
+        let h = e.header.as_mut().unwrap();
+        h.dest_hash_hex = Some("de".to_string());
+        h.src_hash_hex = Some("ad".to_string());
+        let group = PacketGroup { members: vec![e] };
+
+        assert!(group.endpoint_is_managed_repeater(&[contact("deadbeefcafe", true)]));
+    }
+
+    #[test]
+    fn endpoint_is_managed_repeater_false_when_no_match() {
+        let mut e = entry(1, 0, "TextMsg", "deadbeef");
+        let h = e.header.as_mut().unwrap();
+        h.dest_hash_hex = Some("11".to_string());
+        h.src_hash_hex = Some("22".to_string());
+        let group = PacketGroup { members: vec![e] };
+
+        assert!(!group.endpoint_is_managed_repeater(&[contact("deadbeefcafe", true)]));
+    }
+
+    #[test]
+    fn endpoint_is_managed_repeater_ignores_unmanaged_contacts() {
+        let mut e = entry(1, 0, "TextMsg", "deadbeef");
+        e.header.as_mut().unwrap().dest_hash_hex = Some("de".to_string());
+        let group = PacketGroup { members: vec![e] };
+
+        assert!(!group.endpoint_is_managed_repeater(&[contact("deadbeefcafe", false)]));
+    }
+
+    // --- relayed_by_managed_repeater -------------------------------------
+
+    #[test]
+    fn relayed_by_managed_repeater_checks_every_members_path() {
+        let mut newest = entry(2, 20, "TextMsg", "aabb");
+        {
+            let h = newest.header.as_mut().unwrap();
+            h.path_hash_size = 1;
+            h.path_hex = "1122".to_string();
+        }
+        let mut oldest = entry(1, 10, "TextMsg", "aabb");
+        {
+            let h = oldest.header.as_mut().unwrap();
+            h.path_hash_size = 1;
+            // Only this member's path includes the managed repeater's hash.
+            h.path_hex = "deadbeef".to_string();
+        }
+        let group = PacketGroup {
+            members: vec![newest, oldest],
+        };
+
+        assert!(group.relayed_by_managed_repeater(&[contact("deadbeefcafe", true)]));
+    }
+
+    #[test]
+    fn relayed_by_managed_repeater_false_when_no_hop_matches() {
+        let mut e = entry(1, 0, "TextMsg", "aabb");
+        {
+            let h = e.header.as_mut().unwrap();
+            h.path_hash_size = 1;
+            h.path_hex = "1122".to_string();
+        }
+        let group = PacketGroup { members: vec![e] };
+
+        assert!(!group.relayed_by_managed_repeater(&[contact("deadbeefcafe", true)]));
+    }
+
+    // --- path_hop_hashes --------------------------------------------------
+
+    #[test]
+    fn path_hop_hashes_splits_into_hash_size_chunks() {
+        assert_eq!(path_hop_hashes("11223344", 2), vec!["1122", "3344"]);
+    }
+
+    #[test]
+    fn path_hop_hashes_empty_for_a_zero_hash_size_or_uneven_length() {
+        assert!(path_hop_hashes("aabb", 0).is_empty());
+        assert!(path_hop_hashes("112233", 2).is_empty()); // not divisible by 4
+        assert!(path_hop_hashes("", 1).is_empty());
     }
 }

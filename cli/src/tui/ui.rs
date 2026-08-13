@@ -14,7 +14,7 @@
 
 use chrono::{Local, TimeZone};
 use fez_mesh_controller_core::ipc::MeshEvent;
-use fez_mesh_controller_core::mesh::{MeshEventKind, PacketLogEntry};
+use fez_mesh_controller_core::mesh::{ContactDto, MeshEventKind, PacketLogEntry};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -33,6 +33,13 @@ const GREEN: Color = Color::Rgb(0x66, 0xe3, 0x8a);
 const RED: Color = Color::Rgb(0xf2, 0x5c, 0x5c);
 const YELLOW: Color = Color::Rgb(0xf2, 0xc9, 0x4c);
 const MUTED: Color = Color::Rgb(0x7a, 0x84, 0x94);
+/// Packet log row background: this packet's source or destination is a
+/// managed repeater.
+const HL_ENDPOINT_MANAGED_BG: Color = Color::Rgb(0x8a, 0x7a, 0x2a);
+/// Packet log row background: this packet was relayed by a managed
+/// repeater (but doesn't itself address one) — darker/brown so it reads as
+/// a lower-priority signal than [`HL_ENDPOINT_MANAGED_BG`].
+const HL_RELAYED_BY_MANAGED_BG: Color = Color::Rgb(0x4a, 0x38, 0x12);
 
 fn block(title: impl Into<String>) -> Block<'static> {
     Block::default()
@@ -396,7 +403,22 @@ fn hash_or_dash(hash_hex: &Option<String>) -> String {
     hash_hex.clone().unwrap_or_else(|| "-".to_string())
 }
 
-fn packet_group_row(group: &PacketGroup) -> Row<'static> {
+/// Row background for a packet group, flagging its involvement with a
+/// managed repeater: being addressed to/from one takes priority over
+/// merely being relayed by one, since it's the more specific signal (a
+/// packet can be both — e.g. a managed repeater relaying a message to
+/// another managed repeater — in which case the endpoint color wins).
+fn packet_row_highlight(group: &PacketGroup, contacts: &[ContactDto]) -> Option<Color> {
+    if group.endpoint_is_managed_repeater(contacts) {
+        Some(HL_ENDPOINT_MANAGED_BG)
+    } else if group.relayed_by_managed_repeater(contacts) {
+        Some(HL_RELAYED_BY_MANAGED_BG)
+    } else {
+        None
+    }
+}
+
+fn packet_group_row(group: &PacketGroup, contacts: &[ContactDto]) -> Row<'static> {
     let latest = group.latest();
     let time = format_time_short(latest.at_unix);
 
@@ -426,7 +448,7 @@ fn packet_group_row(group: &PacketGroup) -> Row<'static> {
         Cell::from(Span::styled("·", Style::default().fg(MUTED)))
     };
 
-    Row::new(vec![
+    let mut row = Row::new(vec![
         Cell::from(time),
         Cell::from(format!("{:.1}/{}", latest.snr, latest.rssi)),
         Cell::from(route),
@@ -436,14 +458,22 @@ fn packet_group_row(group: &PacketGroup) -> Row<'static> {
         Cell::from(hops_range(group)),
         count_cell,
         Cell::from(packet_summary(latest)),
-    ])
+    ]);
+    if let Some(bg) = packet_row_highlight(group, contacts) {
+        row = row.style(Style::default().bg(bg));
+    }
+    row
 }
 
 fn draw_packet_log_page(frame: &mut Frame, app: &mut App, area: Rect) {
     let groups = app.packet_groups();
     let group_count = groups.len();
     let reception_count: usize = groups.iter().map(PacketGroup::count).sum();
-    let rows: Vec<Row> = groups.iter().map(packet_group_row).collect();
+    let contacts = &app.snapshot.contacts;
+    let rows: Vec<Row> = groups
+        .iter()
+        .map(|g| packet_group_row(g, contacts))
+        .collect();
 
     let header = Row::new(vec![
         Cell::from("Time"),
@@ -809,6 +839,99 @@ mod render_tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
+    fn contact(public_key_prefix_hex: &str, managed: bool) -> ContactDto {
+        ContactDto {
+            name: "Node".to_string(),
+            public_key_prefix_hex: public_key_prefix_hex.to_string(),
+            last_advert_unix: 0,
+            lat: 0.0,
+            lon: 0.0,
+            registered: true,
+            managed,
+        }
+    }
+
+    fn single_member_group(header: PacketHeaderInfo) -> PacketGroup {
+        PacketGroup {
+            members: vec![PacketLogEntry {
+                id: 1,
+                at_unix: 0,
+                snr: 1.0,
+                rssi: -90,
+                header: Some(header),
+                payload_hex: "aabb".to_string(),
+                payload_len: 2,
+            }],
+        }
+    }
+
+    // --- packet_row_highlight --------------------------------------------
+
+    #[test]
+    fn packet_row_highlight_prioritizes_endpoint_over_relay() {
+        let group = single_member_group(PacketHeaderInfo {
+            route_type: "Flood".to_string(),
+            payload_type: "TextMsg".to_string(),
+            payload_version: 0,
+            hops: 1,
+            path_hash_size: 1,
+            path_hex: "aa".to_string(),
+            transport_code_hex: None,
+            dest_hash_hex: Some("de".to_string()),
+            src_hash_hex: None,
+            advertisement: None,
+        });
+        // One contact matches the destination, another matches the relay
+        // hop — the endpoint color must win.
+        let contacts = vec![contact("deadbeefcafe", true), contact("aabbccddeeff", true)];
+
+        assert_eq!(
+            packet_row_highlight(&group, &contacts),
+            Some(HL_ENDPOINT_MANAGED_BG)
+        );
+    }
+
+    #[test]
+    fn packet_row_highlight_relay_only() {
+        let group = single_member_group(PacketHeaderInfo {
+            route_type: "Flood".to_string(),
+            payload_type: "TextMsg".to_string(),
+            payload_version: 0,
+            hops: 1,
+            path_hash_size: 1,
+            path_hex: "aa".to_string(),
+            transport_code_hex: None,
+            dest_hash_hex: None,
+            src_hash_hex: None,
+            advertisement: None,
+        });
+        let contacts = vec![contact("aabbccddeeff", true)];
+
+        assert_eq!(
+            packet_row_highlight(&group, &contacts),
+            Some(HL_RELAYED_BY_MANAGED_BG)
+        );
+    }
+
+    #[test]
+    fn packet_row_highlight_none_when_no_managed_repeater_involved() {
+        let group = single_member_group(PacketHeaderInfo {
+            route_type: "Flood".to_string(),
+            payload_type: "TextMsg".to_string(),
+            payload_version: 0,
+            hops: 1,
+            path_hash_size: 1,
+            path_hex: "aa".to_string(),
+            transport_code_hex: None,
+            dest_hash_hex: Some("de".to_string()),
+            src_hash_hex: None,
+            advertisement: None,
+        });
+        let contacts = vec![contact("112233445566", true)];
+
+        assert_eq!(packet_row_highlight(&group, &contacts), None);
+    }
+
     /// Three receptions: two relays of the same text message (identical
     /// payload, a few seconds apart) and one unrelated Ack.
     fn sample_entries() -> Vec<PacketLogEntry> {
@@ -906,6 +1029,26 @@ mod render_tests {
         assert!(text.contains("×2"));
         assert!(text.contains("TextMsg"));
         assert!(text.contains("Ack"));
+    }
+
+    #[test]
+    fn packet_log_table_highlights_a_row_addressed_to_a_managed_repeater() {
+        let mut app = App::new();
+        app.page = Page::PacketLog;
+        app.set_packet_log(sample_entries());
+        app.packet_table_state.select(None); // avoid the selection style masking the bg
+        app.snapshot.contacts.push(contact("deadbeefcafe", true));
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        // The TextMsg row (dest hash "de" matches the managed repeater's
+        // prefix) is on the first data row of the table, just past the
+        // left border/highlight-symbol gutter.
+        let cell = &buffer[(3, 5)];
+        assert_eq!(cell.bg, HL_ENDPOINT_MANAGED_BG);
     }
 
     #[test]
