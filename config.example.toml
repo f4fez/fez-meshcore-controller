@@ -98,3 +98,16 @@ discovered_nodes_capacity = 200
 # [[regions]]
 # name = "France"
 # parent = "Europe"
+
+# --- Hashtag channels --------------------------------------------------
+#
+# Names of MeshCore "Hashtag Channels" (docs/companion_protocol.md) to try
+# decoding GroupText messages against, in addition to the well-known
+# "Public" channel (always tried, no configuration needed). A hashtag
+# channel's key is derived purely from its name (SHA256("#name"), first 16
+# bytes) — like the Public channel, it's not actually private: anyone who
+# knows or guesses the name can derive the key. Decoded messages show up in
+# the packet log ("<channel>: <text>") and its detail popup. Not editable
+# via the setup wizard yet — add entries here by hand.
+
+# hashtag_channels = ["#test"]

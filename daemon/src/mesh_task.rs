@@ -540,6 +540,7 @@ mod tests {
             },
             managed_repeaters,
             regions: vec![],
+            hashtag_channels: vec![],
         };
         let state = AppState::new(command_tx, config, config_path);
         (state, dir)

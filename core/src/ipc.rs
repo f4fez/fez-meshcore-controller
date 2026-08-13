@@ -105,6 +105,10 @@ pub struct Snapshot {
     /// shown as the dashboard's "Cluster" block and used to recognize
     /// packets' transport codes.
     pub regions: Vec<RegionConfig>,
+    /// Configured "Hashtag Channel" names (see [`crate::config::Config::hashtag_channels`]),
+    /// used alongside the well-known "Public" channel to decode `GroupText`
+    /// messages in the packet log.
+    pub hashtag_channels: Vec<String>,
 }
 
 /// Timestamped mesh event, as broadcast to clients.

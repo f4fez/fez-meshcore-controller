@@ -95,7 +95,7 @@ fn hash_matches_a_managed_repeater(hash_hex: &str, contacts: &[ContactDto]) -> b
 /// `hash_size`-byte hashes (hex-encoded), newest-hop-first as stored.
 /// Empty if `hash_size` is zero or `path_hex` doesn't divide evenly (a
 /// malformed/undecodable path).
-fn path_hop_hashes(path_hex: &str, hash_size: u8) -> Vec<&str> {
+pub fn path_hop_hashes(path_hex: &str, hash_size: u8) -> Vec<&str> {
     let chunk_len = hash_size as usize * 2;
     if chunk_len == 0 || !path_hex.len().is_multiple_of(chunk_len) {
         return Vec::new();

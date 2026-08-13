@@ -153,6 +153,7 @@ mod tests {
             },
             managed_repeaters: vec![],
             regions: vec![],
+            hashtag_channels: vec![],
         };
         AppState::new(
             command_tx,
@@ -191,6 +192,7 @@ mod tests {
             },
             managed_repeaters: vec![],
             regions: vec![],
+            hashtag_channels: vec![],
         };
         AppState::new(
             command_tx,
@@ -243,6 +245,7 @@ mod tests {
             },
             managed_repeaters: vec![],
             regions: vec![],
+            hashtag_channels: vec![],
         };
         let state = AppState::new(command_tx, config, PathBuf::from("/tmp/x.toml"));
         assert_eq!(state.packet_log_capacity, 1);

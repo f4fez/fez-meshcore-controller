@@ -174,7 +174,9 @@ async fn dispatch_command(
 async fn current_snapshot(state: &Arc<AppState>) -> fez_mesh_controller_core::ipc::Snapshot {
     let mut snap = state.snapshot.read().await.clone();
     snap.uptime_secs = state.uptime_secs();
-    snap.regions = state.config.read().await.regions.clone();
+    let config = state.config.read().await;
+    snap.regions = config.regions.clone();
+    snap.hashtag_channels = config.hashtag_channels.clone();
     snap
 }
 
@@ -215,6 +217,7 @@ mod tests {
             },
             managed_repeaters: vec![],
             regions: vec![],
+            hashtag_channels: vec![],
         };
         let state = Arc::new(AppState::new(
             command_tx,
@@ -324,6 +327,7 @@ mod tests {
                 name: "World".to_string(),
                 parent: None,
             }],
+            hashtag_channels: vec![],
         };
         let state = Arc::new(AppState::new(
             command_tx,

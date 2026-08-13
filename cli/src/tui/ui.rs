@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use chrono::{Local, TimeZone};
+use fez_mesh_controller_core::channel;
 use fez_mesh_controller_core::ipc::MeshEvent;
 use fez_mesh_controller_core::mesh::{ContactDto, MeshEventKind, PacketHeaderInfo, PacketLogEntry};
 use fez_mesh_controller_core::region;
@@ -26,7 +27,7 @@ use ratatui::Frame;
 
 use crate::format::{format_coords, format_last_seen};
 use crate::tui::app::{App, Page};
-use crate::tui::packet_group::PacketGroup;
+use crate::tui::packet_group::{path_hop_hashes, PacketGroup};
 
 const CYAN: Color = Color::Rgb(0x4d, 0xd0, 0xe1);
 const MAGENTA: Color = Color::Rgb(0xe0, 0x67, 0xf2);
@@ -72,7 +73,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if app.page == Page::PacketLog {
         if let Some(group) = &app.packet_detail {
-            draw_packet_detail_popup(frame, group, &app.region_keys);
+            draw_packet_detail_popup(frame, group, &app.region_keys, &app.channel_keys);
         }
     }
 
@@ -174,7 +175,7 @@ fn draw_self_info(frame: &mut Frame, app: &App, area: Rect) {
 /// config, unrelated to the connected node's own settings.
 fn draw_cluster_block(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines = vec![Line::from(Span::styled(
-        "Regions:",
+        "🗺️ Regions:",
         Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
     ))];
 
@@ -188,7 +189,11 @@ fn draw_cluster_block(frame: &mut Frame, app: &App, area: Rect) {
             region::flatten_region_tree(&app.snapshot.regions)
                 .into_iter()
                 .map(|(depth, region)| {
-                    Line::from(Span::raw(format!("{}{}", "  ".repeat(depth), region.name)))
+                    Line::from(Span::raw(format!(
+                        "{}{}",
+                        "  ".repeat(depth + 1),
+                        region.name
+                    )))
                 }),
         );
     }
@@ -439,7 +444,7 @@ fn payload_type_description(payload_type: &str) -> &'static str {
 
 /// One-line, human-readable summary of a packet's content, tailored to its
 /// payload type since different types carry very different data.
-fn packet_summary(entry: &PacketLogEntry) -> String {
+fn packet_summary(entry: &PacketLogEntry, channel_keys: &[(String, [u8; 32], u8)]) -> String {
     let Some(header) = &entry.header else {
         return format!("undecodable header ({} byte payload)", entry.payload_len);
     };
@@ -448,6 +453,10 @@ fn packet_summary(entry: &PacketLogEntry) -> String {
         let name = adv.name.as_deref().unwrap_or("(unnamed)");
         let pos = format_coords(adv.lat.unwrap_or(0.0), adv.lon.unwrap_or(0.0));
         return format!("{} \"{name}\" @ {pos}", adv.adv_type_name);
+    }
+
+    if let Some(decoded) = channel::decode_group_text(entry, channel_keys) {
+        return format!("{}: {}", decoded.channel_name, decoded.text);
     }
 
     match header.payload_type.as_str() {
@@ -532,7 +541,11 @@ fn packet_row_highlight(group: &PacketGroup, contacts: &[ContactDto]) -> Option<
     }
 }
 
-fn packet_group_row(group: &PacketGroup, contacts: &[ContactDto]) -> Row<'static> {
+fn packet_group_row(
+    group: &PacketGroup,
+    contacts: &[ContactDto],
+    channel_keys: &[(String, [u8; 32], u8)],
+) -> Row<'static> {
     let latest = group.latest();
     let time = format_time_short(latest.at_unix);
 
@@ -565,7 +578,7 @@ fn packet_group_row(group: &PacketGroup, contacts: &[ContactDto]) -> Row<'static
         dest_cell,
         Cell::from(hops_range(group)),
         count_cell,
-        Cell::from(packet_summary(latest)),
+        Cell::from(packet_summary(latest, channel_keys)),
     ]);
     if let Some(bg) = packet_row_highlight(group, contacts) {
         row = row.style(Style::default().bg(bg));
@@ -578,9 +591,10 @@ fn draw_packet_log_page(frame: &mut Frame, app: &mut App, area: Rect) {
     let group_count = groups.len();
     let reception_count: usize = groups.iter().map(PacketGroup::count).sum();
     let contacts = &app.snapshot.contacts;
+    let channel_keys = &app.channel_keys;
     let rows: Vec<Row> = groups
         .iter()
-        .map(|g| packet_group_row(g, contacts))
+        .map(|g| packet_group_row(g, contacts, channel_keys))
         .collect();
 
     let header = Row::new(vec![
@@ -663,6 +677,22 @@ fn section_title(text: impl Into<String>) -> Line<'static> {
     ))
 }
 
+/// Human-readable rendering of a packet's path: its individual repeater
+/// hop hashes (see [`path_hop_hashes`]), separated by an arrow so they
+/// read as a sequence of hops rather than one illegible run-together hex
+/// blob — `"flood"` for an empty path, or the raw hex as a fallback if it
+/// can't be split into whole hops (malformed/undecodable path).
+fn format_path(path_hex: &str, path_hash_size: u8) -> String {
+    if path_hex.is_empty() {
+        return "flood".to_string();
+    }
+    let hops = path_hop_hashes(path_hex, path_hash_size);
+    if hops.is_empty() {
+        return path_hex.to_string();
+    }
+    hops.join(" → ")
+}
+
 /// One line of the per-reception breakdown: the fields that genuinely
 /// differ between repeaters hearing the same packet (signal quality,
 /// route, hop count, path) — as opposed to the fields common to the whole
@@ -672,11 +702,7 @@ fn reception_line(m: &PacketLogEntry) -> Line<'static> {
         Some(h) => (
             h.route_type.clone(),
             h.hops.to_string(),
-            if h.path_hex.is_empty() {
-                "flood".to_string()
-            } else {
-                h.path_hex.clone()
-            },
+            format_path(&h.path_hex, h.path_hash_size),
         ),
         None => ("?".to_string(), "-".to_string(), "-".to_string()),
     };
@@ -763,6 +789,7 @@ fn draw_packet_detail_popup(
     frame: &mut Frame,
     group: &PacketGroup,
     region_keys: &[(String, [u8; 16])],
+    channel_keys: &[(String, [u8; 32], u8)],
 ) {
     let area = centered_rect(76, 80, frame.area());
     frame.render_widget(Clear, area);
@@ -820,32 +847,32 @@ fn draw_packet_detail_popup(
                 Style::default().fg(Color::White),
             )));
 
-            match &h.advertisement {
-                Some(adv) => {
-                    lines.push(Line::from(""));
-                    lines.push(section_title("— Advertised identity —"));
-                    lines.push(field_line(
-                        "🏷️  Name",
-                        adv.name.clone().unwrap_or_else(|| "(unnamed)".to_string()),
-                    ));
-                    lines.push(field_line("🔖 Advertiser type", adv.adv_type_name.clone()));
-                    lines.push(field_line("🔑 Public key", adv.public_key_hex.clone()));
-                    lines.push(field_line(
-                        "🌍 Position",
-                        format_coords(adv.lat.unwrap_or(0.0), adv.lon.unwrap_or(0.0)),
-                    ));
-                }
-                None => {
-                    lines.push(Line::from(""));
-                    lines.push(field_line(
-                        "📨 Payload",
-                        format!(
-                            "{} bytes: {}",
-                            latest.payload_len,
-                            truncate_hex(&latest.payload_hex)
-                        ),
-                    ));
-                }
+            if let Some(adv) = &h.advertisement {
+                lines.push(Line::from(""));
+                lines.push(section_title("— Advertised identity —"));
+                lines.push(field_line(
+                    "🏷️  Name",
+                    adv.name.clone().unwrap_or_else(|| "(unnamed)".to_string()),
+                ));
+                lines.push(field_line("🔖 Advertiser type", adv.adv_type_name.clone()));
+                lines.push(field_line("🔑 Public key", adv.public_key_hex.clone()));
+                lines.push(field_line(
+                    "🌍 Position",
+                    format_coords(adv.lat.unwrap_or(0.0), adv.lon.unwrap_or(0.0)),
+                ));
+            } else if let Some(decoded) = channel::decode_group_text(latest, channel_keys) {
+                lines.push(Line::from(""));
+                lines.push(section_title("— Payload —"));
+                lines.push(field_line("📡 Channel", decoded.channel_name));
+                lines.push(field_line("💬 Message", decoded.text));
+            } else {
+                lines.push(Line::from(""));
+                lines.push(section_title("— Payload —"));
+                lines.push(field_line(
+                    "📏 Size",
+                    format!("{} bytes", latest.payload_len),
+                ));
+                lines.push(field_line("📨 Raw data", truncate_hex(&latest.payload_hex)));
             }
         }
         None => {
@@ -854,14 +881,13 @@ fn draw_packet_detail_popup(
                 "Header could not be decoded.",
                 Style::default().fg(YELLOW),
             )));
+            lines.push(Line::from(""));
+            lines.push(section_title("— Payload —"));
             lines.push(field_line(
-                "📨 Raw payload",
-                format!(
-                    "{} bytes: {}",
-                    latest.payload_len,
-                    truncate_hex(&latest.payload_hex)
-                ),
+                "📏 Size",
+                format!("{} bytes", latest.payload_len),
             ));
+            lines.push(field_line("📨 Raw data", truncate_hex(&latest.payload_hex)));
         }
     }
 
@@ -1056,6 +1082,37 @@ mod render_tests {
         }
     }
 
+    /// A real `GroupText` packet addressed to the well-known "Public"
+    /// channel: `channel_hash(0x11) || mac || ciphertext`, cross-checked
+    /// independently via the `openssl` CLI (AES-128-ECB) and Python's
+    /// hmac/hashlib (see `core::channel::tests`) — decrypts to
+    /// "Hello, mesh!".
+    fn public_group_text_entry() -> PacketLogEntry {
+        PacketLogEntry {
+            id: 1,
+            at_unix: 0,
+            snr: 1.0,
+            rssi: -90,
+            header: Some(PacketHeaderInfo {
+                route_type: "Flood".to_string(),
+                payload_type: "GroupText".to_string(),
+                payload_type_raw: 5,
+                payload_version: 0,
+                hops: 1,
+                path_hash_size: 1,
+                path_hex: String::new(),
+                transport_code_hex: None,
+                dest_hash_hex: None,
+                src_hash_hex: None,
+                channel_hash_hex: Some("11".to_string()),
+                advertisement: None,
+            }),
+            payload_hex: "11ece6f1d59f9d82b89139e8f514be20fe914ab3d762d29a9a22438cb69d8789f99ce3"
+                .to_string(),
+            payload_len: 34,
+        }
+    }
+
     // --- packet_row_highlight --------------------------------------------
 
     #[test]
@@ -1127,6 +1184,25 @@ mod render_tests {
         let contacts = vec![contact("112233445566", true)];
 
         assert_eq!(packet_row_highlight(&group, &contacts), None);
+    }
+
+    // --- format_path --------------------------------------------------------
+
+    #[test]
+    fn format_path_shows_flood_for_an_empty_path() {
+        assert_eq!(format_path("", 1), "flood");
+    }
+
+    #[test]
+    fn format_path_separates_hops_with_an_arrow() {
+        assert_eq!(format_path("aabbcc", 1), "aa → bb → cc");
+        assert_eq!(format_path("11223344", 2), "1122 → 3344");
+    }
+
+    #[test]
+    fn format_path_falls_back_to_the_raw_hex_when_it_cannot_be_split_into_hops() {
+        // Not evenly divisible by the hash size (2 bytes = 4 hex chars).
+        assert_eq!(format_path("aabbcc", 2), "aabbcc");
     }
 
     /// Three receptions: two relays of the same text message (identical
@@ -1346,9 +1422,11 @@ mod render_tests {
 
         let text = render(&mut app, 120, 30);
 
-        assert!(text.contains("World"));
-        assert!(text.contains("  Europe"));
-        assert!(text.contains("    France"));
+        // Every entry is shifted 2 extra characters right of the "Regions:"
+        // label, on top of its own depth-based indentation.
+        assert!(text.contains("  World"));
+        assert!(text.contains("    Europe"));
+        assert!(text.contains("      France"));
     }
 
     // --- Repeaters panel -----------------------------------------------------
@@ -1431,6 +1509,94 @@ mod render_tests {
         assert!(text.contains("ad"));
         // ...while the Ack row (no per-node addressing) shows a dash.
         assert!(text.contains("-"));
+    }
+
+    #[test]
+    fn packet_log_table_shows_decoded_text_for_a_public_channel_message() {
+        let mut app = App::new();
+        app.page = Page::PacketLog;
+        app.set_packet_log(vec![public_group_text_entry()]);
+        app.packet_table_state.select(Some(0));
+
+        let text = render(&mut app, 140, 20);
+
+        assert!(text.contains("Public: Hello, mesh!"));
+    }
+
+    #[test]
+    fn packet_log_table_shows_decoded_text_for_a_configured_hashtag_channel() {
+        use fez_mesh_controller_core::ipc::Snapshot;
+
+        let mut app = App::new();
+        app.page = Page::PacketLog;
+        app.apply_snapshot(Snapshot {
+            hashtag_channels: vec!["#mytest".to_string()],
+            ..Default::default()
+        });
+        // `channel_hash(0x61) || mac || ciphertext` for channel "#mytest",
+        // cross-checked independently via `openssl`/Python (see
+        // `core::channel::tests`) — decrypts to "Topic chat".
+        app.set_packet_log(vec![PacketLogEntry {
+            id: 1,
+            at_unix: 0,
+            snr: 1.0,
+            rssi: -90,
+            header: Some(PacketHeaderInfo {
+                route_type: "Flood".to_string(),
+                payload_type: "GroupText".to_string(),
+                payload_type_raw: 5,
+                payload_version: 0,
+                hops: 1,
+                path_hash_size: 1,
+                path_hex: String::new(),
+                transport_code_hex: None,
+                dest_hash_hex: None,
+                src_hash_hex: None,
+                channel_hash_hex: Some("61".to_string()),
+                advertisement: None,
+            }),
+            payload_hex: "6197dfa79aead70a65177d5a0b785700bae78c".to_string(),
+            payload_len: 19,
+        }]);
+        app.packet_table_state.select(Some(0));
+
+        let text = render(&mut app, 140, 20);
+
+        assert!(text.contains("#mytest: Topic chat"));
+    }
+
+    #[test]
+    fn packet_log_table_does_not_decode_a_hashtag_channel_that_is_not_configured() {
+        let mut app = App::new(); // no hashtag_channels configured
+        app.page = Page::PacketLog;
+        app.set_packet_log(vec![PacketLogEntry {
+            id: 1,
+            at_unix: 0,
+            snr: 1.0,
+            rssi: -90,
+            header: Some(PacketHeaderInfo {
+                route_type: "Flood".to_string(),
+                payload_type: "GroupText".to_string(),
+                payload_type_raw: 5,
+                payload_version: 0,
+                hops: 1,
+                path_hash_size: 1,
+                path_hex: String::new(),
+                transport_code_hex: None,
+                dest_hash_hex: None,
+                src_hash_hex: None,
+                channel_hash_hex: Some("61".to_string()),
+                advertisement: None,
+            }),
+            payload_hex: "6197dfa79aead70a65177d5a0b785700bae78c".to_string(),
+            payload_len: 19,
+        }]);
+        app.packet_table_state.select(Some(0));
+
+        let text = render(&mut app, 140, 20);
+
+        assert!(!text.contains("Topic chat"));
+        assert!(text.contains("bytes of (encrypted) text"));
     }
 
     #[test]
@@ -1552,6 +1718,63 @@ mod render_tests {
         assert!(text.contains("Destination"));
         assert!(text.contains("{ab}"));
         assert!(text.contains("channel"));
+    }
+
+    #[test]
+    fn packet_detail_popup_shows_the_decoded_channel_and_message_in_the_payload_section() {
+        let mut app = App::new();
+        app.page = Page::PacketLog;
+        app.set_packet_log(vec![public_group_text_entry()]);
+        app.packet_table_state.select(Some(0));
+        app.open_packet_detail();
+
+        let text = render(&mut app, 140, 40);
+
+        assert!(text.contains("Payload"));
+        assert!(text.contains("Channel"));
+        assert!(text.contains("Public"));
+        assert!(text.contains("Message"));
+        assert!(text.contains("Hello, mesh!"));
+        // Decoded, so no raw-hex fallback fields alongside it.
+        assert!(!text.contains("Raw data"));
+    }
+
+    #[test]
+    fn packet_detail_popup_shows_size_and_raw_data_for_an_undecoded_payload() {
+        let mut app = App::new();
+        app.page = Page::PacketLog;
+        app.set_packet_log(vec![PacketLogEntry {
+            id: 1,
+            at_unix: 0,
+            snr: 1.0,
+            rssi: -90,
+            header: Some(PacketHeaderInfo {
+                route_type: "Flood".to_string(),
+                payload_type: "Ack".to_string(),
+                payload_type_raw: 4,
+                payload_version: 0,
+                hops: 1,
+                path_hash_size: 1,
+                path_hex: String::new(),
+                transport_code_hex: None,
+                dest_hash_hex: None,
+                src_hash_hex: None,
+                channel_hash_hex: None,
+                advertisement: None,
+            }),
+            payload_hex: "deadbeef".to_string(),
+            payload_len: 4,
+        }]);
+        app.packet_table_state.select(Some(0));
+        app.open_packet_detail();
+
+        let text = render(&mut app, 140, 40);
+
+        assert!(text.contains("— Payload —"));
+        assert!(text.contains("Size"));
+        assert!(text.contains("4 bytes"));
+        assert!(text.contains("Raw data"));
+        assert!(text.contains("deadbeef"));
     }
 
     // --- Transport code -----------------------------------------------------
@@ -1694,6 +1917,10 @@ mod render_tests {
         // Per-reception rows: the two relays have different hop counts.
         assert!(text.contains("1h"));
         assert!(text.contains("2h"));
+        // The 2-hop reception's path ("aabb", path_hash_size 1) is shown as
+        // its individual hop hashes separated by an arrow, not run together.
+        assert!(text.contains("aa → bb"));
+        assert!(!text.contains("aabb"));
     }
 
     #[test]

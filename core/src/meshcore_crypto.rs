@@ -40,10 +40,20 @@
 //! a fixed per-region value: it's an HMAC over the packet's own payload
 //! type and bytes, so it varies per packet.
 
+use aes::cipher::{generic_array::GenericArray, BlockDecrypt};
+use aes::Aes128;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Size in bytes of the truncated HMAC-SHA256 MAC prefixing an
+/// encrypt-then-MAC payload (`CIPHER_MAC_SIZE`, `src/MeshCore.h`).
+pub const CIPHER_MAC_SIZE: usize = 2;
+
+/// AES-128 block/key size used for direct-message and group-channel
+/// payload encryption (`CIPHER_KEY_SIZE`, `src/MeshCore.h`).
+pub const CIPHER_KEY_SIZE: usize = 16;
 
 /// Derives a region's 16-byte transport key from its name: `SHA256(name)`,
 /// truncated to 16 bytes. Deterministic — two independent implementations
@@ -53,6 +63,26 @@ pub fn derive_region_key(name: &str) -> [u8; 16] {
     let mut key = [0u8; 16];
     key.copy_from_slice(&digest[..16]);
     key
+}
+
+/// Derives a "Hashtag Channel"'s 16-byte PSK from its name, including the
+/// leading `#` (added if the caller omitted it) — `docs/companion_protocol.md`:
+/// "Uses a secret key derived from the channel name... the first 16
+/// bytes of `sha256("#test")`". Independently verified via Python's
+/// hashlib: `SHA256("#test")[:16]` == the doc's own example key
+/// `9cd8fcf22a47333b591d96a2b848b73f`.
+///
+/// Same formula as [`derive_region_key`] (`SHA256(name)`, truncated), but
+/// kept as its own named function: region transport keys and channel PSKs
+/// are different firmware concepts that happen to share this derivation,
+/// not the same value for the same name (a channel key hashes the name
+/// *with* its `#`; nothing requires a region's name to have one).
+pub fn hashtag_channel_key(name: &str) -> [u8; 16] {
+    if name.starts_with('#') {
+        derive_region_key(name)
+    } else {
+        derive_region_key(&format!("#{name}"))
+    }
 }
 
 /// Computes the 2-byte transport code a region would produce for a given
@@ -81,6 +111,64 @@ fn avoid_reserved_codes(code: u16) -> u16 {
     } else {
         code
     }
+}
+
+/// Derives a `GroupChannel`'s 32-byte shared secret and 1-byte channel
+/// hash from its PSK, mirroring the firmware's `BaseChatMesh::addChannel`
+/// (`src/helpers/BaseChatMesh.cpp`):
+///
+/// ```cpp
+/// memset(dest->channel.secret, 0, sizeof(dest->channel.secret));   // 32 bytes
+/// int len = decode_base64(psk_base64, strlen(psk_base64), dest->channel.secret);
+/// mesh::Utils::sha256(dest->channel.hash, sizeof(dest->channel.hash), dest->channel.secret, len);
+/// ```
+///
+/// The secret buffer (`GroupChannel::secret`, `PUB_KEY_SIZE` = 32 bytes)
+/// is the PSK zero-padded to 32 bytes; the hash is `SHA256(psk)`, of
+/// which only the first byte is ever compared to identify a channel from
+/// a received packet (`Mesh::onRecvPacket`'s `searchChannelsByHash`
+/// checks `hash[0]` only).
+pub fn group_channel_secret_and_hash(psk: &[u8]) -> ([u8; 32], u8) {
+    let len = psk.len().min(32);
+    let mut secret = [0u8; 32];
+    secret[..len].copy_from_slice(&psk[..len]);
+    let hash = Sha256::digest(&psk[..len]);
+    (secret, hash[0])
+}
+
+/// Verifies the MAC and decrypts a `mac || ciphertext` payload — mirrors
+/// `Utils::MACThenDecrypt` (`src/Utils.cpp`): the MAC is the first
+/// [`CIPHER_MAC_SIZE`] bytes of `HMAC-SHA256(secret, ciphertext)`; the
+/// ciphertext is AES-128-ECB, `secret`'s first [`CIPHER_KEY_SIZE`] bytes
+/// as the key (`Utils::encrypt` zero-pads its final partial block, so
+/// `ciphertext.len()` is always a multiple of the block size).
+///
+/// Returns `None` if the input is too short, the ciphertext isn't a
+/// multiple of the AES block size, or the MAC doesn't match (wrong
+/// secret, or the bytes simply aren't a valid encrypt-then-MAC payload).
+pub fn mac_then_decrypt(secret: &[u8; 32], mac_and_ciphertext: &[u8]) -> Option<Vec<u8>> {
+    if mac_and_ciphertext.len() <= CIPHER_MAC_SIZE {
+        return None;
+    }
+    let (mac, ciphertext) = mac_and_ciphertext.split_at(CIPHER_MAC_SIZE);
+    if ciphertext.is_empty() || ciphertext.len() % CIPHER_KEY_SIZE != 0 {
+        return None;
+    }
+
+    let mut hmac = HmacSha256::new_from_slice(secret).expect("HMAC accepts a key of any length");
+    hmac.update(ciphertext);
+    let expected_mac = hmac.finalize().into_bytes();
+    if expected_mac[..CIPHER_MAC_SIZE] != *mac {
+        return None;
+    }
+
+    let key = GenericArray::from_slice(&secret[..CIPHER_KEY_SIZE]);
+    let cipher = <Aes128 as aes::cipher::KeyInit>::new(key);
+    let mut plaintext = ciphertext.to_vec();
+    for block in plaintext.chunks_exact_mut(CIPHER_KEY_SIZE) {
+        cipher.decrypt_block(GenericArray::from_mut_slice(block));
+    }
+    Some(plaintext)
 }
 
 #[cfg(test)]
@@ -124,10 +212,95 @@ mod tests {
     }
 
     #[test]
+    fn hashtag_channel_key_matches_the_verified_companion_protocol_doc_vector() {
+        // `docs/companion_protocol.md`'s own worked example, independently
+        // re-verified via Python's hashlib (not taken on faith from the
+        // doc): SHA256("#test")[:16] == 9cd8fcf22a47333b591d96a2b848b73f.
+        const EXPECTED: [u8; 16] = [
+            0x9c, 0xd8, 0xfc, 0xf2, 0x2a, 0x47, 0x33, 0x3b, 0x59, 0x1d, 0x96, 0xa2, 0xb8, 0x48,
+            0xb7, 0x3f,
+        ];
+        assert_eq!(hashtag_channel_key("#test"), EXPECTED);
+    }
+
+    #[test]
+    fn hashtag_channel_key_adds_a_missing_leading_hash() {
+        assert_eq!(hashtag_channel_key("test"), hashtag_channel_key("#test"));
+    }
+
+    #[test]
     fn avoid_reserved_codes_nudges_only_the_two_reserved_values() {
         assert_eq!(avoid_reserved_codes(0x0000), 0x0001);
         assert_eq!(avoid_reserved_codes(0xFFFF), 0xFFFE);
         assert_eq!(avoid_reserved_codes(0x0001), 0x0001);
         assert_eq!(avoid_reserved_codes(0x1234), 0x1234);
+    }
+
+    // --- GroupChannel decryption (well-known "Public" channel) -----------
+
+    // Base64 `izOH6cXN6mrJ5e26oRXNcg==` (`PUBLIC_GROUP_PSK`,
+    // `examples/companion_radio/MyMesh.cpp`), decoded.
+    const PUBLIC_PSK: [u8; 16] = [
+        0x8b, 0x33, 0x87, 0xe9, 0xc5, 0xcd, 0xea, 0x6a, 0xc9, 0xe5, 0xed, 0xba, 0xa1, 0x15, 0xcd,
+        0x72,
+    ];
+
+    #[test]
+    fn group_channel_secret_and_hash_matches_the_verified_public_channel_vector() {
+        // Independently verified via Python's hashlib (not derived from
+        // this implementation): SHA256(PUBLIC_PSK)[0] == 0x11.
+        let (secret, hash) = group_channel_secret_and_hash(&PUBLIC_PSK);
+        assert_eq!(hash, 0x11);
+        assert_eq!(&secret[..16], &PUBLIC_PSK);
+        assert_eq!(&secret[16..], &[0u8; 16]);
+    }
+
+    #[test]
+    fn mac_then_decrypt_matches_a_vector_cross_checked_via_openssl_and_python_hmac() {
+        // AES-128-ECB ciphertext generated independently via the `openssl`
+        // CLI, MAC via Python's hmac/hashlib — not derived from this
+        // implementation. Plaintext: timestamp=0x64ABCD12 (LE), txt_type=0,
+        // text="Hello, mesh!\0", zero-padded to 32 bytes (2 AES blocks).
+        const MAC_AND_CIPHERTEXT: [u8; 34] = [
+            0xec, 0xe6, 0xf1, 0xd5, 0x9f, 0x9d, 0x82, 0xb8, 0x91, 0x39, 0xe8, 0xf5, 0x14, 0xbe,
+            0x20, 0xfe, 0x91, 0x4a, 0xb3, 0xd7, 0x62, 0xd2, 0x9a, 0x9a, 0x22, 0x43, 0x8c, 0xb6,
+            0x9d, 0x87, 0x89, 0xf9, 0x9c, 0xe3,
+        ];
+        let (secret, _hash) = group_channel_secret_and_hash(&PUBLIC_PSK);
+
+        let plaintext = mac_then_decrypt(&secret, &MAC_AND_CIPHERTEXT).expect("MAC should verify");
+
+        let mut expected = vec![0x12, 0xcd, 0xab, 0x64, 0x00];
+        expected.extend_from_slice(b"Hello, mesh!\0");
+        expected.resize(32, 0); // trailing AES block zero-padding
+        assert_eq!(plaintext, expected);
+    }
+
+    #[test]
+    fn mac_then_decrypt_rejects_a_tampered_mac() {
+        let (secret, _hash) = group_channel_secret_and_hash(&PUBLIC_PSK);
+        let mut mac_and_ciphertext: [u8; 34] = [
+            0xec, 0xe6, 0xf1, 0xd5, 0x9f, 0x9d, 0x82, 0xb8, 0x91, 0x39, 0xe8, 0xf5, 0x14, 0xbe,
+            0x20, 0xfe, 0x91, 0x4a, 0xb3, 0xd7, 0x62, 0xd2, 0x9a, 0x9a, 0x22, 0x43, 0x8c, 0xb6,
+            0x9d, 0x87, 0x89, 0xf9, 0x9c, 0xe3,
+        ];
+        mac_and_ciphertext[0] ^= 0xFF;
+
+        assert!(mac_then_decrypt(&secret, &mac_and_ciphertext).is_none());
+    }
+
+    #[test]
+    fn mac_then_decrypt_rejects_a_ciphertext_not_a_multiple_of_the_block_size() {
+        let (secret, _hash) = group_channel_secret_and_hash(&PUBLIC_PSK);
+        let malformed = [0u8; CIPHER_MAC_SIZE + 5]; // 5 "ciphertext" bytes, not a block multiple
+
+        assert!(mac_then_decrypt(&secret, &malformed).is_none());
+    }
+
+    #[test]
+    fn mac_then_decrypt_rejects_input_not_longer_than_the_mac() {
+        let (secret, _hash) = group_channel_secret_and_hash(&PUBLIC_PSK);
+
+        assert!(mac_then_decrypt(&secret, &[0u8; CIPHER_MAC_SIZE]).is_none());
     }
 }

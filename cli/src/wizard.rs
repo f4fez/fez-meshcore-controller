@@ -98,6 +98,9 @@ pub async fn run(existing: Option<&Config>) -> anyhow::Result<Config> {
 
     let existing_regions = existing.map(|c| c.regions.as_slice()).unwrap_or(&[]);
     let regions = ask_regions(existing_regions, &dtheme)?;
+    let hashtag_channels = existing
+        .map(|c| c.hashtag_channels.clone())
+        .unwrap_or_default();
 
     let config = Config {
         node_label,
@@ -113,6 +116,7 @@ pub async fn run(existing: Option<&Config>) -> anyhow::Result<Config> {
         },
         managed_repeaters,
         regions,
+        hashtag_channels,
     };
 
     println!();

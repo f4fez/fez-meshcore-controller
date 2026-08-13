@@ -41,6 +41,15 @@ pub struct Config {
     /// synced with the connected node's own configuration.
     #[serde(default)]
     pub regions: Vec<RegionConfig>,
+    /// Names of "Hashtag Channels" (`docs/companion_protocol.md`) to try
+    /// decoding `GroupText` messages against, in addition to the
+    /// well-known "Public" channel — e.g. `"#test"`. A hashtag channel's
+    /// key is derived purely from its name
+    /// (`crate::meshcore_crypto::hashtag_channel_key`), so like the
+    /// Public channel, it's not actually private: "anyone who knows or
+    /// guesses the channel name can derive the key."
+    #[serde(default)]
+    pub hashtag_channels: Vec<String>,
 }
 
 /// A region in the cluster's hierarchy, mirroring the MeshCore node
@@ -237,6 +246,7 @@ mod tests {
                     parent: Some("World".to_string()),
                 },
             ],
+            hashtag_channels: vec!["#test".to_string()],
         }
     }
 
@@ -320,6 +330,7 @@ mod tests {
         assert_eq!(loaded.regions[0].parent, None);
         assert_eq!(loaded.regions[1].name, "France");
         assert_eq!(loaded.regions[1].parent.as_deref(), Some("World"));
+        assert_eq!(loaded.hashtag_channels, vec!["#test".to_string()]);
         match loaded.connection {
             ConnectionConfig::Serial { port, baud_rate } => {
                 assert_eq!(port, "/dev/ttyUSB0");
@@ -349,6 +360,7 @@ mod tests {
         let config: Config = toml::from_str(toml).expect("parse legacy config");
         assert!(config.managed_repeaters.is_empty());
         assert!(config.regions.is_empty());
+        assert!(config.hashtag_channels.is_empty());
         assert_eq!(config.daemon.packet_log_capacity, 500);
         assert_eq!(config.daemon.discovered_nodes_capacity, 200);
         assert_eq!(config.daemon.log_dir, default_log_dir());

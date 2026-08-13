@@ -20,6 +20,7 @@
 //! - a high-level wrapper around `meshcore-rs` and the shared serializable
 //!   data transfer objects (DTOs) ([`mesh`])
 
+pub mod channel;
 pub mod config;
 pub mod error;
 pub mod ipc;

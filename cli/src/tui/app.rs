@@ -14,6 +14,7 @@
 
 use std::collections::VecDeque;
 
+use fez_mesh_controller_core::channel;
 use fez_mesh_controller_core::ipc::{MeshEvent, Snapshot};
 use fez_mesh_controller_core::mesh::{is_repeater_or_room, ContactDto, PacketLogEntry};
 use fez_mesh_controller_core::region;
@@ -71,6 +72,12 @@ pub struct App {
     /// [`Self::apply_snapshot`]) rather than per packet — see
     /// [`fez_mesh_controller_core::region::precompute_region_keys`].
     pub region_keys: Vec<(String, [u8; 16])>,
+    /// Every candidate `GroupText` channel's precomputed secret and hash
+    /// (name, secret, hash) — the well-known "Public" channel plus each
+    /// configured hashtag channel — derived once whenever a fresh
+    /// `Snapshot` arrives, not per packet — see
+    /// [`fez_mesh_controller_core::channel::precompute_channel_keys`].
+    pub channel_keys: Vec<(String, [u8; 32], u8)>,
 }
 
 impl App {
@@ -90,14 +97,16 @@ impl App {
             packet_detail: None,
             help_open: false,
             region_keys: Vec::new(),
+            channel_keys: channel::precompute_channel_keys(&[]),
         }
     }
 
     /// Applies a fresh `Snapshot` from the daemon, precomputing the
-    /// configured regions' transport keys once (not per packet — see
-    /// [`Self::region_keys`]).
+    /// configured regions' transport keys and candidate channels' secrets
+    /// once (not per packet — see [`Self::region_keys`]/[`Self::channel_keys`]).
     pub fn apply_snapshot(&mut self, snapshot: Snapshot) {
         self.region_keys = region::precompute_region_keys(&snapshot.regions);
+        self.channel_keys = channel::precompute_channel_keys(&snapshot.hashtag_channels);
         self.snapshot = snapshot;
     }
 
