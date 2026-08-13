@@ -27,6 +27,7 @@ use crossterm::terminal::{
 };
 use crossterm::{execute, ExecutableCommand};
 use fez_mesh_controller_core::ipc::{ClientMessage, ServerMessage};
+use fez_mesh_controller_core::mesh::MeshEventKind;
 use fez_mesh_controller_core::Config;
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
@@ -79,7 +80,7 @@ async fn run_loop(
         terminal.draw(|f| ui::draw(f, app))?;
 
         tokio::select! {
-            Some(event) = ui_rx.recv() => apply_ui_event(app, event),
+            Some(event) = ui_rx.recv() => apply_ui_event(app, event, cmd_tx).await,
             Some(Ok(event)) = term_events.next() => {
                 if let Event::Key(key) = event {
                     if key.kind == KeyEventKind::Press {
@@ -214,13 +215,25 @@ async fn confirm_or_arm_delete(app: &mut App, cmd_tx: &mpsc::Sender<ClientMessag
     }
 }
 
-fn apply_ui_event(app: &mut App, event: UiEvent) {
+async fn apply_ui_event(app: &mut App, event: UiEvent, cmd_tx: &mpsc::Sender<ClientMessage>) {
     match event {
         UiEvent::DaemonConnected => app.daemon_connected = true,
         UiEvent::DaemonDisconnected => app.daemon_connected = false,
         UiEvent::Server(msg) => match *msg {
             ServerMessage::Snapshot(snapshot) => app.snapshot = snapshot,
-            ServerMessage::Event(event) => app.push_event(event),
+            ServerMessage::Event(event) => {
+                // The node just (re)connected: the daemon's own cache
+                // (self_info/contacts) is already fresh by the time it
+                // broadcasts this (see mesh_task.rs), but that freshness
+                // isn't pushed to already-connected clients on its own —
+                // ask for a fresh snapshot so the dashboard doesn't stay
+                // stale until the user manually presses 'r'.
+                let just_connected = matches!(event.kind, MeshEventKind::Connected);
+                app.push_event(event);
+                if just_connected {
+                    let _ = cmd_tx.send(ClientMessage::RequestSnapshot).await;
+                }
+            }
             ServerMessage::PacketLog(backlog) => app.set_packet_log(backlog),
             ServerMessage::PacketLogEntry(entry) => app.push_packet(*entry),
             ServerMessage::Error(message) => app.last_status = Some(message),
@@ -287,4 +300,62 @@ fn restore_terminal(terminal: &mut Term) -> Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fez_mesh_controller_core::ipc::MeshEvent;
+
+    fn server_event(kind: MeshEventKind) -> UiEvent {
+        UiEvent::Server(Box::new(ServerMessage::Event(MeshEvent {
+            at_unix: 0,
+            kind,
+        })))
+    }
+
+    #[tokio::test]
+    async fn connected_event_requests_a_fresh_snapshot() {
+        let mut app = App::new();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<ClientMessage>(8);
+
+        apply_ui_event(&mut app, server_event(MeshEventKind::Connected), &cmd_tx).await;
+
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(ClientMessage::RequestSnapshot)
+        ));
+        // Still logged to the dashboard's event feed like any other event.
+        assert_eq!(app.events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn other_events_do_not_request_a_snapshot() {
+        let mut app = App::new();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<ClientMessage>(8);
+
+        apply_ui_event(&mut app, server_event(MeshEventKind::MessageSent), &cmd_tx).await;
+
+        assert!(cmd_rx.try_recv().is_err());
+        assert_eq!(app.events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn snapshot_message_replaces_the_app_snapshot() {
+        let mut app = App::new();
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<ClientMessage>(8);
+
+        let snapshot = fez_mesh_controller_core::ipc::Snapshot {
+            uptime_secs: 42,
+            ..Default::default()
+        };
+        apply_ui_event(
+            &mut app,
+            UiEvent::Server(Box::new(ServerMessage::Snapshot(snapshot))),
+            &cmd_tx,
+        )
+        .await;
+
+        assert_eq!(app.snapshot.uptime_secs, 42);
+    }
 }
