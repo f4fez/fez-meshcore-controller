@@ -157,6 +157,11 @@ pub struct PacketLogEntry {
 pub struct PacketHeaderInfo {
     pub route_type: String,
     pub payload_type: String,
+    /// Raw numeric payload type byte (see `meshcore_rs::packets::PayloadType`),
+    /// preserved alongside the human-readable `payload_type` string —
+    /// needed to recompute a packet's transport code for region matching
+    /// (see `crate::meshcore_crypto::calc_transport_code`).
+    pub payload_type_raw: u8,
     pub payload_version: u8,
     pub hops: u8,
     pub path_hash_size: u8,
@@ -299,6 +304,7 @@ pub fn build_packet_log_entry(
         PacketHeaderInfo {
             route_type: format!("{:?}", h.route_type),
             payload_type: format!("{:?}", h.payload_type),
+            payload_type_raw: h.payload_type as u8,
             payload_version: h.payload_version,
             hops: h.path_len,
             path_hash_size: h.path_hash_size,

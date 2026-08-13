@@ -15,6 +15,7 @@
 use chrono::{Local, TimeZone};
 use fez_mesh_controller_core::ipc::MeshEvent;
 use fez_mesh_controller_core::mesh::{ContactDto, MeshEventKind, PacketHeaderInfo, PacketLogEntry};
+use fez_mesh_controller_core::region;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -71,7 +72,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if app.page == Page::PacketLog {
         if let Some(group) = &app.packet_detail {
-            draw_packet_detail_popup(frame, group);
+            draw_packet_detail_popup(frame, group, &app.region_keys);
         }
     }
 
@@ -122,7 +123,13 @@ fn draw_body(frame: &mut Frame, app: &mut App, area: Rect) {
         .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
         .split(area);
 
-    draw_self_info(frame, app, cols[0]);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(cols[0]);
+
+    draw_self_info(frame, app, left[0]);
+    draw_cluster_block(frame, app, left[1]);
 
     let right = Layout::default()
         .direction(Direction::Vertical)
@@ -156,6 +163,28 @@ fn draw_self_info(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     frame.render_widget(Paragraph::new(lines).block(block("🛰️  Local node")), area);
+}
+
+/// The cluster's configured region hierarchy (see
+/// `fez_mesh_controller_core::config::RegionConfig`) — for now, just
+/// renders the tree, indented by depth. Local to this controller's own
+/// config, unrelated to the connected node's own settings.
+fn draw_cluster_block(frame: &mut Frame, app: &App, area: Rect) {
+    let lines: Vec<Line> = if app.snapshot.regions.is_empty() {
+        vec![Line::from(Span::styled(
+            "No regions configured",
+            Style::default().fg(MUTED),
+        ))]
+    } else {
+        region::flatten_region_tree(&app.snapshot.regions)
+            .into_iter()
+            .map(|(depth, region)| {
+                Line::from(Span::raw(format!("{}{}", "  ".repeat(depth), region.name)))
+            })
+            .collect()
+    };
+
+    frame.render_widget(Paragraph::new(lines).block(block("🧩 Cluster")), area);
 }
 
 fn field_line(label: &str, value: impl Into<String>) -> Line<'static> {
@@ -669,13 +698,66 @@ fn reception_header_line() -> Line<'static> {
     ))
 }
 
+/// The packet detail popup's transport code line: the header's *first*
+/// transport code half only (the second is reserved, never shown — see
+/// `PacketHeaderInfo::transport_code_hex`). `None` when the packet has no
+/// transport code at all (a route type that doesn't carry one).
+///
+/// A code of `{0, 0}` (*both* halves — the reservation only ever nudges a
+/// real computed code away from an all-zero *first* half, so checking just
+/// that half isn't enough to tell a genuine `{0, x}` apart from `{0, 0}`)
+/// isn't a normal region-scoped code at all: it's the firmware's explicit
+/// "Share" marker — `isShare()` in `examples/simple_repeater/MyMesh.cpp`
+/// checks exactly this, with the literal comment `{ 0, 0 } means 'send
+/// this nowhere'` (also `BaseChatMesh::shareContactZeroHop`). It's how a
+/// node deliberately opts a packet out of flood/repeat propagation — e.g.
+/// resharing a contact's advert to immediate neighbors only — not a
+/// leftover/unset value. Shown as a distinct "Share (not repeated)" label
+/// rather than attempting a region match, since it's not a real code.
+///
+/// Otherwise, green when it matches a configured region's precomputed
+/// transport code for this exact packet, plain white if not.
+fn transport_code_line(
+    entry: &PacketLogEntry,
+    region_keys: &[(String, [u8; 16])],
+) -> Option<Line<'static>> {
+    let code_hex = entry.header.as_ref()?.transport_code_hex.as_deref()?;
+    if code_hex.len() < 8 {
+        return None;
+    }
+    let first_half = &code_hex[..4];
+
+    let value = if code_hex == "00000000" {
+        Span::styled("Share (not repeated)", Style::default().fg(MUTED))
+    } else {
+        let color = if region::matching_region_name(entry, region_keys).is_some() {
+            GREEN
+        } else {
+            Color::White
+        };
+        Span::styled(first_half.to_string(), Style::default().fg(color))
+    };
+
+    Some(Line::from(vec![
+        Span::styled(
+            format!("{:<16}", "🧭 Transport code"),
+            Style::default().fg(MUTED),
+        ),
+        value,
+    ]))
+}
+
 /// Popup with the full detail of a packet group, laid out differently
 /// depending on its payload type since e.g. an advert carries
 /// identity/position data that a plain data packet doesn't. Fields common
 /// to every reception (payload type/version/content) are shown once; the
 /// per-reception breakdown below covers what genuinely differs between the
 /// repeaters that relayed it (signal quality, route, hop count, path).
-fn draw_packet_detail_popup(frame: &mut Frame, group: &PacketGroup) {
+fn draw_packet_detail_popup(
+    frame: &mut Frame,
+    group: &PacketGroup,
+    region_keys: &[(String, [u8; 16])],
+) {
     let area = centered_rect(76, 80, frame.area());
     frame.render_widget(Clear, area);
 
@@ -704,6 +786,9 @@ fn draw_packet_detail_popup(frame: &mut Frame, group: &PacketGroup) {
                 "🔢 Payload version",
                 h.payload_version.to_string(),
             ));
+            if let Some(transport_line) = transport_code_line(latest, region_keys) {
+                lines.push(transport_line);
+            }
             if let Some(dest) = &h.dest_hash_hex {
                 lines.push(field_line("🎯 Destination", dest.clone()));
             } else if let Some(channel) = &h.channel_hash_hex {
@@ -964,6 +1049,7 @@ mod render_tests {
         let group = single_member_group(PacketHeaderInfo {
             route_type: "Flood".to_string(),
             payload_type: "TextMsg".to_string(),
+            payload_type_raw: 2,
             payload_version: 0,
             hops: 1,
             path_hash_size: 1,
@@ -989,6 +1075,7 @@ mod render_tests {
         let group = single_member_group(PacketHeaderInfo {
             route_type: "Flood".to_string(),
             payload_type: "TextMsg".to_string(),
+            payload_type_raw: 2,
             payload_version: 0,
             hops: 1,
             path_hash_size: 1,
@@ -1012,6 +1099,7 @@ mod render_tests {
         let group = single_member_group(PacketHeaderInfo {
             route_type: "Flood".to_string(),
             payload_type: "TextMsg".to_string(),
+            payload_type_raw: 2,
             payload_version: 0,
             hops: 1,
             path_hash_size: 1,
@@ -1039,6 +1127,7 @@ mod render_tests {
                 header: Some(PacketHeaderInfo {
                     route_type: "Flood".to_string(),
                     payload_type: "TextMsg".to_string(),
+                    payload_type_raw: 2,
                     payload_version: 0,
                     hops: 2,
                     path_hash_size: 1,
@@ -1060,6 +1149,7 @@ mod render_tests {
                 header: Some(PacketHeaderInfo {
                     route_type: "Flood".to_string(),
                     payload_type: "TextMsg".to_string(),
+                    payload_type_raw: 2,
                     payload_version: 0,
                     hops: 1,
                     path_hash_size: 1,
@@ -1081,6 +1171,7 @@ mod render_tests {
                 header: Some(PacketHeaderInfo {
                     route_type: "Direct".to_string(),
                     payload_type: "Ack".to_string(),
+                    payload_type_raw: 3,
                     payload_version: 0,
                     hops: 0,
                     path_hash_size: 1,
@@ -1098,10 +1189,7 @@ mod render_tests {
     }
 
     fn render(app: &mut App, width: u16, height: u16) -> String {
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, app)).unwrap();
-        let buffer = terminal.backend().buffer();
+        let buffer = render_buffer(app, width, height);
         (0..buffer.area.height)
             .map(|y| {
                 (0..buffer.area.width)
@@ -1110,6 +1198,76 @@ mod render_tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn render_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// The foreground color of the cell where `text` starts in the
+    /// rendered buffer (scanning left-to-right, top-to-bottom), or `None`
+    /// if it isn't found. Used to assert on styling that plain
+    /// string-contains checks can't see.
+    fn fg_of_text(buffer: &ratatui::buffer::Buffer, text: &str) -> Option<Color> {
+        let chars: Vec<String> = text.chars().map(|c| c.to_string()).collect();
+        for y in 0..buffer.area.height {
+            for x in 0..=buffer.area.width.saturating_sub(chars.len() as u16) {
+                let matches = chars
+                    .iter()
+                    .enumerate()
+                    .all(|(i, ch)| buffer[(x + i as u16, y)].symbol() == ch);
+                if matches {
+                    return Some(buffer[(x, y)].fg);
+                }
+            }
+        }
+        None
+    }
+
+    // --- Cluster block -----------------------------------------------------
+
+    #[test]
+    fn draw_cluster_block_shows_empty_state_when_no_regions_configured() {
+        let mut app = App::new();
+
+        let text = render(&mut app, 120, 30);
+
+        assert!(text.contains("Cluster"));
+        assert!(text.contains("No regions configured"));
+    }
+
+    #[test]
+    fn draw_cluster_block_renders_the_hierarchy_indented_by_depth() {
+        use fez_mesh_controller_core::ipc::Snapshot;
+        use fez_mesh_controller_core::RegionConfig;
+
+        let mut app = App::new();
+        app.apply_snapshot(Snapshot {
+            regions: vec![
+                RegionConfig {
+                    name: "World".to_string(),
+                    parent: None,
+                },
+                RegionConfig {
+                    name: "Europe".to_string(),
+                    parent: Some("World".to_string()),
+                },
+                RegionConfig {
+                    name: "France".to_string(),
+                    parent: Some("Europe".to_string()),
+                },
+            ],
+            ..Default::default()
+        });
+
+        let text = render(&mut app, 120, 30);
+
+        assert!(text.contains("World"));
+        assert!(text.contains("  Europe"));
+        assert!(text.contains("    France"));
     }
 
     #[test]
@@ -1195,6 +1353,7 @@ mod render_tests {
             header: Some(PacketHeaderInfo {
                 route_type: "Flood".to_string(),
                 payload_type: "AnonReq".to_string(),
+                payload_type_raw: 7,
                 payload_version: 0,
                 hops: 1,
                 path_hash_size: 1,
@@ -1230,6 +1389,7 @@ mod render_tests {
             header: Some(PacketHeaderInfo {
                 route_type: "Flood".to_string(),
                 payload_type: "GroupText".to_string(),
+                payload_type_raw: 5,
                 payload_version: 0,
                 hops: 1,
                 path_hash_size: 1,
@@ -1262,6 +1422,7 @@ mod render_tests {
             header: Some(PacketHeaderInfo {
                 route_type: "Flood".to_string(),
                 payload_type: "GroupText".to_string(),
+                payload_type_raw: 5,
                 payload_version: 0,
                 hops: 1,
                 path_hash_size: 1,
@@ -1283,6 +1444,131 @@ mod render_tests {
         assert!(text.contains("Destination"));
         assert!(text.contains("{ab}"));
         assert!(text.contains("channel"));
+    }
+
+    // --- Transport code -----------------------------------------------------
+
+    /// The same verified vector used in `core::meshcore_crypto`'s and
+    /// `core::region`'s tests: region "TestRegion", payload_type 2
+    /// ("TextMsg"), payload "deadbeef" -> transport code "a518".
+    fn entry_with_transport_code(transport_code_hex: Option<&str>) -> PacketLogEntry {
+        PacketLogEntry {
+            id: 1,
+            at_unix: 0,
+            snr: 1.0,
+            rssi: -90,
+            header: Some(PacketHeaderInfo {
+                route_type: "TransportFlood".to_string(),
+                payload_type: "TextMsg".to_string(),
+                payload_type_raw: 2,
+                payload_version: 0,
+                hops: 1,
+                path_hash_size: 1,
+                path_hex: String::new(),
+                transport_code_hex: transport_code_hex.map(str::to_string),
+                dest_hash_hex: None,
+                src_hash_hex: None,
+                channel_hash_hex: None,
+                advertisement: None,
+            }),
+            payload_hex: "deadbeef".to_string(),
+            payload_len: 4,
+        }
+    }
+
+    fn app_with_regions_and_entry(region_names: &[&str], entry: PacketLogEntry) -> App {
+        use fez_mesh_controller_core::ipc::Snapshot;
+        use fez_mesh_controller_core::RegionConfig;
+
+        let mut app = App::new();
+        app.page = Page::PacketLog;
+        app.apply_snapshot(Snapshot {
+            regions: region_names
+                .iter()
+                .map(|name| RegionConfig {
+                    name: name.to_string(),
+                    parent: None,
+                })
+                .collect(),
+            ..Default::default()
+        });
+        app.set_packet_log(vec![entry]);
+        app.packet_table_state.select(Some(0));
+        app.open_packet_detail();
+        app
+    }
+
+    #[test]
+    fn transport_code_renders_green_when_it_matches_a_configured_region() {
+        let mut app = app_with_regions_and_entry(
+            &["TestRegion"],
+            entry_with_transport_code(Some("a5180000")),
+        );
+
+        let buffer = render_buffer(&mut app, 140, 40);
+
+        assert_eq!(fg_of_text(&buffer, "a518"), Some(GREEN));
+    }
+
+    #[test]
+    fn transport_code_renders_plain_when_it_matches_no_configured_region() {
+        let mut app = app_with_regions_and_entry(
+            &["SomeOtherRegion"],
+            entry_with_transport_code(Some("a5180000")),
+        );
+
+        let buffer = render_buffer(&mut app, 140, 40);
+
+        assert_eq!(fg_of_text(&buffer, "a518"), Some(Color::White));
+    }
+
+    #[test]
+    fn transport_code_all_zero_shows_the_share_label_and_is_never_green() {
+        // { 0, 0 } is the firmware's explicit "Share" marker (isShare() in
+        // examples/simple_repeater/MyMesh.cpp: "{ 0, 0 } means 'send this
+        // nowhere'") -- not a leftover/unset value -- so it must never be
+        // treated as a normal region-scoped code, even if a configured
+        // region's name happened to collide.
+        let mut app = app_with_regions_and_entry(
+            &["TestRegion"],
+            entry_with_transport_code(Some("00000000")),
+        );
+
+        let text = render(&mut app, 140, 40);
+        let buffer = render_buffer(&mut app, 140, 40);
+
+        assert!(text.contains("Transport code"));
+        assert!(text.contains("Share"));
+        assert!(text.contains("not repeated"));
+        assert_ne!(fg_of_text(&buffer, "Share"), Some(GREEN));
+    }
+
+    #[test]
+    fn transport_code_with_only_the_first_half_zero_is_not_treated_as_share() {
+        // The "Share" marker requires *both* halves to be zero. A first
+        // half of 0000 with a nonzero second half isn't a legitimate
+        // firmware value (calcTransportCode reserves 0000 away), but the
+        // check must still require both halves, not just the first --
+        // otherwise a malformed/non-conformant packet with only the first
+        // half zero would be mislabeled "Share".
+        let mut app = app_with_regions_and_entry(
+            &["TestRegion"],
+            entry_with_transport_code(Some("00000001")),
+        );
+
+        let text = render(&mut app, 140, 40);
+
+        assert!(text.contains("Transport code"));
+        assert!(!text.contains("Share"));
+    }
+
+    #[test]
+    fn no_transport_code_line_when_the_packet_has_none() {
+        let mut app = app_with_regions_and_entry(&["TestRegion"], entry_with_transport_code(None));
+
+        let text = render(&mut app, 140, 40);
+
+        assert!(!text.contains("Transport code"));
     }
 
     #[test]
@@ -1370,6 +1656,7 @@ mod render_tests {
             header: Some(PacketHeaderInfo {
                 route_type: "Direct".to_string(),
                 payload_type: "Battery".to_string(),
+                payload_type_raw: 255,
                 payload_version: 0,
                 hops: 0,
                 path_hash_size: 1,

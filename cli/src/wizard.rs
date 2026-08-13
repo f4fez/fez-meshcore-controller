@@ -19,11 +19,21 @@
 use std::time::Duration;
 
 use console::style;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use crossterm::{execute, ExecutableCommand};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Confirm, Input, Select};
-use fez_mesh_controller_core::{Config, ConnectionConfig, DaemonConfig};
+use fez_mesh_controller_core::{region, Config, ConnectionConfig, DaemonConfig, RegionConfig};
 use indicatif::{ProgressBar, ProgressStyle};
 use names::Generator;
+use ratatui::backend::CrosstermBackend;
+use ratatui::style::{Color, Modifier as RatatuiModifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::Terminal;
 
 use crate::theme::{self, accent, muted, primary};
 
@@ -86,6 +96,9 @@ pub async fn run(existing: Option<&Config>) -> anyhow::Result<Config> {
         .map(|c| c.managed_repeaters.clone())
         .unwrap_or_default();
 
+    let existing_regions = existing.map(|c| c.regions.as_slice()).unwrap_or(&[]);
+    let regions = ask_regions(existing_regions, &dtheme)?;
+
     let config = Config {
         node_label,
         connection,
@@ -97,6 +110,7 @@ pub async fn run(existing: Option<&Config>) -> anyhow::Result<Config> {
             packet_log_capacity: fez_mesh_controller_core::config::default_packet_log_capacity(),
         },
         managed_repeaters,
+        regions,
     };
 
     println!();
@@ -292,4 +306,305 @@ async fn ask_ble(
     };
 
     Ok(ConnectionConfig::Ble { name })
+}
+
+/// A region name at a given indentation depth while interactively
+/// arranging the hierarchy. Order + depth together determine the parent
+/// (the nearest preceding entry one level shallower) — see
+/// `regions_from_outline`.
+type RegionOutline = Vec<(String, usize)>;
+
+/// Prompts for the cluster's region names, then — if there are at least
+/// two — a small embedded screen to arrange them into a hierarchy
+/// (indent/unindent with the arrow keys), mirroring the MeshCore node
+/// firmware's own region tree. `dialoguer` has no tree/indent widget
+/// (only `Sort`, for flat reordering), so arranging needs a custom screen;
+/// entering names stays a normal `Input` loop, consistent with the rest of
+/// the wizard.
+fn ask_regions(
+    existing: &[RegionConfig],
+    dtheme: &ColorfulTheme,
+) -> anyhow::Result<Vec<RegionConfig>> {
+    println!();
+    println!(
+        "{} {}",
+        style("🧩").bold(),
+        primary().apply_to("Cluster regions")
+    );
+    println!(
+        "  {}",
+        muted().apply_to("Regions this controller's cluster is organized into, mirroring the")
+    );
+    println!(
+        "  {}",
+        muted().apply_to("MeshCore node firmware's own region concept. Leave empty to skip.")
+    );
+
+    let mut outline = outline_from_regions(existing);
+
+    loop {
+        let name: String = Input::with_theme(dtheme)
+            .with_prompt("🧩 Add a region name (leave empty to continue)")
+            .allow_empty(true)
+            .interact_text()?;
+        let name = name.trim();
+        if name.is_empty() {
+            break;
+        }
+        outline.push((name.to_string(), 0));
+    }
+
+    if outline.len() >= 2 {
+        outline = arrange_region_hierarchy(outline)?;
+    }
+
+    Ok(regions_from_outline(&outline))
+}
+
+/// Flattens existing `RegionConfig`s (parent-by-name) into the ordered
+/// `(name, depth)` outline the arrange screen edits, so re-running the
+/// wizard preserves whatever hierarchy was already configured.
+fn outline_from_regions(regions: &[RegionConfig]) -> RegionOutline {
+    region::flatten_region_tree(regions)
+        .into_iter()
+        .map(|(depth, r)| (r.name.clone(), depth))
+        .collect()
+}
+
+/// Converts the arranged `(name, depth)` outline back into `RegionConfig`s:
+/// each entry's parent is the name of the nearest *preceding* entry one
+/// depth shallower (`None` for a depth-0 root).
+fn regions_from_outline(outline: &RegionOutline) -> Vec<RegionConfig> {
+    outline
+        .iter()
+        .enumerate()
+        .map(|(i, (name, depth))| {
+            let parent = if *depth == 0 {
+                None
+            } else {
+                outline[..i]
+                    .iter()
+                    .rev()
+                    .find(|(_, d)| *d == depth - 1)
+                    .map(|(n, _)| n.clone())
+            };
+            RegionConfig {
+                name: name.clone(),
+                parent,
+            }
+        })
+        .collect()
+}
+
+/// The new depth for indenting (`delta > 0`) or unindenting (`delta < 0`)
+/// the entry at `index`. Indenting is capped at one level deeper than the
+/// *immediately preceding* entry (can't skip a level — the same rule
+/// outliners like Workflowy/org-mode use), and the very first entry can
+/// never be indented (nothing precedes it to nest under). Unindenting is
+/// floored at 0.
+fn clamp_indent(outline: &RegionOutline, index: usize, delta: i32) -> usize {
+    let current = outline[index].1;
+    if delta > 0 {
+        let max_depth = if index == 0 {
+            0
+        } else {
+            outline[index - 1].1 + 1
+        };
+        (current + 1).min(max_depth)
+    } else {
+        current.saturating_sub(1)
+    }
+}
+
+/// Runs the embedded raw-mode screen for arranging `outline` into a
+/// hierarchy. Returns the arranged outline on `Enter`, or the original
+/// (pre-arrangement) outline unchanged on `Esc`. Enters/exits raw mode +
+/// the alternate screen the same way `cli/src/tui/mod.rs`'s
+/// `setup_terminal`/`restore_terminal` do; not shared with that module
+/// since this is simple enough not to be worth coupling the two.
+fn arrange_region_hierarchy(outline: RegionOutline) -> anyhow::Result<RegionOutline> {
+    let original = outline.clone();
+    let mut outline = outline;
+    let mut selected: usize = 0;
+
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    stdout.execute(EnterAlternateScreen)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+
+    let result = (|| -> anyhow::Result<RegionOutline> {
+        loop {
+            terminal.draw(|frame| draw_arrange_screen(frame, &outline, selected))?;
+
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+
+            match key.code {
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    if selected > 0 {
+                        outline.swap(selected, selected - 1);
+                        selected -= 1;
+                    }
+                }
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    if selected + 1 < outline.len() {
+                        outline.swap(selected, selected + 1);
+                        selected += 1;
+                    }
+                }
+                KeyCode::Up => selected = selected.saturating_sub(1),
+                KeyCode::Down => {
+                    if selected + 1 < outline.len() {
+                        selected += 1;
+                    }
+                }
+                KeyCode::Right => outline[selected].1 = clamp_indent(&outline, selected, 1),
+                KeyCode::Left => outline[selected].1 = clamp_indent(&outline, selected, -1),
+                KeyCode::Enter => return Ok(outline.clone()),
+                KeyCode::Esc => return Ok(original.clone()),
+                _ => {}
+            }
+        }
+    })();
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    result
+}
+
+fn draw_arrange_screen(frame: &mut ratatui::Frame, outline: &RegionOutline, selected: usize) {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Arrange the region hierarchy",
+            Style::default().add_modifier(RatatuiModifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    for (i, (name, depth)) in outline.iter().enumerate() {
+        let cursor = if i == selected { "➤ " } else { "  " };
+        let text = format!("{cursor}{}{name}", "  ".repeat(*depth));
+        let style = if i == selected {
+            Style::default()
+                .add_modifier(RatatuiModifier::BOLD)
+                .bg(Color::Rgb(0x2a, 0x2e, 0x3a))
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑/↓ select   Shift+↑/↓ move   →/← indent/unindent   Enter confirm   Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let block = Block::default().borders(Borders::ALL).title(" 🧩 Regions ");
+    frame.render_widget(Paragraph::new(lines).block(block), frame.area());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outline(pairs: &[(&str, usize)]) -> RegionOutline {
+        pairs.iter().map(|(n, d)| (n.to_string(), *d)).collect()
+    }
+
+    // --- outline_from_regions / regions_from_outline (round-trip) --------
+
+    #[test]
+    fn regions_from_outline_resolves_parent_by_nearest_preceding_shallower_entry() {
+        let o = outline(&[("World", 0), ("Europe", 1), ("France", 2), ("Asia", 1)]);
+
+        let regions = regions_from_outline(&o);
+
+        assert_eq!(regions[0].parent, None);
+        assert_eq!(regions[1].parent.as_deref(), Some("World"));
+        assert_eq!(regions[2].parent.as_deref(), Some("Europe"));
+        assert_eq!(regions[3].parent.as_deref(), Some("World"));
+    }
+
+    #[test]
+    fn outline_and_regions_round_trip() {
+        let regions = vec![
+            RegionConfig {
+                name: "World".to_string(),
+                parent: None,
+            },
+            RegionConfig {
+                name: "Europe".to_string(),
+                parent: Some("World".to_string()),
+            },
+            RegionConfig {
+                name: "France".to_string(),
+                parent: Some("Europe".to_string()),
+            },
+            RegionConfig {
+                name: "Asia".to_string(),
+                parent: Some("World".to_string()),
+            },
+        ];
+
+        let o = outline_from_regions(&regions);
+        let round_tripped = regions_from_outline(&o);
+
+        assert_eq!(round_tripped, regions);
+    }
+
+    #[test]
+    fn outline_and_regions_round_trip_with_multiple_roots() {
+        let regions = vec![
+            RegionConfig {
+                name: "World".to_string(),
+                parent: None,
+            },
+            RegionConfig {
+                name: "Moon".to_string(),
+                parent: None,
+            },
+        ];
+
+        let o = outline_from_regions(&regions);
+        let round_tripped = regions_from_outline(&o);
+
+        assert_eq!(round_tripped, regions);
+    }
+
+    // --- clamp_indent -------------------------------------------------------
+
+    #[test]
+    fn clamp_indent_cannot_indent_the_first_entry() {
+        let o = outline(&[("World", 0)]);
+        assert_eq!(clamp_indent(&o, 0, 1), 0);
+    }
+
+    #[test]
+    fn clamp_indent_cannot_skip_a_level() {
+        // "Asia" (depth 0) follows "France" (depth 2) — indenting "Asia"
+        // can only reach depth 1 (France's depth + 1), not jump to 3.
+        let o = outline(&[("World", 0), ("Europe", 1), ("France", 2), ("Asia", 0)]);
+        assert_eq!(clamp_indent(&o, 3, 1), 1);
+    }
+
+    #[test]
+    fn clamp_indent_unindent_floors_at_zero() {
+        let o = outline(&[("World", 0)]);
+        assert_eq!(clamp_indent(&o, 0, -1), 0);
+    }
+
+    #[test]
+    fn clamp_indent_normal_indent_and_unindent() {
+        let o = outline(&[("World", 0), ("Europe", 0)]);
+        assert_eq!(clamp_indent(&o, 1, 1), 1); // indent under World
+        let o2 = outline(&[("World", 0), ("Europe", 1)]);
+        assert_eq!(clamp_indent(&o2, 1, -1), 0); // unindent back to root
+    }
 }

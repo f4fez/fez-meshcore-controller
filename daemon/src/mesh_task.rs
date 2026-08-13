@@ -541,6 +541,7 @@ mod tests {
                 packet_log_capacity: 500,
             },
             managed_repeaters,
+            regions: vec![],
         };
         let state = AppState::new(command_tx, config, config_path);
         (state, dir)

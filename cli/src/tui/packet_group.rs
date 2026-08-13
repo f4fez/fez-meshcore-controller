@@ -189,6 +189,7 @@ mod tests {
             header: Some(PacketHeaderInfo {
                 route_type: "Flood".to_string(),
                 payload_type: payload_type.to_string(),
+                payload_type_raw: 0,
                 payload_version: 0,
                 hops: 1,
                 path_hash_size: 1,

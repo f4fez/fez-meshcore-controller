@@ -69,3 +69,26 @@ packet_log_capacity = 500
 # [[managed_repeaters]]
 # name = "F4FEZ Repeater"
 # public_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd"
+
+# --- Region hierarchy (cluster) --------------------------------------------
+#
+# The cluster's region hierarchy, mirroring the MeshCore node firmware's own
+# region concept (name + parent, forming a tree). Local to this controller
+# only — not synced with the connected node's own configuration. Shown as
+# the "Cluster" block on the dashboard, and used to recognize a packet's
+# transport code (packet log detail popup): a region's transport key is
+# derived deterministically from its name (no secret to provision), so any
+# name you use here must match the name configured on the mesh's nodes for
+# matching to work. Editable interactively via the setup wizard
+# (`fez-mesh-controller setup`), including arrow-key hierarchy arrangement.
+
+# [[regions]]
+# name = "World"
+
+# [[regions]]
+# name = "Europe"
+# parent = "World"
+
+# [[regions]]
+# name = "France"
+# parent = "Europe"

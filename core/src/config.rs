@@ -36,6 +36,21 @@ pub struct Config {
     /// by public key so they can be highlighted in the UIs.
     #[serde(default)]
     pub managed_repeaters: Vec<ManagedRepeater>,
+    /// The cluster's region hierarchy, mirroring the MeshCore node
+    /// firmware's own region concept. Local to this controller — not
+    /// synced with the connected node's own configuration.
+    #[serde(default)]
+    pub regions: Vec<RegionConfig>,
+}
+
+/// A region in the cluster's hierarchy, mirroring the MeshCore node
+/// firmware's `RegionMap` (name + parent, forming a tree). `parent`
+/// references another configured region's `name`, or `None` for a root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegionConfig {
+    pub name: String,
+    #[serde(default)]
+    pub parent: Option<String>,
 }
 
 /// A repeater managed by this application, identified by name and public key.
@@ -201,6 +216,16 @@ mod tests {
                 name: "F4FEZ Repeater".to_string(),
                 public_key_hex: "ab".repeat(32),
             }],
+            regions: vec![
+                RegionConfig {
+                    name: "World".to_string(),
+                    parent: None,
+                },
+                RegionConfig {
+                    name: "France".to_string(),
+                    parent: Some("World".to_string()),
+                },
+            ],
         }
     }
 
@@ -274,6 +299,11 @@ mod tests {
         assert_eq!(loaded.daemon.packet_log_capacity, 500);
         assert_eq!(loaded.managed_repeaters.len(), 1);
         assert_eq!(loaded.managed_repeaters[0].name, "F4FEZ Repeater");
+        assert_eq!(loaded.regions.len(), 2);
+        assert_eq!(loaded.regions[0].name, "World");
+        assert_eq!(loaded.regions[0].parent, None);
+        assert_eq!(loaded.regions[1].name, "France");
+        assert_eq!(loaded.regions[1].parent.as_deref(), Some("World"));
         match loaded.connection {
             ConnectionConfig::Serial { port, baud_rate } => {
                 assert_eq!(port, "/dev/ttyUSB0");
@@ -302,8 +332,19 @@ mod tests {
         "#;
         let config: Config = toml::from_str(toml).expect("parse legacy config");
         assert!(config.managed_repeaters.is_empty());
+        assert!(config.regions.is_empty());
         assert_eq!(config.daemon.packet_log_capacity, 500);
         assert_eq!(config.daemon.log_dir, default_log_dir());
+    }
+
+    #[test]
+    fn region_config_parent_defaults_to_none_when_omitted() {
+        let toml = r#"
+            name = "World"
+        "#;
+        let region: RegionConfig = toml::from_str(toml).expect("parse region without parent");
+        assert_eq!(region.name, "World");
+        assert_eq!(region.parent, None);
     }
 
     #[test]

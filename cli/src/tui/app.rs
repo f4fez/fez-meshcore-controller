@@ -16,6 +16,7 @@ use std::collections::VecDeque;
 
 use fez_mesh_controller_core::ipc::{MeshEvent, Snapshot};
 use fez_mesh_controller_core::mesh::{ContactDto, PacketLogEntry};
+use fez_mesh_controller_core::region;
 
 use super::packet_group::{group_packets, PacketGroup};
 
@@ -64,6 +65,12 @@ pub struct App {
     /// Whether the F1 help popup is open, showing shortcuts for the
     /// current page.
     pub help_open: bool,
+
+    /// Each configured region's precomputed transport key (name, key),
+    /// derived once whenever a fresh `Snapshot` arrives (see
+    /// [`Self::apply_snapshot`]) rather than per packet — see
+    /// [`fez_mesh_controller_core::region::precompute_region_keys`].
+    pub region_keys: Vec<(String, [u8; 16])>,
 }
 
 impl App {
@@ -82,7 +89,16 @@ impl App {
             locked_view: None,
             packet_detail: None,
             help_open: false,
+            region_keys: Vec::new(),
         }
+    }
+
+    /// Applies a fresh `Snapshot` from the daemon, precomputing the
+    /// configured regions' transport keys once (not per packet — see
+    /// [`Self::region_keys`]).
+    pub fn apply_snapshot(&mut self, snapshot: Snapshot) {
+        self.region_keys = region::precompute_region_keys(&snapshot.regions);
+        self.snapshot = snapshot;
     }
 
     /// Contacts sorted the way they're displayed (most recently seen

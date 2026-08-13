@@ -123,6 +123,7 @@ mod tests {
                 packet_log_capacity,
             },
             managed_repeaters: vec![],
+            regions: vec![],
         };
         AppState::new(
             command_tx,
@@ -172,6 +173,7 @@ mod tests {
                 packet_log_capacity: 0,
             },
             managed_repeaters: vec![],
+            regions: vec![],
         };
         let state = AppState::new(command_tx, config, PathBuf::from("/tmp/x.toml"));
         assert_eq!(state.packet_log_capacity, 1);

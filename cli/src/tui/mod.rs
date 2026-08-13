@@ -220,7 +220,7 @@ async fn apply_ui_event(app: &mut App, event: UiEvent, cmd_tx: &mpsc::Sender<Cli
         UiEvent::DaemonConnected => app.daemon_connected = true,
         UiEvent::DaemonDisconnected => app.daemon_connected = false,
         UiEvent::Server(msg) => match *msg {
-            ServerMessage::Snapshot(snapshot) => app.snapshot = snapshot,
+            ServerMessage::Snapshot(snapshot) => app.apply_snapshot(snapshot),
             ServerMessage::Event(event) => {
                 // The node just (re)connected: the daemon's own cache
                 // (self_info/contacts) is already fresh by the time it

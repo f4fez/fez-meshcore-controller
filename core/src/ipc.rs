@@ -23,6 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::RegionConfig;
 use crate::mesh::{ContactDto, MeshEventKind, PacketLogEntry, SelfInfoDto};
 
 /// IPC protocol version, to bump on incompatible changes.
@@ -100,6 +101,10 @@ pub struct Snapshot {
     pub uptime_secs: u64,
     /// Unix timestamp when this snapshot was generated.
     pub generated_at_unix: i64,
+    /// The cluster's configured region hierarchy (see [`crate::config::RegionConfig`]),
+    /// shown as the dashboard's "Cluster" block and used to recognize
+    /// packets' transport codes.
+    pub regions: Vec<RegionConfig>,
 }
 
 /// Timestamped mesh event, as broadcast to clients.

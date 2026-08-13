@@ -174,6 +174,7 @@ async fn dispatch_command(
 async fn current_snapshot(state: &Arc<AppState>) -> fez_mesh_controller_core::ipc::Snapshot {
     let mut snap = state.snapshot.read().await.clone();
     snap.uptime_secs = state.uptime_secs();
+    snap.regions = state.config.read().await.regions.clone();
     snap
 }
 
@@ -212,6 +213,7 @@ mod tests {
                 packet_log_capacity: 500,
             },
             managed_repeaters: vec![],
+            regions: vec![],
         };
         let state = Arc::new(AppState::new(
             command_tx,
@@ -295,6 +297,42 @@ mod tests {
             recv(&mut reader).await,
             ServerMessage::Snapshot(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn current_snapshot_includes_the_configured_regions() {
+        use fez_mesh_controller_core::RegionConfig;
+
+        let (command_tx, _command_rx) = mpsc::channel(8);
+        let config = Config {
+            node_label: "test-node".to_string(),
+            connection: ConnectionConfig::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: 5000,
+            },
+            daemon: DaemonConfig {
+                socket_path: PathBuf::from("/tmp/fez-mesh-controller-test.sock"),
+                refresh_interval_secs: 5,
+                log_level: "info".to_string(),
+                log_dir: PathBuf::from("/tmp/fez-mesh-controller-test/logs"),
+                packet_log_capacity: 500,
+            },
+            managed_repeaters: vec![],
+            regions: vec![RegionConfig {
+                name: "World".to_string(),
+                parent: None,
+            }],
+        };
+        let state = Arc::new(AppState::new(
+            command_tx,
+            config,
+            PathBuf::from("/tmp/fez-mesh-controller-test.toml"),
+        ));
+
+        let snap = current_snapshot(&state).await;
+
+        assert_eq!(snap.regions.len(), 1);
+        assert_eq!(snap.regions[0].name, "World");
     }
 
     #[tokio::test]
