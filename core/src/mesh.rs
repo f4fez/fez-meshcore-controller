@@ -507,12 +507,28 @@ impl MeshClient {
 
     /// Removes a contact from the node's own contact list, identified by
     /// its public key prefix (hex).
+    ///
+    /// The companion's `CMD_REMOVE_CONTACT` requires the contact's *full*
+    /// 32-byte public key, not just the prefix carried over IPC — so this
+    /// resolves the prefix against the cached contact list first, rather
+    /// than forwarding the prefix straight through (which would either
+    /// fail outright or, with an older `meshcore-rs`, send a malformed,
+    /// too-short command that the node never responds to).
     pub async fn remove_contact(&self, public_key_prefix_hex: &str) -> Result<()> {
+        let prefix = hex_decode(public_key_prefix_hex)?;
+        let contact = self
+            .inner
+            .get_contact_by_prefix(&prefix)
+            .await
+            .ok_or_else(|| {
+                Error::Other(format!("no contact matches prefix {public_key_prefix_hex}"))
+            })?;
+
         self.inner
             .commands()
             .lock()
             .await
-            .remove_contact(public_key_prefix_hex)
+            .remove_contact(&contact)
             .await?;
         Ok(())
     }
