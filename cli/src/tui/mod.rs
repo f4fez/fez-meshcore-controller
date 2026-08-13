@@ -223,16 +223,19 @@ async fn apply_ui_event(app: &mut App, event: UiEvent, cmd_tx: &mpsc::Sender<Cli
             ServerMessage::Snapshot(snapshot) => app.apply_snapshot(snapshot),
             ServerMessage::Event(event) => {
                 // These events mean the daemon's own cache
-                // (self_info/contacts) just changed — on (re)connection, or
+                // (self_info/contacts) just changed — on (re)connection,
                 // because this same client's own `d` (delete) request
-                // succeeded — but that freshness isn't pushed to clients on
-                // its own (the daemon only replies to the request with
-                // success/failure, it doesn't broadcast a new `Snapshot`).
-                // Ask for a fresh one so the dashboard doesn't stay stale
-                // until the user manually presses 'r'.
+                // succeeded, or because the companion auto-added a newly
+                // heard node as a contact — but that freshness isn't
+                // pushed to clients on its own (the daemon only replies to
+                // a request with success/failure, it doesn't broadcast a
+                // new `Snapshot`). Ask for a fresh one so the dashboard
+                // doesn't stay stale until the user manually presses 'r'.
                 let needs_fresh_snapshot = matches!(
                     event.kind,
-                    MeshEventKind::Connected | MeshEventKind::ContactRemoved { .. }
+                    MeshEventKind::Connected
+                        | MeshEventKind::ContactRemoved { .. }
+                        | MeshEventKind::NewContact { .. }
                 );
                 app.push_event(event);
                 if needs_fresh_snapshot {
@@ -344,6 +347,27 @@ mod tests {
             server_event(MeshEventKind::ContactRemoved {
                 name: "Repeater".to_string(),
                 prefix_hex: "aabbccddeeff".to_string(),
+            }),
+            &cmd_tx,
+        )
+        .await;
+
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(ClientMessage::RequestSnapshot)
+        ));
+        assert_eq!(app.events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn new_contact_event_requests_a_fresh_snapshot() {
+        let mut app = App::new();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<ClientMessage>(8);
+
+        apply_ui_event(
+            &mut app,
+            server_event(MeshEventKind::NewContact {
+                name: "Repeater".to_string(),
             }),
             &cmd_tx,
         )
