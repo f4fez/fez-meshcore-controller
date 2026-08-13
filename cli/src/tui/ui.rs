@@ -343,6 +343,65 @@ fn payload_type_color(payload_type: &str) -> Color {
     }
 }
 
+/// Plain-language explanation of what a payload type is used for, shown in
+/// the packet detail popup — the type name alone (`TextMsg`, `Path`, ...)
+/// isn't self-explanatory to someone not already familiar with the MeshCore
+/// protocol. Mirrors `meshcore_rs::packets::PayloadType`'s variants.
+fn payload_type_description(payload_type: &str) -> &'static str {
+    match payload_type {
+        "Req" => {
+            "A directed request to a specific node (e.g. a remote status \
+             query), addressed by its destination hash and routed back to \
+             the sender via its source hash."
+        }
+        "Response" => "A reply to a Req or an anonymous request (AnonReq).",
+        "TextMsg" => {
+            "A direct, end-to-end encrypted text message between two \
+             specific nodes."
+        }
+        "Ack" => "Acknowledgement confirming a message reached its destination.",
+        "Advert" => {
+            "A node broadcasting its identity (public key, and optionally \
+             name/position) to the whole mesh, so other nodes can discover \
+             and route to it."
+        }
+        "GroupText" => {
+            "A text message sent to a channel/group, addressed by a shared \
+             channel hash rather than a specific node — anyone with the \
+             channel's secret can read it."
+        }
+        "GroupData" => {
+            "Structured (non-text) data sent to a channel/group, addressed \
+             the same way as GroupText."
+        }
+        "AnonReq" => {
+            "A request from a sender with no prior contact relationship \
+             (e.g. an anonymous remote query), carrying the sender's full \
+             public key instead of a source hash."
+        }
+        "Path" => {
+            "The route back to a node, returned in response to a path \
+             discovery so future packets can be sent to it directly \
+             instead of flooding."
+        }
+        "Trace" => {
+            "A diagnostic packet used to trace the hops (and their SNR) a \
+             transmission takes across the mesh."
+        }
+        "Multipart" => "One fragment of a message too large to fit in a single packet.",
+        "Control" => {
+            "A low-level control packet (e.g. node discovery) used by the \
+             mesh protocol itself, not by applications."
+        }
+        "RawCustom" => {
+            "Custom application payload with its own encryption/format, \
+             sent via SEND_RAW_DATA — not decoded by any of the standard \
+             message types."
+        }
+        _ => "Unrecognized payload type; its purpose can't be determined.",
+    }
+}
+
 /// One-line, human-readable summary of a packet's content, tailored to its
 /// payload type since different types carry very different data.
 fn packet_summary(entry: &PacketLogEntry) -> String {
@@ -635,6 +694,13 @@ fn draw_packet_detail_popup(frame: &mut Frame, group: &PacketGroup) {
                 lines.push(field_line("📤 Source", src.clone()));
                 lines.push(field_line("🎯 Destination", dest.clone()));
             }
+
+            lines.push(Line::from(""));
+            lines.push(section_title("— About this packet type —"));
+            lines.push(Line::from(Span::styled(
+                payload_type_description(&h.payload_type),
+                Style::default().fg(Color::White),
+            )));
 
             match &h.advertisement {
                 Some(adv) => {
@@ -1098,6 +1164,53 @@ mod render_tests {
         // Per-reception rows: the two relays have different hop counts.
         assert!(text.contains("1h"));
         assert!(text.contains("2h"));
+    }
+
+    #[test]
+    fn packet_detail_popup_explains_the_payload_type_below_the_summary_block() {
+        let mut app = App::new();
+        app.page = Page::PacketLog;
+        app.set_packet_log(sample_entries());
+        app.packet_table_state.select(Some(0)); // the grouped TextMsg (newest)
+        app.open_packet_detail();
+
+        let text = render(&mut app, 140, 40);
+
+        assert!(text.contains("About this packet type"));
+        assert!(text.contains("end-to-end encrypted text message"));
+
+        // Placed after the summary block (Payload version) and before the
+        // per-reception breakdown.
+        let version_pos = text.find("Payload version").unwrap();
+        let about_pos = text.find("About this packet type").unwrap();
+        let receptions_pos = text.find("Receptions (2)").unwrap();
+        assert!(version_pos < about_pos);
+        assert!(about_pos < receptions_pos);
+    }
+
+    #[test]
+    fn payload_type_description_has_an_entry_for_every_known_payload_type() {
+        for payload_type in [
+            "Req",
+            "Response",
+            "TextMsg",
+            "Ack",
+            "Advert",
+            "GroupText",
+            "GroupData",
+            "AnonReq",
+            "Path",
+            "Trace",
+            "Multipart",
+            "Control",
+            "RawCustom",
+        ] {
+            assert_ne!(
+                payload_type_description(payload_type),
+                payload_type_description("some-unknown-type"),
+                "{payload_type} should have its own description"
+            );
+        }
     }
 
     #[test]
