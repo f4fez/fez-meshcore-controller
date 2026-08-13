@@ -108,6 +108,8 @@ pub async fn run(existing: Option<&Config>) -> anyhow::Result<Config> {
             log_level,
             log_dir,
             packet_log_capacity: fez_mesh_controller_core::config::default_packet_log_capacity(),
+            discovered_nodes_capacity:
+                fez_mesh_controller_core::config::default_discovered_nodes_capacity(),
         },
         managed_repeaters,
         regions,

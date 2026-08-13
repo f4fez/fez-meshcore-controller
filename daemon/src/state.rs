@@ -36,11 +36,14 @@ pub struct AppState {
     /// client adds/removes a managed repeater at runtime.
     pub config: RwLock<Config>,
     pub config_path: PathBuf,
-    /// Repeaters overheard but not (yet) a companion contact, keyed by
-    /// 12-hex-char public key prefix. Populated from decoded RF log data,
-    /// which (unlike the plain `Advertisement` push) carries the full
-    /// public key needed to register them.
+    /// Nodes (repeaters/room servers) overheard but not (yet) a companion
+    /// contact, keyed by 12-hex-char public key prefix. Populated from
+    /// decoded RF log data, which (unlike the plain `Advertisement` push)
+    /// carries the full public key needed to register them. Bounded to
+    /// `discovered_repeaters_capacity` entries, least-recently-seen
+    /// evicted first — see [`Self::upsert_discovered_node`].
     pub discovered_repeaters: RwLock<HashMap<String, DiscoveredNode>>,
+    pub discovered_repeaters_capacity: usize,
     /// Rotating cache of raw packets (newest first), for the TUI's packet
     /// log page. Bounded to `packet_log_capacity` entries.
     pub packet_log: RwLock<VecDeque<PacketLogEntry>>,
@@ -58,6 +61,7 @@ impl AppState {
         let (events_tx, _rx) = broadcast::channel(256);
         let (packet_log_tx, _rx) = broadcast::channel(256);
         let packet_log_capacity = config.daemon.packet_log_capacity.max(1);
+        let discovered_repeaters_capacity = config.daemon.discovered_nodes_capacity.max(1);
         Self {
             snapshot: RwLock::new(Snapshot::default()),
             events_tx,
@@ -66,6 +70,7 @@ impl AppState {
             config: RwLock::new(config),
             config_path,
             discovered_repeaters: RwLock::new(HashMap::new()),
+            discovered_repeaters_capacity,
             packet_log: RwLock::new(VecDeque::with_capacity(packet_log_capacity)),
             packet_log_capacity,
             packet_log_tx,
@@ -99,6 +104,29 @@ impl AppState {
         }
         let _ = self.packet_log_tx.send(entry);
     }
+
+    /// Records a newly-overheard node in the discovered-nodes cache
+    /// (refreshing its entry if already known), evicting the
+    /// least-recently-seen one if the cache is at capacity. Returns
+    /// whether this is a genuinely new node, not just an updated
+    /// last-seen timestamp for one already tracked.
+    pub async fn upsert_discovered_node(&self, node: DiscoveredNode) -> bool {
+        let mut discovered = self.discovered_repeaters.write().await;
+        let is_new = !discovered.contains_key(&node.public_key_prefix_hex);
+
+        if is_new && discovered.len() >= self.discovered_repeaters_capacity {
+            if let Some(oldest_prefix) = discovered
+                .iter()
+                .min_by_key(|(_, n)| n.last_seen_unix)
+                .map(|(prefix, _)| prefix.clone())
+            {
+                discovered.remove(&oldest_prefix);
+            }
+        }
+
+        discovered.insert(node.public_key_prefix_hex.clone(), node);
+        is_new
+    }
 }
 
 #[cfg(test)]
@@ -121,6 +149,7 @@ mod tests {
                 log_level: "info".to_string(),
                 log_dir: PathBuf::from("/tmp/fez-mesh-controller-test/logs"),
                 packet_log_capacity,
+                discovered_nodes_capacity: 200,
             },
             managed_repeaters: vec![],
             regions: vec![],
@@ -141,6 +170,45 @@ mod tests {
             header: None,
             payload_hex: String::new(),
             payload_len: 0,
+        }
+    }
+
+    fn make_state_with_discovered_capacity(discovered_nodes_capacity: usize) -> AppState {
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let config = Config {
+            node_label: "test-node".to_string(),
+            connection: ConnectionConfig::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: 5000,
+            },
+            daemon: DaemonConfig {
+                socket_path: PathBuf::from("/tmp/fez-mesh-controller-test.sock"),
+                refresh_interval_secs: 5,
+                log_level: "info".to_string(),
+                log_dir: PathBuf::from("/tmp/fez-mesh-controller-test/logs"),
+                packet_log_capacity: 500,
+                discovered_nodes_capacity,
+            },
+            managed_repeaters: vec![],
+            regions: vec![],
+        };
+        AppState::new(
+            command_tx,
+            config,
+            PathBuf::from("/tmp/fez-mesh-controller-test.toml"),
+        )
+    }
+
+    fn sample_node(prefix: &str, last_seen_unix: i64) -> DiscoveredNode {
+        DiscoveredNode {
+            name: "Node".to_string(),
+            public_key_hex: "aa".repeat(32),
+            public_key_prefix_hex: prefix.to_string(),
+            is_repeater: true,
+            adv_type: 2,
+            lat: 0.0,
+            lon: 0.0,
+            last_seen_unix,
         }
     }
 
@@ -171,6 +239,7 @@ mod tests {
                 log_level: "info".to_string(),
                 log_dir: PathBuf::from("/tmp/fez-mesh-controller-test/logs"),
                 packet_log_capacity: 0,
+                discovered_nodes_capacity: 200,
             },
             managed_repeaters: vec![],
             regions: vec![],
@@ -211,5 +280,74 @@ mod tests {
             at_unix: 0,
             kind: MeshEventKind::Connected,
         });
+    }
+
+    #[tokio::test]
+    async fn upsert_discovered_node_reports_new_vs_already_known() {
+        let state = make_state_with_discovered_capacity(200);
+
+        assert!(
+            state
+                .upsert_discovered_node(sample_node("aaaaaaaaaaaa", 1))
+                .await
+        );
+        // Same prefix seen again: not new, just refreshed.
+        assert!(
+            !state
+                .upsert_discovered_node(sample_node("aaaaaaaaaaaa", 2))
+                .await
+        );
+
+        let discovered = state.discovered_repeaters.read().await;
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered["aaaaaaaaaaaa"].last_seen_unix, 2);
+    }
+
+    #[tokio::test]
+    async fn upsert_discovered_node_evicts_the_least_recently_seen_when_at_capacity() {
+        let state = make_state_with_discovered_capacity(2);
+
+        state
+            .upsert_discovered_node(sample_node("aaaaaaaaaaaa", 1))
+            .await;
+        state
+            .upsert_discovered_node(sample_node("bbbbbbbbbbbb", 2))
+            .await;
+        // At capacity: adding a third node must evict the oldest (prefix "aa...").
+        state
+            .upsert_discovered_node(sample_node("cccccccccccc", 3))
+            .await;
+
+        let discovered = state.discovered_repeaters.read().await;
+        assert_eq!(discovered.len(), 2);
+        assert!(!discovered.contains_key("aaaaaaaaaaaa"));
+        assert!(discovered.contains_key("bbbbbbbbbbbb"));
+        assert!(discovered.contains_key("cccccccccccc"));
+    }
+
+    #[tokio::test]
+    async fn upsert_discovered_node_refreshing_an_existing_entry_does_not_evict() {
+        let state = make_state_with_discovered_capacity(2);
+
+        state
+            .upsert_discovered_node(sample_node("aaaaaaaaaaaa", 1))
+            .await;
+        state
+            .upsert_discovered_node(sample_node("bbbbbbbbbbbb", 2))
+            .await;
+        // Already at capacity, but this just refreshes an existing entry.
+        state
+            .upsert_discovered_node(sample_node("aaaaaaaaaaaa", 3))
+            .await;
+
+        let discovered = state.discovered_repeaters.read().await;
+        assert_eq!(discovered.len(), 2);
+        assert_eq!(discovered["aaaaaaaaaaaa"].last_seen_unix, 3);
+    }
+
+    #[test]
+    fn discovered_repeaters_capacity_is_at_least_one() {
+        let state = make_state_with_discovered_capacity(0);
+        assert_eq!(state.discovered_repeaters_capacity, 1);
     }
 }

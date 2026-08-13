@@ -70,6 +70,9 @@ pub struct ContactDto {
     pub registered: bool,
     /// Whether this node is in the config's `managed_repeaters` list.
     pub managed: bool,
+    /// Advertiser type byte (see [`adv_type_name`]/`CONTACT_TYPENAMES`:
+    /// 1=Chat, 2=Repeater, 3=Room, 4=Sensor).
+    pub contact_type: u8,
 }
 
 impl From<&Contact> for ContactDto {
@@ -82,8 +85,17 @@ impl From<&Contact> for ContactDto {
             lon: c.adv_lon as f64 / 1_000_000.0,
             registered: true,
             managed: false,
+            contact_type: c.contact_type,
         }
     }
+}
+
+/// Whether an advertiser type byte (`ContactDto::contact_type`/
+/// `DiscoveredNode::adv_type`) identifies a repeater or a room server —
+/// the two node types the TUI's "Repeaters" panel is scoped to, as opposed
+/// to plain chat clients or sensors.
+pub fn is_repeater_or_room(contact_type: u8) -> bool {
+    matches!(contact_type, 2 | 3)
 }
 
 /// A node's full identity, resolved from an overheard advertisement via RF
@@ -100,6 +112,8 @@ pub struct DiscoveredNode {
     /// First 12 hex chars of `public_key_hex`, matches [`ContactDto::public_key_prefix_hex`].
     pub public_key_prefix_hex: String,
     pub is_repeater: bool,
+    /// Advertiser type byte, see [`ContactDto::contact_type`].
+    pub adv_type: u8,
     pub lat: f64,
     pub lon: f64,
     pub last_seen_unix: i64,
@@ -126,6 +140,7 @@ pub fn extract_discovered_node(event: &MeshCoreEvent, now_unix: i64) -> Option<D
         public_key_prefix_hex: public_key_hex.chars().take(12).collect(),
         public_key_hex,
         is_repeater: adv.adv_type == 2, // see declare_contact's CONTACT_TYPENAMES note
+        adv_type: adv.adv_type,
         lat: adv.lat.map(|v| v as f64 / 1_000_000.0).unwrap_or(0.0),
         lon: adv.lon.map(|v| v as f64 / 1_000_000.0).unwrap_or(0.0),
         last_seen_unix: now_unix,
@@ -707,6 +722,7 @@ mod tests {
         assert_eq!(node.public_key_hex, "ab".repeat(32));
         assert_eq!(node.public_key_prefix_hex, "abababababab");
         assert!(node.is_repeater);
+        assert_eq!(node.adv_type, 2);
         assert_eq!(node.lat, 48.85);
         assert_eq!(node.lon, 2.35);
         assert_eq!(node.last_seen_unix, 1_700_000_042);
@@ -725,6 +741,7 @@ mod tests {
             extract_discovered_node(&event(EventType::LogData, EventPayload::LogData(log)), 0)
                 .unwrap();
         assert!(!node.is_repeater);
+        assert_eq!(node.adv_type, 1);
     }
 
     #[test]
@@ -1348,5 +1365,15 @@ mod tests {
         assert_eq!(dto.lon, 2.35);
         assert!(dto.registered);
         assert!(!dto.managed);
+        assert_eq!(dto.contact_type, 2);
+    }
+
+    #[test]
+    fn is_repeater_or_room_accepts_only_types_two_and_three() {
+        assert!(!is_repeater_or_room(1)); // Chat
+        assert!(is_repeater_or_room(2)); // Repeater
+        assert!(is_repeater_or_room(3)); // Room
+        assert!(!is_repeater_or_room(4)); // Sensor
+        assert!(!is_repeater_or_room(0));
     }
 }

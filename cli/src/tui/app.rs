@@ -15,7 +15,7 @@
 use std::collections::VecDeque;
 
 use fez_mesh_controller_core::ipc::{MeshEvent, Snapshot};
-use fez_mesh_controller_core::mesh::{ContactDto, PacketLogEntry};
+use fez_mesh_controller_core::mesh::{is_repeater_or_room, ContactDto, PacketLogEntry};
 use fez_mesh_controller_core::region;
 
 use super::packet_group::{group_packets, PacketGroup};
@@ -101,10 +101,17 @@ impl App {
         self.snapshot = snapshot;
     }
 
-    /// Contacts sorted the way they're displayed (most recently seen
-    /// first), so table row indices line up with selection/action logic.
+    /// Repeaters and room servers (the "Repeaters" panel's scope — plain
+    /// chat clients and sensors are excluded), sorted the way they're
+    /// displayed (most recently seen first), so table row indices line up
+    /// with selection/action logic.
     pub fn sorted_contacts(&self) -> Vec<&ContactDto> {
-        let mut contacts: Vec<&ContactDto> = self.snapshot.contacts.iter().collect();
+        let mut contacts: Vec<&ContactDto> = self
+            .snapshot
+            .contacts
+            .iter()
+            .filter(|c| is_repeater_or_room(c.contact_type))
+            .collect();
         contacts.sort_by_key(|c| std::cmp::Reverse(c.last_advert_unix));
         contacts
     }
@@ -123,7 +130,7 @@ impl App {
     }
 
     pub fn select_next_contact(&mut self) {
-        let len = self.snapshot.contacts.len();
+        let len = self.sorted_contacts().len();
         if len == 0 {
             return;
         }
@@ -136,7 +143,7 @@ impl App {
     }
 
     pub fn select_prev_contact(&mut self) {
-        let len = self.snapshot.contacts.len();
+        let len = self.sorted_contacts().len();
         if len == 0 {
             return;
         }

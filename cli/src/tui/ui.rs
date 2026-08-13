@@ -128,15 +128,15 @@ fn draw_body(frame: &mut Frame, app: &mut App, area: Rect) {
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(cols[0]);
 
-    draw_self_info(frame, app, left[0]);
-    draw_cluster_block(frame, app, left[1]);
+    draw_cluster_block(frame, app, left[0]);
+    draw_self_info(frame, app, left[1]);
 
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(cols[1]);
 
-    draw_contacts(frame, app, right[0]);
+    draw_repeaters(frame, app, right[0]);
     draw_events(frame, app, right[1]);
 }
 
@@ -162,7 +162,10 @@ fn draw_self_info(frame: &mut Frame, app: &App, area: Rect) {
         ))],
     };
 
-    frame.render_widget(Paragraph::new(lines).block(block("🛰️  Local node")), area);
+    frame.render_widget(
+        Paragraph::new(lines).block(block("🛰️  Observer node")),
+        area,
+    );
 }
 
 /// The cluster's configured region hierarchy (see
@@ -170,19 +173,25 @@ fn draw_self_info(frame: &mut Frame, app: &App, area: Rect) {
 /// renders the tree, indented by depth. Local to this controller's own
 /// config, unrelated to the connected node's own settings.
 fn draw_cluster_block(frame: &mut Frame, app: &App, area: Rect) {
-    let lines: Vec<Line> = if app.snapshot.regions.is_empty() {
-        vec![Line::from(Span::styled(
+    let mut lines = vec![Line::from(Span::styled(
+        "Regions:",
+        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+    ))];
+
+    if app.snapshot.regions.is_empty() {
+        lines.push(Line::from(Span::styled(
             "No regions configured",
             Style::default().fg(MUTED),
-        ))]
+        )));
     } else {
-        region::flatten_region_tree(&app.snapshot.regions)
-            .into_iter()
-            .map(|(depth, region)| {
-                Line::from(Span::raw(format!("{}{}", "  ".repeat(depth), region.name)))
-            })
-            .collect()
-    };
+        lines.extend(
+            region::flatten_region_tree(&app.snapshot.regions)
+                .into_iter()
+                .map(|(depth, region)| {
+                    Line::from(Span::raw(format!("{}{}", "  ".repeat(depth), region.name)))
+                }),
+        );
+    }
 
     frame.render_widget(Paragraph::new(lines).block(block("🧩 Cluster")), area);
 }
@@ -194,7 +203,7 @@ fn field_line(label: &str, value: impl Into<String>) -> Line<'static> {
     ])
 }
 
-fn draw_contacts(frame: &mut Frame, app: &mut App, area: Rect) {
+fn draw_repeaters(frame: &mut Frame, app: &mut App, area: Rect) {
     let contacts = app.sorted_contacts();
 
     let header = Row::new(vec![
@@ -254,10 +263,7 @@ fn draw_contacts(frame: &mut Frame, app: &mut App, area: Rect) {
             .add_modifier(Modifier::BOLD),
     )
     .highlight_symbol("➤ ")
-    .block(block(format!(
-        "👥 Contacts ({})",
-        app.snapshot.contacts.len()
-    )));
+    .block(block(format!("👥 Repeaters ({})", contacts.len())));
 
     frame.render_stateful_widget(table, area, &mut app.contacts_state);
 }
@@ -898,15 +904,15 @@ fn help_content(
     match page {
         Page::Dashboard => (
             "Dashboard",
-            "Local node status, mesh contacts, and the live event log.",
+            "Observer node status, cluster regions, repeaters, and the live event log.",
             &[
                 ("F1", "Toggle this help"),
                 ("F2", "Dashboard page (current)"),
                 ("F3", "Packet log page"),
-                ("↑ / ↓", "Select a contact"),
+                ("↑ / ↓", "Select a repeater"),
                 ("r", "Refresh snapshot"),
                 ("m", "Toggle managed repeater"),
-                ("d", "Delete contact (press twice to confirm)"),
+                ("d", "Delete repeater (press twice to confirm)"),
                 ("q / Esc", "Quit"),
             ],
         ),
@@ -1025,6 +1031,14 @@ mod render_tests {
             lon: 0.0,
             registered: true,
             managed,
+            contact_type: 2, // Repeater
+        }
+    }
+
+    fn contact_of_type(public_key_prefix_hex: &str, contact_type: u8) -> ContactDto {
+        ContactDto {
+            contact_type,
+            ..contact(public_key_prefix_hex, false)
         }
     }
 
@@ -1227,6 +1241,52 @@ mod render_tests {
         None
     }
 
+    /// The row where `text` starts in the rendered buffer (scanning
+    /// left-to-right, top-to-bottom), or `None` if it isn't found. Used to
+    /// assert on the relative vertical ordering of two blocks.
+    fn text_row(buffer: &ratatui::buffer::Buffer, text: &str) -> Option<u16> {
+        let chars: Vec<String> = text.chars().map(|c| c.to_string()).collect();
+        for y in 0..buffer.area.height {
+            for x in 0..=buffer.area.width.saturating_sub(chars.len() as u16) {
+                let matches = chars
+                    .iter()
+                    .enumerate()
+                    .all(|(i, ch)| buffer[(x + i as u16, y)].symbol() == ch);
+                if matches {
+                    return Some(y);
+                }
+            }
+        }
+        None
+    }
+
+    // --- Dashboard layout ----------------------------------------------------
+
+    #[test]
+    fn dashboard_renames_local_node_to_observer_node() {
+        let mut app = App::new();
+
+        let text = render(&mut app, 120, 30);
+
+        assert!(text.contains("Observer node"));
+        assert!(!text.contains("Local node"));
+    }
+
+    #[test]
+    fn dashboard_places_the_cluster_block_above_the_observer_node_block() {
+        let mut app = App::new();
+
+        let buffer = render_buffer(&mut app, 120, 30);
+        let cluster_y = text_row(&buffer, "Cluster").expect("Cluster block should render");
+        let observer_y =
+            text_row(&buffer, "Observer node").expect("Observer node block should render");
+
+        assert!(
+            cluster_y < observer_y,
+            "expected Cluster (y={cluster_y}) above Observer node (y={observer_y})"
+        );
+    }
+
     // --- Cluster block -----------------------------------------------------
 
     #[test]
@@ -1237,6 +1297,27 @@ mod render_tests {
 
         assert!(text.contains("Cluster"));
         assert!(text.contains("No regions configured"));
+    }
+
+    #[test]
+    fn draw_cluster_block_shows_a_label_above_the_region_list() {
+        use fez_mesh_controller_core::ipc::Snapshot;
+        use fez_mesh_controller_core::RegionConfig;
+
+        let mut app = App::new();
+        app.apply_snapshot(Snapshot {
+            regions: vec![RegionConfig {
+                name: "World".to_string(),
+                parent: None,
+            }],
+            ..Default::default()
+        });
+
+        let buffer = render_buffer(&mut app, 120, 30);
+        let label_y = text_row(&buffer, "Regions:").expect("label should render");
+        let world_y = text_row(&buffer, "World").expect("region should render");
+
+        assert!(label_y < world_y);
     }
 
     #[test]
@@ -1268,6 +1349,33 @@ mod render_tests {
         assert!(text.contains("World"));
         assert!(text.contains("  Europe"));
         assert!(text.contains("    France"));
+    }
+
+    // --- Repeaters panel -----------------------------------------------------
+
+    #[test]
+    fn draw_repeaters_panel_is_titled_repeaters() {
+        let mut app = App::new();
+
+        let text = render(&mut app, 120, 30);
+
+        assert!(text.contains("Repeaters ("));
+        assert!(!text.contains("Contacts ("));
+    }
+
+    #[test]
+    fn draw_repeaters_panel_only_shows_repeaters_and_room_servers() {
+        let mut app = App::new();
+        app.snapshot.contacts = vec![
+            contact_of_type("111111111111", 1), // Chat
+            contact_of_type("222222222222", 2), // Repeater
+            contact_of_type("333333333333", 3), // Room
+            contact_of_type("444444444444", 4), // Sensor
+        ];
+
+        let text = render(&mut app, 120, 30);
+
+        assert!(text.contains("Repeaters (2)"));
     }
 
     #[test]

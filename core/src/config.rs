@@ -113,6 +113,10 @@ pub struct DaemonConfig {
     /// page F3), oldest evicted first.
     #[serde(default = "default_packet_log_capacity")]
     pub packet_log_capacity: usize,
+    /// Number of overheard-but-not-yet-a-contact nodes kept in the
+    /// discovered-nodes cache, least-recently-seen evicted first.
+    #[serde(default = "default_discovered_nodes_capacity")]
+    pub discovered_nodes_capacity: usize,
 }
 
 impl Default for DaemonConfig {
@@ -123,6 +127,7 @@ impl Default for DaemonConfig {
             log_level: "info".to_string(),
             log_dir: default_log_dir(),
             packet_log_capacity: default_packet_log_capacity(),
+            discovered_nodes_capacity: default_discovered_nodes_capacity(),
         }
     }
 }
@@ -158,6 +163,11 @@ pub fn default_log_dir() -> PathBuf {
 /// Default number of entries kept in the rotating packet-log cache.
 pub fn default_packet_log_capacity() -> usize {
     500
+}
+
+/// Default number of entries kept in the discovered-nodes cache.
+pub fn default_discovered_nodes_capacity() -> usize {
+    200
 }
 
 impl Config {
@@ -211,6 +221,7 @@ mod tests {
                 log_level: "info".to_string(),
                 log_dir: PathBuf::from("/tmp/fez-mesh-controller/logs"),
                 packet_log_capacity: 500,
+                discovered_nodes_capacity: 200,
             },
             managed_repeaters: vec![ManagedRepeater {
                 name: "F4FEZ Repeater".to_string(),
@@ -287,6 +298,11 @@ mod tests {
     }
 
     #[test]
+    fn daemon_config_default_uses_200_discovered_nodes_capacity() {
+        assert_eq!(DaemonConfig::default().discovered_nodes_capacity, 200);
+    }
+
+    #[test]
     fn config_save_and_load_roundtrip() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
@@ -334,6 +350,7 @@ mod tests {
         assert!(config.managed_repeaters.is_empty());
         assert!(config.regions.is_empty());
         assert_eq!(config.daemon.packet_log_capacity, 500);
+        assert_eq!(config.daemon.discovered_nodes_capacity, 200);
         assert_eq!(config.daemon.log_dir, default_log_dir());
     }
 

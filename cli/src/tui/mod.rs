@@ -170,7 +170,7 @@ async fn toggle_managed(app: &mut App, cmd_tx: &mpsc::Sender<ClientMessage>) {
         .selected_contact()
         .map(|c| (c.public_key_prefix_hex.clone(), c.name.clone(), !c.managed))
     else {
-        app.last_status = Some("No contact selected".to_string());
+        app.last_status = Some("No repeater selected".to_string());
         return;
     };
 
@@ -210,7 +210,7 @@ async fn confirm_or_arm_delete(app: &mut App, cmd_tx: &mpsc::Sender<ClientMessag
             app.pending_delete = Some((prefix, name));
         }
         (_, None) => {
-            app.last_status = Some("No contact selected".to_string());
+            app.last_status = Some("No repeater selected".to_string());
         }
     }
 }

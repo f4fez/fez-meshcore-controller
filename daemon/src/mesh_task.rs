@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use fez_mesh_controller_core::ipc::MeshEvent;
 use fez_mesh_controller_core::mesh::{
-    build_packet_log_entry, extract_discovered_node, map_event, ContactDto, MeshClient,
-    MeshEventKind,
+    build_packet_log_entry, extract_discovered_node, is_repeater_or_room, map_event, ContactDto,
+    MeshClient, MeshEventKind,
 };
 use fez_mesh_controller_core::{ConnectionConfig, ManagedRepeater};
 use futures::StreamExt;
@@ -73,7 +73,7 @@ pub async fn run(
                             match maybe_event {
                                 Some(raw) => {
                                     if let Some(node) = extract_discovered_node(&raw, now_unix()) {
-                                        if node.is_repeater {
+                                        if is_repeater_or_room(node.adv_type) {
                                             handle_discovered_node(node, &client, &state).await;
                                         }
                                     }
@@ -175,6 +175,7 @@ async fn build_snapshot_contacts(client: &MeshClient, state: &AppState) -> Vec<C
             managed: managed_repeaters
                 .iter()
                 .any(|r| r.matches(&node.public_key_prefix_hex)),
+            contact_type: node.adv_type,
         });
     }
 
@@ -188,20 +189,16 @@ async fn refresh_snapshot_contacts(client: &MeshClient, state: &AppState) {
     snap.generated_at_unix = now_unix();
 }
 
-/// Records a newly-overheard repeater (full identity resolved from RF log
-/// data) and, if it isn't already known, surfaces it in the contact list
-/// as "discovered" and logs a one-off event the first time it's seen.
+/// Records a newly-overheard node (full identity resolved from RF log
+/// data) in the (capacity-bounded) discovered-nodes cache and, if it
+/// isn't already known, surfaces it in the contact list as "discovered"
+/// and logs a one-off event the first time it's seen.
 async fn handle_discovered_node(
     node: fez_mesh_controller_core::mesh::DiscoveredNode,
     client: &MeshClient,
     state: &AppState,
 ) {
-    let is_new = {
-        let mut discovered = state.discovered_repeaters.write().await;
-        let is_new = !discovered.contains_key(&node.public_key_prefix_hex);
-        discovered.insert(node.public_key_prefix_hex.clone(), node.clone());
-        is_new
-    };
+    let is_new = state.upsert_discovered_node(node.clone()).await;
 
     if !is_new {
         return;
@@ -539,6 +536,7 @@ mod tests {
                 log_level: "info".to_string(),
                 log_dir: PathBuf::from("/tmp/fez-mesh-controller-test/logs"),
                 packet_log_capacity: 500,
+                discovered_nodes_capacity: 200,
             },
             managed_repeaters,
             regions: vec![],

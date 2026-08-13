@@ -58,6 +58,12 @@ log_dir = "/home/user/.local/state/fez-mesh-controller/logs"
 # defaults to 500 if omitted.
 packet_log_capacity = 500
 
+# Number of overheard-but-not-yet-a-contact nodes (repeaters/room servers
+# detected purely from RF traffic, not yet in the companion's own contact
+# list) kept in the discovered-nodes cache, least-recently-seen evicted
+# first. Optional, defaults to 200 if omitted.
+discovered_nodes_capacity = 200
+
 # --- Managed repeaters -----------------------------------------------------
 #
 # Repeaters this application actively manages: shown as "🛰️ Managed" in the

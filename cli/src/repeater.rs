@@ -297,6 +297,7 @@ mod tests {
             lon: 0.0,
             registered: true,
             managed: false,
+            contact_type: 2, // Repeater
         }
     }
 
