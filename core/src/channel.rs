@@ -149,6 +149,7 @@ mod tests {
     fn group_text_header(payload_version: u8) -> PacketHeaderInfo {
         PacketHeaderInfo {
             route_type: "Flood".to_string(),
+            route_type_raw: 1,
             payload_type: "GroupText".to_string(),
             payload_type_raw: 5,
             payload_version,

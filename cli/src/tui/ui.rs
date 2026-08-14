@@ -14,7 +14,7 @@
 
 use chrono::{Local, TimeZone};
 use fez_mesh_controller_core::channel;
-use fez_mesh_controller_core::ipc::MeshEvent;
+use fez_mesh_controller_core::ipc::{MeshEvent, MqttBrokerStatus, MqttBrokerStatusDto};
 use fez_mesh_controller_core::mesh::{
     ContactDto, ControlPayloadInfo, MeshEventKind, PacketHeaderInfo, PacketLogEntry,
 };
@@ -144,7 +144,7 @@ fn draw_body(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_self_info(frame: &mut Frame, app: &App, area: Rect) {
-    let lines: Vec<Line> = match &app.snapshot.self_info {
+    let mut lines: Vec<Line> = match &app.snapshot.self_info {
         Some(info) => {
             let key_short: String = info.public_key_hex.chars().take(16).collect();
             vec![
@@ -165,10 +165,35 @@ fn draw_self_info(frame: &mut Frame, app: &App, area: Rect) {
         ))],
     };
 
+    if !app.snapshot.mqtt_brokers.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "MQTT brokers:",
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        )));
+        lines.extend(app.snapshot.mqtt_brokers.iter().map(mqtt_broker_line));
+    }
+
     frame.render_widget(
         Paragraph::new(lines).block(block("🛰️  Observer node")),
         area,
     );
+}
+
+/// One line for a configured MQTT broker in the Observer node block: its
+/// name plus a colored icon/label for its live connection status (see
+/// [`fez_mesh_controller_core::ipc::MqttBrokerStatus`]).
+fn mqtt_broker_line(broker: &MqttBrokerStatusDto) -> Line<'static> {
+    let (icon, text, color) = match &broker.status {
+        MqttBrokerStatus::Connecting => ("🟡", "Connecting".to_string(), YELLOW),
+        MqttBrokerStatus::Connected => ("🟢", "Connected".to_string(), GREEN),
+        MqttBrokerStatus::Disconnected => ("🔴", "Disconnected".to_string(), MUTED),
+        MqttBrokerStatus::Error { reason } => ("⚠️", format!("Error: {reason}"), RED),
+    };
+    Line::from(vec![
+        Span::raw(format!("  {icon} {}: ", broker.name)),
+        Span::styled(text, Style::default().fg(color)),
+    ])
 }
 
 /// The cluster's configured region hierarchy (see
@@ -1182,6 +1207,7 @@ mod render_tests {
             rssi: -90,
             header: Some(PacketHeaderInfo {
                 route_type: "Flood".to_string(),
+                route_type_raw: 1,
                 payload_type: "GroupText".to_string(),
                 payload_type_raw: 5,
                 payload_version: 0,
@@ -1208,6 +1234,7 @@ mod render_tests {
     fn packet_row_highlight_prioritizes_endpoint_over_relay() {
         let group = single_member_group(PacketHeaderInfo {
             route_type: "Flood".to_string(),
+            route_type_raw: 1,
             payload_type: "TextMsg".to_string(),
             payload_type_raw: 2,
             payload_version: 0,
@@ -1236,6 +1263,7 @@ mod render_tests {
     fn packet_row_highlight_relay_only() {
         let group = single_member_group(PacketHeaderInfo {
             route_type: "Flood".to_string(),
+            route_type_raw: 1,
             payload_type: "TextMsg".to_string(),
             payload_type_raw: 2,
             payload_version: 0,
@@ -1262,6 +1290,7 @@ mod render_tests {
     fn packet_row_highlight_none_when_no_managed_repeater_involved() {
         let group = single_member_group(PacketHeaderInfo {
             route_type: "Flood".to_string(),
+            route_type_raw: 1,
             payload_type: "TextMsg".to_string(),
             payload_type_raw: 2,
             payload_version: 0,
@@ -1311,6 +1340,7 @@ mod render_tests {
                 rssi: -80,
                 header: Some(PacketHeaderInfo {
                     route_type: "Flood".to_string(),
+                    route_type_raw: 1,
                     payload_type: "TextMsg".to_string(),
                     payload_type_raw: 2,
                     payload_version: 0,
@@ -1335,6 +1365,7 @@ mod render_tests {
                 rssi: -95,
                 header: Some(PacketHeaderInfo {
                     route_type: "Flood".to_string(),
+                    route_type_raw: 1,
                     payload_type: "TextMsg".to_string(),
                     payload_type_raw: 2,
                     payload_version: 0,
@@ -1359,6 +1390,7 @@ mod render_tests {
                 rssi: -100,
                 header: Some(PacketHeaderInfo {
                     route_type: "Direct".to_string(),
+                    route_type_raw: 2,
                     payload_type: "Ack".to_string(),
                     payload_type_raw: 3,
                     payload_version: 0,
@@ -1483,6 +1515,45 @@ mod render_tests {
 
         assert!(text.contains("Observer node"));
         assert!(!text.contains("Local node"));
+    }
+
+    #[test]
+    fn observer_node_block_hides_mqtt_section_when_no_brokers_configured() {
+        let mut app = App::new();
+
+        let text = render(&mut app, 120, 30);
+
+        assert!(!text.contains("MQTT brokers"));
+    }
+
+    #[test]
+    fn observer_node_block_shows_configured_mqtt_brokers_and_status() {
+        use fez_mesh_controller_core::ipc::{MqttBrokerStatus, MqttBrokerStatusDto, Snapshot};
+
+        let mut app = App::new();
+        app.apply_snapshot(Snapshot {
+            mqtt_brokers: vec![
+                MqttBrokerStatusDto {
+                    name: "Home Assistant".to_string(),
+                    status: MqttBrokerStatus::Connected,
+                },
+                MqttBrokerStatusDto {
+                    name: "Backup".to_string(),
+                    status: MqttBrokerStatus::Error {
+                        reason: "connection refused".to_string(),
+                    },
+                },
+            ],
+            ..Default::default()
+        });
+
+        let text = render(&mut app, 120, 30);
+
+        assert!(text.contains("MQTT brokers"));
+        assert!(text.contains("Home Assistant"));
+        assert!(text.contains("Connected"));
+        assert!(text.contains("Backup"));
+        assert!(text.contains("Error: connection refused"));
     }
 
     #[test]
@@ -1696,6 +1767,7 @@ mod render_tests {
             rssi: -90,
             header: Some(PacketHeaderInfo {
                 route_type: "Flood".to_string(),
+                route_type_raw: 1,
                 payload_type: "GroupText".to_string(),
                 payload_type_raw: 5,
                 payload_version: 0,
@@ -1731,6 +1803,7 @@ mod render_tests {
             rssi: -90,
             header: Some(PacketHeaderInfo {
                 route_type: "Flood".to_string(),
+                route_type_raw: 1,
                 payload_type: "GroupText".to_string(),
                 payload_type_raw: 5,
                 payload_version: 0,
@@ -1783,6 +1856,7 @@ mod render_tests {
             rssi: -90,
             header: Some(PacketHeaderInfo {
                 route_type: "Flood".to_string(),
+                route_type_raw: 1,
                 payload_type: "AnonReq".to_string(),
                 payload_type_raw: 7,
                 payload_version: 0,
@@ -1818,6 +1892,7 @@ mod render_tests {
             rssi: -90,
             header: Some(PacketHeaderInfo {
                 route_type: "Flood".to_string(),
+                route_type_raw: 1,
                 payload_type: "AnonReq".to_string(),
                 payload_type_raw: 7,
                 payload_version: 0,
@@ -1871,6 +1946,7 @@ mod render_tests {
             rssi: -90,
             header: Some(PacketHeaderInfo {
                 route_type: "Direct".to_string(),
+                route_type_raw: 2,
                 payload_type: "Control".to_string(),
                 payload_type_raw: 11,
                 payload_version: 0,
@@ -1985,6 +2061,7 @@ mod render_tests {
             rssi: -90,
             header: Some(PacketHeaderInfo {
                 route_type: "Flood".to_string(),
+                route_type_raw: 1,
                 payload_type: "GroupText".to_string(),
                 payload_type_raw: 5,
                 payload_version: 0,
@@ -2020,6 +2097,7 @@ mod render_tests {
             rssi: -90,
             header: Some(PacketHeaderInfo {
                 route_type: "Flood".to_string(),
+                route_type_raw: 1,
                 payload_type: "GroupText".to_string(),
                 payload_type_raw: 5,
                 payload_version: 0,
@@ -2077,6 +2155,7 @@ mod render_tests {
             rssi: -90,
             header: Some(PacketHeaderInfo {
                 route_type: "Flood".to_string(),
+                route_type_raw: 1,
                 payload_type: "Ack".to_string(),
                 payload_type_raw: 4,
                 payload_version: 0,
@@ -2119,6 +2198,7 @@ mod render_tests {
             rssi: -90,
             header: Some(PacketHeaderInfo {
                 route_type: "TransportFlood".to_string(),
+                route_type_raw: 0,
                 payload_type: "TextMsg".to_string(),
                 payload_type_raw: 2,
                 payload_version: 0,
@@ -2321,6 +2401,7 @@ mod render_tests {
             rssi: -90,
             header: Some(PacketHeaderInfo {
                 route_type: "Direct".to_string(),
+                route_type_raw: 2,
                 payload_type: "Battery".to_string(),
                 payload_type_raw: 255,
                 payload_version: 0,

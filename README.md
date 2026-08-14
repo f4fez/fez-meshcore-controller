@@ -67,6 +67,9 @@ Configuration is stored in `~/.config/fez-mesh-controller/config.toml` (re-run t
 `fez-mesh-controller setup`). See [`config.example.toml`](config.example.toml) for every
 available parameter, with comments.
 
+MQTT broker forwarding is also available — see
+[`documentation/mqtt.md`](documentation/mqtt.md) for configuration and message formats.
+
 ## CLI commands
 
 The daemon must be running for any of these to work — they all talk to it over the IPC socket,

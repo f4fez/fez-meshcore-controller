@@ -111,3 +111,44 @@ discovered_nodes_capacity = 200
 # via the setup wizard yet — add entries here by hand.
 
 # hashtag_channels = ["#test"]
+
+# --- MQTT brokers --------------------------------------------------------
+#
+# Forwards received mesh events to one or more MQTT brokers, using the same
+# topic structure and JSON message shape as the community
+# `ipnet-mesh/meshcore-mqtt` bridge (verified against its source). The
+# <prefix>/status topic instead matches the community
+# `agessaman/meshcore-packet-capture` bridge's richer status message shape
+# (verified against its source). Editable via the setup wizard, or by hand
+# below. `password` is stored in plaintext, like the rest of this file.
+
+# [[mqtt_brokers]]
+# name = "Home Assistant"
+# host = "mqtt.example.com"
+# port = 1883
+# username = "fez"
+# password = "hunter2"
+# topic_prefix = "meshcore"
+# status_topic = "{prefix}/status" # supports {prefix}/{public_key} placeholders, see below
+# status_refresh_interval_secs = 300 # 0 disables the periodic status heartbeat
+# enable_high_level_messages = true # false mutes this broker (connects, publishes nothing)
+#
+# Raw-packet topics: every overheard packet, regardless of whether this
+# project's own decoders recognize it. Topic routes support {prefix} (this
+# broker's topic_prefix) and {public_key} (this node's own uppercase public
+# key hex) placeholders. See documentation/mqtt.md for full message shapes.
+# enable_packet_trafic_messages = true  # rich schema (letsmesh-mqtt-auth.md / agessaman "packets")
+# packet_trafic_topic = "{prefix}/packets"
+# enable_raw_messages = false           # off by default; minimal envelope (agessaman "raw")
+# raw_topic = "{prefix}/raw"
+#
+# Connection protocol: "tcp" (default) or "websocket". websocket_path is
+# only used when transport_protocol = "websocket" (broker-specific, e.g.
+# "/mqtt", "/ws").
+# transport_protocol = "tcp"
+# websocket_path = "/mqtt"
+#
+# tls_enabled = false
+# tls_ca_cert = "/etc/mqtt/ca.pem"
+# tls_client_cert = "/etc/mqtt/client.pem"
+# tls_client_key = "/etc/mqtt/client.key"

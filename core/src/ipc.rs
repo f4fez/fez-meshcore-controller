@@ -109,6 +109,38 @@ pub struct Snapshot {
     /// used alongside the well-known "Public" channel to decode `GroupText`
     /// messages in the packet log.
     pub hashtag_channels: Vec<String>,
+    /// Configured MQTT brokers (see [`crate::config::Config::mqtt_brokers`])
+    /// and their live connection status, shown in the TUI's "Observer node"
+    /// block.
+    pub mqtt_brokers: Vec<MqttBrokerStatusDto>,
+}
+
+/// A configured MQTT broker's name and live connection status — see
+/// [`Snapshot::mqtt_brokers`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MqttBrokerStatusDto {
+    /// Matches [`crate::config::MqttBrokerConfig::name`].
+    pub name: String,
+    pub status: MqttBrokerStatus,
+}
+
+/// Live connection status of a configured MQTT broker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MqttBrokerStatus {
+    /// Not yet connected, or reconnecting after a drop.
+    #[default]
+    Connecting,
+    Connected,
+    /// A publish loop exited without a live connection (e.g. still waiting
+    /// for the first successful connect on daemon startup, before the
+    /// broker task's first status update).
+    Disconnected,
+    /// The last connection attempt failed; `reason` is the error, for
+    /// display (e.g. "connection refused", a TLS handshake failure).
+    Error {
+        reason: String,
+    },
 }
 
 /// Timestamped mesh event, as broadcast to clients.
@@ -182,5 +214,21 @@ mod tests {
         assert!(!snapshot.mesh_connected);
         assert!(snapshot.self_info.is_none());
         assert!(snapshot.contacts.is_empty());
+        assert!(snapshot.mqtt_brokers.is_empty());
+    }
+
+    #[test]
+    fn mqtt_broker_status_variants_roundtrip() {
+        assert_roundtrips_as_single_line(&MqttBrokerStatus::Connecting);
+        assert_roundtrips_as_single_line(&MqttBrokerStatus::Connected);
+        assert_roundtrips_as_single_line(&MqttBrokerStatus::Disconnected);
+        assert_roundtrips_as_single_line(&MqttBrokerStatus::Error {
+            reason: "connection refused".to_string(),
+        });
+    }
+
+    #[test]
+    fn mqtt_broker_status_default_is_connecting() {
+        assert_eq!(MqttBrokerStatus::default(), MqttBrokerStatus::Connecting);
     }
 }

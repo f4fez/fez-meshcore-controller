@@ -34,6 +34,7 @@ pub struct SelfInfoDto {
     pub name: String,
     pub public_key_hex: String,
     pub radio_freq_mhz: f64,
+    pub radio_bw_khz: f64,
     pub spreading_factor: u8,
     pub coding_rate: u8,
     pub tx_power_dbm: u8,
@@ -47,11 +48,37 @@ impl From<&SelfInfo> for SelfInfoDto {
             name: info.name.clone(),
             public_key_hex: hex_encode(&info.public_key),
             radio_freq_mhz: info.radio_freq as f64 / 1000.0,
+            radio_bw_khz: info.radio_bw as f64 / 1000.0,
             spreading_factor: info.sf,
             coding_rate: info.cr,
             tx_power_dbm: info.tx_power,
             lat: info.adv_lat as f64 / 1_000_000.0,
             lon: info.adv_lon as f64 / 1_000_000.0,
+        }
+    }
+}
+
+/// Device model/firmware info, ready to display — see
+/// [`MeshClient::device_info`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceInfoDto {
+    pub model: String,
+    pub firmware_version: String,
+}
+
+impl From<&meshcore_rs::events::DeviceInfoData> for DeviceInfoDto {
+    fn from(info: &meshcore_rs::events::DeviceInfoData) -> Self {
+        let model = info.model.clone().unwrap_or_else(|| "unknown".to_string());
+        let firmware_version = match (&info.version, &info.fw_build) {
+            (Some(version), Some(build)) => {
+                let version = version.strip_prefix('v').unwrap_or(version);
+                format!("v{version} (Build: {build})")
+            }
+            _ => "unknown".to_string(),
+        };
+        Self {
+            model,
+            firmware_version,
         }
     }
 }
@@ -171,6 +198,11 @@ pub struct PacketLogEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PacketHeaderInfo {
     pub route_type: String,
+    /// Raw numeric route type byte (see `meshcore_rs::packets::RouteType`),
+    /// preserved alongside the human-readable `route_type` string — needed
+    /// to reconstruct the original packet header byte for
+    /// [`reconstruct_raw_packet_hex`].
+    pub route_type_raw: u8,
     pub payload_type: String,
     /// Raw numeric payload type byte (see `meshcore_rs::packets::PayloadType`),
     /// preserved alongside the human-readable `payload_type` string —
@@ -361,7 +393,7 @@ fn extract_channel_hash(
 /// `None` for any other payload type, a too-short payload, or a
 /// non-`PAYLOAD_VER_1` payload version (same sizing caveat as
 /// [`extract_dest_src_hashes`]).
-fn extract_anon_req_sender_public_key(
+pub fn extract_anon_req_sender_public_key(
     payload_type: PayloadType,
     payload_version: u8,
     payload: &[u8],
@@ -390,7 +422,7 @@ fn extract_anon_req_sender_public_key(
 /// Returns `None` for any other payload type, a non-`PAYLOAD_VER_1`
 /// payload version, an unrecognized sub-type, or a payload too short to
 /// hold its sub-type's fixed fields.
-fn decode_control_payload(
+pub fn decode_control_payload(
     payload_type: PayloadType,
     payload_version: u8,
     payload: &[u8],
@@ -456,6 +488,7 @@ pub fn build_packet_log_entry(
         let control = decode_control_payload(h.payload_type, h.payload_version, &log.payload);
         PacketHeaderInfo {
             route_type: format!("{:?}", h.route_type),
+            route_type_raw: h.route_type as u8,
             payload_type: format!("{:?}", h.payload_type),
             payload_type_raw: h.payload_type as u8,
             payload_version: h.payload_version,
@@ -487,6 +520,32 @@ pub fn build_packet_log_entry(
         payload_hex: hex_encode(&log.payload),
         payload_len: log.payload.len(),
     })
+}
+
+/// Reconstructs the exact over-the-air packet bytes (as hex) a
+/// [`PacketLogEntry`] was decoded from — the inverse of
+/// `meshcore_rs::parsing::parse_mesh_packet_header`, whose header byte
+/// layout is bits 0-1 = route type, bits 2-5 = payload type, bits 6-7 =
+/// payload version, followed by an optional 4-byte transport code, a path
+/// byte (bits 6-7 = `path_hash_size - 1`, bits 0-5 = path length), the path
+/// hop hashes, then the inner payload. `None` if `entry.header` is `None`
+/// (payload too short to have contained a decodable header in the first
+/// place — nothing to reconstruct).
+pub fn reconstruct_raw_packet_hex(entry: &PacketLogEntry) -> Option<String> {
+    let header = entry.header.as_ref()?;
+    let header_byte = (header.payload_version << 6)
+        | ((header.payload_type_raw & 0x0F) << 2)
+        | (header.route_type_raw & 0x03);
+    let path_byte = (header.path_hash_size.saturating_sub(1) << 6) | (header.hops & 0x3F);
+
+    let mut raw_hex = hex_encode(&[header_byte]);
+    if let Some(transport_code_hex) = &header.transport_code_hex {
+        raw_hex.push_str(transport_code_hex);
+    }
+    raw_hex.push_str(&hex_encode(&[path_byte]));
+    raw_hex.push_str(&header.path_hex);
+    raw_hex.push_str(&entry.payload_hex);
+    Some(raw_hex)
 }
 
 /// Simplified, serializable version of a `meshcore-rs` event, as broadcast
@@ -633,6 +692,21 @@ impl MeshClient {
 
     pub async fn self_info(&self) -> Option<SelfInfoDto> {
         self.inner.self_info().await.as_ref().map(SelfInfoDto::from)
+    }
+
+    /// Queries the connected device for its model/firmware info. Unlike
+    /// [`Self::self_info`] (populated automatically on connect), this is an
+    /// explicit RPC — best-effort, `None` if the device doesn't answer.
+    pub async fn device_info(&self) -> Option<DeviceInfoDto> {
+        self.inner
+            .commands()
+            .lock()
+            .await
+            .send_device_query()
+            .await
+            .ok()
+            .as_ref()
+            .map(DeviceInfoDto::from)
     }
 
     pub async fn contacts(&self) -> Vec<ContactDto> {
@@ -1663,11 +1737,48 @@ mod tests {
         assert_eq!(dto.name, "Base station");
         assert_eq!(dto.public_key_hex, "cd".repeat(32));
         assert_eq!(dto.radio_freq_mhz, 869.525);
+        assert_eq!(dto.radio_bw_khz, 250.0);
         assert_eq!(dto.spreading_factor, 10);
         assert_eq!(dto.coding_rate, 5);
         assert_eq!(dto.tx_power_dbm, 22);
         assert_eq!(dto.lat, 48.85);
         assert_eq!(dto.lon, 2.35);
+    }
+
+    #[test]
+    fn device_info_dto_formats_firmware_version_and_strips_v_prefix() {
+        let info = meshcore_rs::events::DeviceInfoData {
+            fw_version_code: 3,
+            max_contacts: None,
+            max_channels: None,
+            ble_pin: None,
+            fw_build: Some("06-Jun-2026".to_string()),
+            model: Some("Seeed Xiao-nrf52".to_string()),
+            version: Some("v1.16.0-07a3ca9".to_string()),
+            repeat: None,
+        };
+        let dto = DeviceInfoDto::from(&info);
+
+        assert_eq!(dto.model, "Seeed Xiao-nrf52");
+        assert_eq!(dto.firmware_version, "v1.16.0-07a3ca9 (Build: 06-Jun-2026)");
+    }
+
+    #[test]
+    fn device_info_dto_falls_back_to_unknown_when_fields_missing() {
+        let info = meshcore_rs::events::DeviceInfoData {
+            fw_version_code: 1,
+            max_contacts: None,
+            max_channels: None,
+            ble_pin: None,
+            fw_build: None,
+            model: None,
+            version: None,
+            repeat: None,
+        };
+        let dto = DeviceInfoDto::from(&info);
+
+        assert_eq!(dto.model, "unknown");
+        assert_eq!(dto.firmware_version, "unknown");
     }
 
     #[test]
@@ -1705,5 +1816,77 @@ mod tests {
         assert!(is_repeater_or_room(3)); // Room
         assert!(!is_repeater_or_room(4)); // Sensor
         assert!(!is_repeater_or_room(0));
+    }
+
+    // --- reconstruct_raw_packet_hex ----------------------------------------
+
+    #[test]
+    fn reconstruct_raw_packet_hex_round_trips_through_the_real_parser() {
+        // header_byte: version=1 (bits 6-7) | TextMsg=2 (bits 2-5) | Direct=2 (bits 0-1)
+        //            = 0b01_0010_10 = 0x4A
+        let mut raw = vec![0x4Au8];
+        // path_byte: path_hash_size=1 -> (1-1)<<6=0, path_len=2 -> 0x02
+        raw.push(0x02);
+        raw.extend_from_slice(&[0x11, 0x22]); // path (path_len=2, path_hash_size=1)
+        raw.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]); // inner payload
+
+        let (header, remaining) =
+            meshcore_rs::parsing::parse_mesh_packet_header(&raw).expect("decodable header");
+        let log = LogData {
+            snr: 1.0,
+            rssi: -80,
+            header: Some(header),
+            advertisement: None,
+            payload: remaining.to_vec(),
+        };
+        let entry =
+            build_packet_log_entry(&event(EventType::LogData, EventPayload::LogData(log)), 1, 0)
+                .unwrap();
+
+        let reconstructed = reconstruct_raw_packet_hex(&entry).expect("should reconstruct");
+        assert_eq!(reconstructed, hex_encode(&raw));
+    }
+
+    #[test]
+    fn reconstruct_raw_packet_hex_round_trips_with_a_transport_code() {
+        // header_byte: version=0 | Advert=4 (bits 2-5) | TransportFlood=0 (bits 0-1)
+        //            = 0b00_0100_00 = 0x10
+        let mut raw = vec![0x10u8];
+        raw.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]); // transport code
+        raw.push(0x41); // path_hash_size=2 ((2-1)<<6=0x40), path_len=1
+        raw.extend_from_slice(&[0x33, 0x44]); // single 2-byte path hop hash
+        raw.extend_from_slice(&[0x01, 0x02]); // inner payload
+
+        let (header, remaining) =
+            meshcore_rs::parsing::parse_mesh_packet_header(&raw).expect("decodable header");
+        let log = LogData {
+            snr: 1.0,
+            rssi: -80,
+            header: Some(header),
+            advertisement: None,
+            payload: remaining.to_vec(),
+        };
+        let entry =
+            build_packet_log_entry(&event(EventType::LogData, EventPayload::LogData(log)), 1, 0)
+                .unwrap();
+
+        let reconstructed = reconstruct_raw_packet_hex(&entry).expect("should reconstruct");
+        assert_eq!(reconstructed, hex_encode(&raw));
+    }
+
+    #[test]
+    fn reconstruct_raw_packet_hex_none_when_header_is_none() {
+        let log = LogData {
+            snr: 1.0,
+            rssi: -80,
+            header: None,
+            advertisement: None,
+            payload: vec![],
+        };
+        let entry =
+            build_packet_log_entry(&event(EventType::LogData, EventPayload::LogData(log)), 1, 0)
+                .unwrap();
+
+        assert!(reconstruct_raw_packet_hex(&entry).is_none());
     }
 }

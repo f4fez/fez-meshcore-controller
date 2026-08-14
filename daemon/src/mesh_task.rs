@@ -54,6 +54,7 @@ pub async fn run(
                     snap.self_info = client.self_info().await;
                     snap.generated_at_unix = now_unix();
                 }
+                state.set_device_info(client.device_info().await).await;
                 refresh_snapshot_contacts(&client, &state).await;
                 state.broadcast_event(MeshEvent {
                     at_unix: now_unix(),
@@ -83,6 +84,14 @@ pub async fn run(
                                     {
                                         state.record_packet(entry).await;
                                     }
+
+                                    // Every raw event, regardless of whether
+                                    // `map_event` below recognizes it —
+                                    // MQTT forwarding (see `crate::mqtt`)
+                                    // covers some event types (e.g. Control,
+                                    // AnonReq, both carried via LogData) that
+                                    // `MeshEventKind` doesn't.
+                                    state.broadcast_raw_event(Arc::new(raw.clone()));
 
                                     let Some(kind) = map_event(&raw) else { continue };
                                     let is_disconnect = matches!(kind, MeshEventKind::Disconnected);
@@ -541,6 +550,7 @@ mod tests {
             managed_repeaters,
             regions: vec![],
             hashtag_channels: vec![],
+            mqtt_brokers: vec![],
         };
         let state = AppState::new(command_tx, config, config_path);
         (state, dir)

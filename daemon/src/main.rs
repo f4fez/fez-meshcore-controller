@@ -15,6 +15,7 @@
 mod command;
 mod lock;
 mod mesh_task;
+mod mqtt;
 mod server;
 mod state;
 
@@ -103,6 +104,7 @@ async fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
     let refresh_interval = Duration::from_secs(config.daemon.refresh_interval_secs.max(1));
     let connection = config.connection.clone();
     let socket_path = config.daemon.socket_path.clone();
+    let mqtt_brokers = config.mqtt_brokers.clone();
 
     let state = Arc::new(AppState::new(command_tx, config, config_path));
 
@@ -113,6 +115,15 @@ async fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
         command_rx,
         mesh_state,
     ));
+
+    // A broker outage must not affect the mesh connection, the IPC server,
+    // or other brokers, so these tasks are fire-and-forget: not joined via
+    // the `select!` below (mirrors `mesh_task::run`'s own
+    // reconnect-forever style, just one level up).
+    for broker in mqtt_brokers {
+        let broker_state = state.clone();
+        tokio::spawn(mqtt::run_broker(broker, broker_state));
+    }
 
     let server_state = state.clone();
     let server_socket_path = socket_path.clone();

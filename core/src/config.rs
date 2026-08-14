@@ -50,6 +50,164 @@ pub struct Config {
     /// guesses the channel name can derive the key."
     #[serde(default)]
     pub hashtag_channels: Vec<String>,
+    /// MQTT brokers to forward received mesh events to, in the same topic
+    /// structure and JSON envelope as the community `ipnet-mesh/meshcore-mqtt`
+    /// bridge (verified against its source, not assumed) plus two extra
+    /// topics (`<prefix>/control`, `<prefix>/anon_req`) this project also
+    /// decodes. Local to this controller — the connected node itself has no
+    /// notion of MQTT.
+    #[serde(default)]
+    pub mqtt_brokers: Vec<MqttBrokerConfig>,
+}
+
+/// An MQTT broker to forward received mesh events to — see
+/// [`Config::mqtt_brokers`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MqttBrokerConfig {
+    /// Internal identification for this broker (shown in the TUI's Observer
+    /// node block); not part of the MQTT protocol itself.
+    pub name: String,
+    pub host: String,
+    #[serde(default = "default_mqtt_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Stored in plaintext, like the rest of this config file — there is no
+    /// secret-encryption mechanism here today.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Prefix prepended to every published topic (`<prefix>/advertisement`,
+    /// `<prefix>/status`, ...), matching `ipnet-mesh/meshcore-mqtt`'s own
+    /// `topic_prefix` config key.
+    #[serde(default = "default_mqtt_topic_prefix")]
+    pub topic_prefix: String,
+    #[serde(default)]
+    pub tls_enabled: bool,
+    /// Path to a CA certificate to trust, in addition to the system's own
+    /// trust store. `None` with `tls_enabled` still gets a TLS connection,
+    /// just without a custom CA.
+    #[serde(default)]
+    pub tls_ca_cert: Option<PathBuf>,
+    /// Client certificate for mutual TLS. Requires `tls_client_key` too.
+    #[serde(default)]
+    pub tls_client_cert: Option<PathBuf>,
+    /// Private key for `tls_client_cert`.
+    #[serde(default)]
+    pub tls_client_key: Option<PathBuf>,
+    /// How often (in seconds) to republish the retained `<prefix>/status`
+    /// message while connected, so its `timestamp` stays fresh for
+    /// consumers watching that topic — matches
+    /// `agessaman/meshcore-packet-capture`'s own `STATS_REFRESH_INTERVAL`
+    /// default. `0` disables the periodic republish (status is still
+    /// published on connect/disconnect transitions).
+    #[serde(default = "default_mqtt_status_refresh_interval_secs")]
+    pub status_refresh_interval_secs: u32,
+    /// Whether to publish the decoded-event topics and the `<prefix>/status`
+    /// topic at all. `false` mutes this broker entirely (the connection is
+    /// still made, but nothing is ever published) — useful for a broker
+    /// added in advance of enabling forwarding, or temporarily silenced
+    /// without removing its configuration.
+    #[serde(default = "default_mqtt_enable_high_level_messages")]
+    pub enable_high_level_messages: bool,
+    /// Whether to publish the rich `"PACKET"`-schema raw-packet topic (every
+    /// overheard packet, decoded metadata + raw hex — matches the format
+    /// documented by `Colorado-Mesh/mesh-client`'s `letsmesh-mqtt-auth.md`
+    /// and `agessaman/meshcore-packet-capture`'s own `packets` topic).
+    #[serde(default = "default_mqtt_enable_packet_trafic_messages")]
+    pub enable_packet_trafic_messages: bool,
+    /// Topic route for [`Self::enable_packet_trafic_messages`]. Supports
+    /// `{prefix}` (this broker's `topic_prefix`) and `{public_key}` (this
+    /// node's own uppercase public key hex) placeholders.
+    #[serde(default = "default_mqtt_packet_trafic_topic")]
+    pub packet_trafic_topic: String,
+    /// Whether to publish the minimal `"RAW"`-envelope topic
+    /// (`agessaman/meshcore-packet-capture`'s own separate, opt-in-only
+    /// `raw` topic — just `{origin, origin_id, timestamp, type, data}`,
+    /// `data` being the raw packet hex). Off by default, unlike the other
+    /// MQTT topics — matches `agessaman`'s own default (no built-in topic
+    /// route for it unless explicitly configured).
+    #[serde(default)]
+    pub enable_raw_messages: bool,
+    /// Topic route for [`Self::enable_raw_messages`]. Same `{prefix}`/
+    /// `{public_key}` placeholders as [`Self::packet_trafic_topic`].
+    #[serde(default = "default_mqtt_raw_topic")]
+    pub raw_topic: String,
+    /// Topic route for the `<prefix>/status` topic. Same `{prefix}`/
+    /// `{public_key}` placeholders as [`Self::packet_trafic_topic`] —
+    /// needed to match consumers (e.g.
+    /// `yellowcooln/meshcore-mqtt-live-map`) that require a node-id segment
+    /// in every topic, including status.
+    #[serde(default = "default_mqtt_status_topic")]
+    pub status_topic: String,
+    /// Connection protocol to the broker.
+    #[serde(default)]
+    pub transport_protocol: MqttTransportProtocol,
+    /// URL path for the WebSocket connection (e.g. `/mqtt`, `/ws`) — only
+    /// used when [`Self::transport_protocol`] is
+    /// [`MqttTransportProtocol::Websocket`]. Broker-specific; there is no
+    /// universal default across MQTT-over-WebSocket providers.
+    #[serde(default = "default_mqtt_websocket_path")]
+    pub websocket_path: String,
+}
+
+/// Connection protocol to an MQTT broker — see
+/// [`MqttBrokerConfig::transport_protocol`]. TLS is layered on top via the
+/// existing [`MqttBrokerConfig::tls_enabled`] (`Tcp`+TLS = `mqtts`-style
+/// secure TCP; `Websocket`+TLS = `wss`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MqttTransportProtocol {
+    #[default]
+    Tcp,
+    Websocket,
+}
+
+/// Default MQTT broker port (`ipnet-mesh/meshcore-mqtt`'s own default).
+pub fn default_mqtt_port() -> u16 {
+    1883
+}
+
+/// Default MQTT topic prefix (`ipnet-mesh/meshcore-mqtt`'s own default).
+pub fn default_mqtt_topic_prefix() -> String {
+    "meshcore".to_string()
+}
+
+/// Default MQTT status heartbeat interval, in seconds
+/// (`agessaman/meshcore-packet-capture`'s own `STATS_REFRESH_INTERVAL` default).
+pub fn default_mqtt_status_refresh_interval_secs() -> u32 {
+    300
+}
+
+/// Default for [`MqttBrokerConfig::enable_high_level_messages`] — publish by
+/// default once a broker is configured.
+pub fn default_mqtt_enable_high_level_messages() -> bool {
+    true
+}
+
+/// Default for [`MqttBrokerConfig::enable_packet_trafic_messages`] — on by
+/// default, matching the user's request for the primary raw-packet topic.
+pub fn default_mqtt_enable_packet_trafic_messages() -> bool {
+    true
+}
+
+/// Default topic route for [`MqttBrokerConfig::packet_trafic_topic`].
+pub fn default_mqtt_packet_trafic_topic() -> String {
+    "{prefix}/packets".to_string()
+}
+
+/// Default topic route for [`MqttBrokerConfig::raw_topic`].
+pub fn default_mqtt_raw_topic() -> String {
+    "{prefix}/raw".to_string()
+}
+
+/// Default topic route for [`MqttBrokerConfig::status_topic`].
+pub fn default_mqtt_status_topic() -> String {
+    "{prefix}/status".to_string()
+}
+
+/// Default WebSocket path for [`MqttBrokerConfig::websocket_path`].
+pub fn default_mqtt_websocket_path() -> String {
+    "/mqtt".to_string()
 }
 
 /// A region in the cluster's hierarchy, mirroring the MeshCore node
@@ -247,6 +405,27 @@ mod tests {
                 },
             ],
             hashtag_channels: vec!["#test".to_string()],
+            mqtt_brokers: vec![MqttBrokerConfig {
+                name: "Home Assistant".to_string(),
+                host: "mqtt.example.com".to_string(),
+                port: 8883,
+                username: Some("fez".to_string()),
+                password: Some("hunter2".to_string()),
+                topic_prefix: "meshcore".to_string(),
+                tls_enabled: true,
+                tls_ca_cert: Some(PathBuf::from("/etc/mqtt/ca.pem")),
+                tls_client_cert: None,
+                tls_client_key: None,
+                status_refresh_interval_secs: 300,
+                enable_high_level_messages: true,
+                enable_packet_trafic_messages: true,
+                packet_trafic_topic: "{prefix}/packets".to_string(),
+                enable_raw_messages: false,
+                raw_topic: "{prefix}/raw".to_string(),
+                status_topic: "{prefix}/status".to_string(),
+                transport_protocol: MqttTransportProtocol::Tcp,
+                websocket_path: "/mqtt".to_string(),
+            }],
         }
     }
 
@@ -331,6 +510,7 @@ mod tests {
         assert_eq!(loaded.regions[1].name, "France");
         assert_eq!(loaded.regions[1].parent.as_deref(), Some("World"));
         assert_eq!(loaded.hashtag_channels, vec!["#test".to_string()]);
+        assert_eq!(loaded.mqtt_brokers, original.mqtt_brokers);
         match loaded.connection {
             ConnectionConfig::Serial { port, baud_rate } => {
                 assert_eq!(port, "/dev/ttyUSB0");
@@ -361,6 +541,7 @@ mod tests {
         assert!(config.managed_repeaters.is_empty());
         assert!(config.regions.is_empty());
         assert!(config.hashtag_channels.is_empty());
+        assert!(config.mqtt_brokers.is_empty());
         assert_eq!(config.daemon.packet_log_capacity, 500);
         assert_eq!(config.daemon.discovered_nodes_capacity, 200);
         assert_eq!(config.daemon.log_dir, default_log_dir());
@@ -381,5 +562,59 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("does-not-exist.toml");
         assert!(Config::load_from(&path).is_err());
+    }
+
+    #[test]
+    fn mqtt_broker_config_defaults_port_and_topic_prefix_when_omitted() {
+        let toml = r#"
+            name = "Home Assistant"
+            host = "mqtt.example.com"
+        "#;
+        let broker: MqttBrokerConfig = toml::from_str(toml).expect("parse minimal broker");
+        assert_eq!(broker.port, 1883);
+        assert_eq!(broker.topic_prefix, "meshcore");
+        assert_eq!(broker.username, None);
+        assert_eq!(broker.password, None);
+        assert!(!broker.tls_enabled);
+        assert_eq!(broker.tls_ca_cert, None);
+        assert_eq!(broker.status_refresh_interval_secs, 300);
+        assert!(broker.enable_high_level_messages);
+        assert!(broker.enable_packet_trafic_messages);
+        assert_eq!(broker.packet_trafic_topic, "{prefix}/packets");
+        assert!(!broker.enable_raw_messages);
+        assert_eq!(broker.raw_topic, "{prefix}/raw");
+        assert_eq!(broker.status_topic, "{prefix}/status");
+        assert_eq!(broker.transport_protocol, MqttTransportProtocol::Tcp);
+        assert_eq!(broker.websocket_path, "/mqtt");
+    }
+
+    #[test]
+    fn mqtt_broker_config_round_trips_tls_settings() {
+        let broker = MqttBrokerConfig {
+            name: "Home Assistant".to_string(),
+            host: "mqtt.example.com".to_string(),
+            port: 8883,
+            username: Some("fez".to_string()),
+            password: Some("hunter2".to_string()),
+            topic_prefix: "meshcore".to_string(),
+            tls_enabled: true,
+            tls_ca_cert: Some(PathBuf::from("/etc/mqtt/ca.pem")),
+            tls_client_cert: Some(PathBuf::from("/etc/mqtt/client.pem")),
+            tls_client_key: Some(PathBuf::from("/etc/mqtt/client.key")),
+            status_refresh_interval_secs: 600,
+            enable_high_level_messages: false,
+            enable_packet_trafic_messages: false,
+            packet_trafic_topic: "custom/packets".to_string(),
+            enable_raw_messages: true,
+            raw_topic: "custom/raw".to_string(),
+            status_topic: "custom/status".to_string(),
+            transport_protocol: MqttTransportProtocol::Websocket,
+            websocket_path: "/ws".to_string(),
+        };
+
+        let toml = toml::to_string_pretty(&broker).expect("serialize");
+        let reloaded: MqttBrokerConfig = toml::from_str(&toml).expect("deserialize");
+
+        assert_eq!(reloaded, broker);
     }
 }

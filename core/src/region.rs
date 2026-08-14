@@ -119,6 +119,7 @@ mod tests {
     fn header(transport_code_hex: Option<&str>) -> PacketHeaderInfo {
         PacketHeaderInfo {
             route_type: "TransportFlood".to_string(),
+            route_type_raw: 0,
             payload_type: "TextMsg".to_string(),
             payload_type_raw: 2,
             payload_version: 0,

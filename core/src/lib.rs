@@ -28,5 +28,8 @@ pub mod mesh;
 pub mod meshcore_crypto;
 pub mod region;
 
-pub use config::{Config, ConnectionConfig, DaemonConfig, ManagedRepeater, RegionConfig};
+pub use config::{
+    Config, ConnectionConfig, DaemonConfig, ManagedRepeater, MqttBrokerConfig,
+    MqttTransportProtocol, RegionConfig,
+};
 pub use error::{Error, Result};

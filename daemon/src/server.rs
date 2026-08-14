@@ -177,6 +177,24 @@ async fn current_snapshot(state: &Arc<AppState>) -> fez_mesh_controller_core::ip
     let config = state.config.read().await;
     snap.regions = config.regions.clone();
     snap.hashtag_channels = config.hashtag_channels.clone();
+
+    let broker_status = state.mqtt_broker_status.read().await;
+    snap.mqtt_brokers = config
+        .mqtt_brokers
+        .iter()
+        .map(
+            |broker| fez_mesh_controller_core::ipc::MqttBrokerStatusDto {
+                name: broker.name.clone(),
+                // A broker not yet in the status map hasn't had its first
+                // status update from its worker task (see `crate::mqtt`) yet.
+                status: broker_status
+                    .get(&broker.name)
+                    .cloned()
+                    .unwrap_or(fez_mesh_controller_core::ipc::MqttBrokerStatus::Connecting),
+            },
+        )
+        .collect();
+
     snap
 }
 
@@ -218,6 +236,7 @@ mod tests {
             managed_repeaters: vec![],
             regions: vec![],
             hashtag_channels: vec![],
+            mqtt_brokers: vec![],
         };
         let state = Arc::new(AppState::new(
             command_tx,
@@ -328,6 +347,7 @@ mod tests {
                 parent: None,
             }],
             hashtag_channels: vec![],
+            mqtt_brokers: vec![],
         };
         let state = Arc::new(AppState::new(
             command_tx,
@@ -339,6 +359,101 @@ mod tests {
 
         assert_eq!(snap.regions.len(), 1);
         assert_eq!(snap.regions[0].name, "World");
+    }
+
+    #[tokio::test]
+    async fn current_snapshot_includes_configured_mqtt_brokers_with_live_status() {
+        use fez_mesh_controller_core::ipc::{MqttBrokerStatus, MqttBrokerStatusDto};
+        use fez_mesh_controller_core::MqttBrokerConfig;
+
+        let (command_tx, _command_rx) = mpsc::channel(8);
+        let config = Config {
+            node_label: "test-node".to_string(),
+            connection: ConnectionConfig::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: 5000,
+            },
+            daemon: DaemonConfig {
+                socket_path: PathBuf::from("/tmp/fez-mesh-controller-test.sock"),
+                refresh_interval_secs: 5,
+                log_level: "info".to_string(),
+                log_dir: PathBuf::from("/tmp/fez-mesh-controller-test/logs"),
+                packet_log_capacity: 500,
+                discovered_nodes_capacity: 200,
+            },
+            managed_repeaters: vec![],
+            regions: vec![],
+            hashtag_channels: vec![],
+            mqtt_brokers: vec![
+                MqttBrokerConfig {
+                    name: "Home Assistant".to_string(),
+                    host: "mqtt.example.com".to_string(),
+                    port: 1883,
+                    username: None,
+                    password: None,
+                    topic_prefix: "meshcore".to_string(),
+                    tls_enabled: false,
+                    tls_ca_cert: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
+                    status_refresh_interval_secs: 300,
+                    enable_high_level_messages: true,
+                    enable_packet_trafic_messages: true,
+                    packet_trafic_topic: "{prefix}/packets".to_string(),
+                    enable_raw_messages: false,
+                    raw_topic: "{prefix}/raw".to_string(),
+                    status_topic: "{prefix}/status".to_string(),
+                    transport_protocol: fez_mesh_controller_core::MqttTransportProtocol::Tcp,
+                    websocket_path: "/mqtt".to_string(),
+                },
+                MqttBrokerConfig {
+                    name: "Not Yet Reported".to_string(),
+                    host: "other.example.com".to_string(),
+                    port: 1883,
+                    username: None,
+                    password: None,
+                    topic_prefix: "meshcore".to_string(),
+                    tls_enabled: false,
+                    tls_ca_cert: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
+                    status_refresh_interval_secs: 300,
+                    enable_high_level_messages: true,
+                    enable_packet_trafic_messages: true,
+                    packet_trafic_topic: "{prefix}/packets".to_string(),
+                    enable_raw_messages: false,
+                    raw_topic: "{prefix}/raw".to_string(),
+                    status_topic: "{prefix}/status".to_string(),
+                    transport_protocol: fez_mesh_controller_core::MqttTransportProtocol::Tcp,
+                    websocket_path: "/mqtt".to_string(),
+                },
+            ],
+        };
+        let state = Arc::new(AppState::new(
+            command_tx,
+            config,
+            PathBuf::from("/tmp/fez-mesh-controller-test.toml"),
+        ));
+        state
+            .set_mqtt_broker_status("Home Assistant", MqttBrokerStatus::Connected)
+            .await;
+
+        let snap = current_snapshot(&state).await;
+
+        assert_eq!(
+            snap.mqtt_brokers,
+            vec![
+                MqttBrokerStatusDto {
+                    name: "Home Assistant".to_string(),
+                    status: MqttBrokerStatus::Connected,
+                },
+                // No status reported yet for this one: defaults to Connecting.
+                MqttBrokerStatusDto {
+                    name: "Not Yet Reported".to_string(),
+                    status: MqttBrokerStatus::Connecting,
+                },
+            ]
+        );
     }
 
     #[tokio::test]

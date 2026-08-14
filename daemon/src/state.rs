@@ -15,11 +15,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
-use fez_mesh_controller_core::ipc::{MeshEvent, Snapshot};
-use fez_mesh_controller_core::mesh::{DiscoveredNode, PacketLogEntry};
+use fez_mesh_controller_core::ipc::{MeshEvent, MqttBrokerStatus, Snapshot};
+use fez_mesh_controller_core::mesh::{DeviceInfoDto, DiscoveredNode, PacketLogEntry};
 use fez_mesh_controller_core::Config;
+use meshcore_rs::MeshCoreEvent;
 use tokio::sync::{broadcast, mpsc, RwLock};
 
 use crate::command::DaemonCommand;
@@ -50,6 +52,20 @@ pub struct AppState {
     pub packet_log_capacity: usize,
     pub packet_log_tx: broadcast::Sender<PacketLogEntry>,
     next_packet_id: AtomicU64,
+    /// Every raw event the mesh connection receives, broadcast for any
+    /// number of MQTT broker worker tasks (see `crate::mqtt`) to forward.
+    /// `Arc`-wrapped since `MeshCoreEvent` can be non-trivial and each
+    /// configured broker holds its own clone of the receiver.
+    pub raw_events_tx: broadcast::Sender<Arc<MeshCoreEvent>>,
+    /// Live connection status of each configured MQTT broker, keyed by
+    /// [`fez_mesh_controller_core::config::MqttBrokerConfig::name`] —
+    /// updated by that broker's own worker task, read by
+    /// [`crate::server::run`] to populate [`Snapshot::mqtt_brokers`].
+    pub mqtt_broker_status: RwLock<HashMap<String, MqttBrokerStatus>>,
+    /// The connected device's model/firmware info, queried once per
+    /// connection (see `crate::mesh_task::run`) — consumed by
+    /// `crate::mqtt`'s status message, not exposed over IPC.
+    pub device_info: RwLock<Option<DeviceInfoDto>>,
 }
 
 impl AppState {
@@ -60,6 +76,7 @@ impl AppState {
     ) -> Self {
         let (events_tx, _rx) = broadcast::channel(256);
         let (packet_log_tx, _rx) = broadcast::channel(256);
+        let (raw_events_tx, _rx) = broadcast::channel(256);
         let packet_log_capacity = config.daemon.packet_log_capacity.max(1);
         let discovered_repeaters_capacity = config.daemon.discovered_nodes_capacity.max(1);
         Self {
@@ -75,6 +92,9 @@ impl AppState {
             packet_log_capacity,
             packet_log_tx,
             next_packet_id: AtomicU64::new(1),
+            raw_events_tx,
+            mqtt_broker_status: RwLock::new(HashMap::new()),
+            device_info: RwLock::new(None),
         }
     }
 
@@ -86,6 +106,28 @@ impl AppState {
     /// nobody is listening).
     pub fn broadcast_event(&self, event: MeshEvent) {
         let _ = self.events_tx.send(event);
+    }
+
+    /// Broadcasts a raw mesh event to any MQTT broker worker tasks
+    /// (silently dropped if none are configured/subscribed).
+    pub fn broadcast_raw_event(&self, event: Arc<MeshCoreEvent>) {
+        let _ = self.raw_events_tx.send(event);
+    }
+
+    /// Records a configured MQTT broker's current connection status, read
+    /// back by [`crate::server::run`] to populate
+    /// [`fez_mesh_controller_core::ipc::Snapshot::mqtt_brokers`].
+    pub async fn set_mqtt_broker_status(&self, name: &str, status: MqttBrokerStatus) {
+        self.mqtt_broker_status
+            .write()
+            .await
+            .insert(name.to_string(), status);
+    }
+
+    /// Records the connected device's model/firmware info, read back by
+    /// `crate::mqtt` when building the MQTT status message.
+    pub async fn set_device_info(&self, info: Option<DeviceInfoDto>) {
+        *self.device_info.write().await = info;
     }
 
     pub fn next_packet_id(&self) -> u64 {
@@ -154,6 +196,7 @@ mod tests {
             managed_repeaters: vec![],
             regions: vec![],
             hashtag_channels: vec![],
+            mqtt_brokers: vec![],
         };
         AppState::new(
             command_tx,
@@ -193,6 +236,7 @@ mod tests {
             managed_repeaters: vec![],
             regions: vec![],
             hashtag_channels: vec![],
+            mqtt_brokers: vec![],
         };
         AppState::new(
             command_tx,
@@ -246,6 +290,7 @@ mod tests {
             managed_repeaters: vec![],
             regions: vec![],
             hashtag_channels: vec![],
+            mqtt_brokers: vec![],
         };
         let state = AppState::new(command_tx, config, PathBuf::from("/tmp/x.toml"));
         assert_eq!(state.packet_log_capacity, 1);
@@ -283,6 +328,72 @@ mod tests {
             at_unix: 0,
             kind: MeshEventKind::Connected,
         });
+    }
+
+    fn sample_raw_event() -> MeshCoreEvent {
+        MeshCoreEvent {
+            event_type: meshcore_rs::EventType::Connected,
+            payload: meshcore_rs::EventPayload::None,
+            attributes: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn broadcast_raw_event_without_subscribers_does_not_panic() {
+        let state = make_state(500);
+        state.broadcast_raw_event(Arc::new(sample_raw_event()));
+    }
+
+    #[tokio::test]
+    async fn broadcast_raw_event_reaches_subscribers() {
+        let state = make_state(500);
+        let mut rx = state.raw_events_tx.subscribe();
+
+        state.broadcast_raw_event(Arc::new(sample_raw_event()));
+
+        let received = rx.try_recv().expect("should have received the event");
+        assert_eq!(received.event_type, meshcore_rs::EventType::Connected);
+    }
+
+    #[tokio::test]
+    async fn set_mqtt_broker_status_updates_and_overwrites() {
+        let state = make_state(500);
+
+        state
+            .set_mqtt_broker_status("Home Assistant", MqttBrokerStatus::Connecting)
+            .await;
+        assert_eq!(
+            state.mqtt_broker_status.read().await["Home Assistant"],
+            MqttBrokerStatus::Connecting
+        );
+
+        state
+            .set_mqtt_broker_status("Home Assistant", MqttBrokerStatus::Connected)
+            .await;
+        assert_eq!(
+            state.mqtt_broker_status.read().await["Home Assistant"],
+            MqttBrokerStatus::Connected
+        );
+    }
+
+    #[tokio::test]
+    async fn set_device_info_updates_and_overwrites() {
+        let state = make_state(500);
+        assert!(state.device_info.read().await.is_none());
+
+        state
+            .set_device_info(Some(DeviceInfoDto {
+                model: "Seeed Xiao-nrf52".to_string(),
+                firmware_version: "v1.16.0 (Build: 06-Jun-2026)".to_string(),
+            }))
+            .await;
+        assert_eq!(
+            state.device_info.read().await.as_ref().unwrap().model,
+            "Seeed Xiao-nrf52"
+        );
+
+        state.set_device_info(None).await;
+        assert!(state.device_info.read().await.is_none());
     }
 
     #[tokio::test]

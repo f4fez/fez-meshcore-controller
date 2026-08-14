@@ -189,6 +189,7 @@ mod tests {
             rssi: -90,
             header: Some(PacketHeaderInfo {
                 route_type: "Flood".to_string(),
+                route_type_raw: 1,
                 payload_type: payload_type.to_string(),
                 payload_type_raw: 0,
                 payload_version: 0,

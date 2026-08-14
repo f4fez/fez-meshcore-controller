@@ -16,6 +16,7 @@
 //! configuration file is found (or explicitly via `fez-mesh-controller
 //! setup`).
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use console::style;
@@ -25,8 +26,11 @@ use crossterm::terminal::{
 };
 use crossterm::{execute, ExecutableCommand};
 use dialoguer::theme::ColorfulTheme;
-use dialoguer::{Confirm, Input, Select};
-use fez_mesh_controller_core::{region, Config, ConnectionConfig, DaemonConfig, RegionConfig};
+use dialoguer::{Confirm, Input, Password, Select};
+use fez_mesh_controller_core::{
+    region, Config, ConnectionConfig, DaemonConfig, MqttBrokerConfig, MqttTransportProtocol,
+    RegionConfig,
+};
 use indicatif::{ProgressBar, ProgressStyle};
 use names::Generator;
 use ratatui::backend::CrosstermBackend;
@@ -101,6 +105,8 @@ pub async fn run(existing: Option<&Config>) -> anyhow::Result<Config> {
     let hashtag_channels = existing
         .map(|c| c.hashtag_channels.clone())
         .unwrap_or_default();
+    let existing_mqtt_brokers = existing.map(|c| c.mqtt_brokers.as_slice()).unwrap_or(&[]);
+    let mqtt_brokers = ask_mqtt_brokers(existing_mqtt_brokers, &dtheme)?;
 
     let config = Config {
         node_label,
@@ -117,6 +123,7 @@ pub async fn run(existing: Option<&Config>) -> anyhow::Result<Config> {
         managed_repeaters,
         regions,
         hashtag_channels,
+        mqtt_brokers,
     };
 
     println!();
@@ -365,6 +372,182 @@ fn ask_regions(
     }
 
     Ok(regions_from_outline(&outline))
+}
+
+/// Interactively builds the list of MQTT brokers to forward received mesh
+/// events to (`Config::mqtt_brokers`) — same topics/JSON format as the
+/// community `meshcore-mqtt` bridge, see `daemon/src/mqtt.rs`. A
+/// `Confirm`-driven "add another?" loop, since (unlike regions, a flat
+/// list of names) each broker needs several fields.
+fn ask_mqtt_brokers(
+    existing: &[MqttBrokerConfig],
+    dtheme: &ColorfulTheme,
+) -> anyhow::Result<Vec<MqttBrokerConfig>> {
+    println!();
+    println!(
+        "{} {}",
+        style("📡").bold(),
+        primary().apply_to("MQTT brokers")
+    );
+    println!(
+        "  {}",
+        muted().apply_to("Forward received mesh events to MQTT brokers, using the same topics")
+    );
+    println!(
+        "  {}",
+        muted().apply_to("and message format as the community meshcore-mqtt bridge. Passwords are")
+    );
+    println!(
+        "  {}",
+        muted().apply_to("stored in plaintext in config.toml, like the rest of this file.")
+    );
+
+    let mut brokers = existing.to_vec();
+
+    loop {
+        let prompt = if brokers.is_empty() {
+            "➕ Add an MQTT broker?"
+        } else {
+            "➕ Add another MQTT broker?"
+        };
+        let add_one = Confirm::with_theme(dtheme)
+            .with_prompt(prompt)
+            .default(false)
+            .interact()?;
+        if !add_one {
+            break;
+        }
+
+        let name: String = Input::with_theme(dtheme)
+            .with_prompt("🏷️  Broker name (internal identification)")
+            .interact_text()?;
+
+        let host: String = Input::with_theme(dtheme)
+            .with_prompt("🌐 Broker host")
+            .interact_text()?;
+
+        let port: u16 = Input::with_theme(dtheme)
+            .with_prompt("🔢 Broker port")
+            .default(fez_mesh_controller_core::config::default_mqtt_port())
+            .interact_text()?;
+
+        let protocol_options = ["📡 TCP", "🔌 WebSocket"];
+        let protocol_choice = Select::with_theme(dtheme)
+            .with_prompt("🔗 Connection protocol")
+            .items(&protocol_options)
+            .default(0)
+            .interact()?;
+        let (transport_protocol, websocket_path) = if protocol_choice == 1 {
+            let path: String = Input::with_theme(dtheme)
+                .with_prompt("🔀 WebSocket path (broker-specific, e.g. /mqtt, /ws)")
+                .default(fez_mesh_controller_core::config::default_mqtt_websocket_path())
+                .interact_text()?;
+            (MqttTransportProtocol::Websocket, path)
+        } else {
+            (
+                MqttTransportProtocol::Tcp,
+                fez_mesh_controller_core::config::default_mqtt_websocket_path(),
+            )
+        };
+
+        let username = ask_optional_text(dtheme, "👤 Username (leave empty for none)")?;
+        let password = if username.is_some() {
+            let password: String = Password::with_theme(dtheme)
+                .with_prompt("🔑 Password (leave empty for none)")
+                .allow_empty_password(true)
+                .interact()?;
+            (!password.is_empty()).then_some(password)
+        } else {
+            None
+        };
+
+        let topic_prefix: String = Input::with_theme(dtheme)
+            .with_prompt("📂 Topic prefix")
+            .default(fez_mesh_controller_core::config::default_mqtt_topic_prefix())
+            .interact_text()?;
+
+        let status_topic: String = Input::with_theme(dtheme)
+            .with_prompt("📍 Status topic route ({prefix}/{public_key} placeholders supported)")
+            .default(fez_mesh_controller_core::config::default_mqtt_status_topic())
+            .interact_text()?;
+
+        let status_refresh_interval_secs: u32 = Input::with_theme(dtheme)
+            .with_prompt("💓 Status heartbeat interval, in seconds (0 to disable)")
+            .default(fez_mesh_controller_core::config::default_mqtt_status_refresh_interval_secs())
+            .interact_text()?;
+
+        let enable_high_level_messages = Confirm::with_theme(dtheme)
+            .with_prompt("📤 Publish the decoded-event and status topics to this broker?")
+            .default(fez_mesh_controller_core::config::default_mqtt_enable_high_level_messages())
+            .interact()?;
+
+        let enable_packet_trafic_messages = Confirm::with_theme(dtheme)
+            .with_prompt("📦 Publish packet capture")
+            .default(fez_mesh_controller_core::config::default_mqtt_enable_packet_trafic_messages())
+            .interact()?;
+
+        let tls_enabled = Confirm::with_theme(dtheme)
+            .with_prompt("🔒 Enable TLS?")
+            .default(false)
+            .interact()?;
+
+        let (tls_ca_cert, tls_client_cert, tls_client_key) = if tls_enabled {
+            let ca_cert = ask_optional_path(
+                dtheme,
+                "📄 CA certificate path (leave empty to use the system trust store)",
+            )?;
+            let client_cert = ask_optional_path(
+                dtheme,
+                "📄 Client certificate path (leave empty to skip mutual TLS)",
+            )?;
+            let client_key = if client_cert.is_some() {
+                ask_optional_path(dtheme, "🔑 Client private key path")?
+            } else {
+                None
+            };
+            (ca_cert, client_cert, client_key)
+        } else {
+            (None, None, None)
+        };
+
+        brokers.push(MqttBrokerConfig {
+            name,
+            host,
+            port,
+            username,
+            password,
+            topic_prefix,
+            tls_enabled,
+            tls_ca_cert,
+            tls_client_cert,
+            tls_client_key,
+            status_refresh_interval_secs,
+            enable_high_level_messages,
+            enable_packet_trafic_messages,
+            packet_trafic_topic: fez_mesh_controller_core::config::default_mqtt_packet_trafic_topic(
+            ),
+            enable_raw_messages: false,
+            raw_topic: fez_mesh_controller_core::config::default_mqtt_raw_topic(),
+            status_topic,
+            transport_protocol,
+            websocket_path,
+        });
+    }
+
+    Ok(brokers)
+}
+
+fn ask_optional_text(dtheme: &ColorfulTheme, prompt: &str) -> anyhow::Result<Option<String>> {
+    let value: String = Input::with_theme(dtheme)
+        .with_prompt(prompt)
+        .allow_empty(true)
+        .interact_text()?;
+    let value = value.trim();
+    Ok((!value.is_empty()).then(|| value.to_string()))
+}
+
+fn ask_optional_path(dtheme: &ColorfulTheme, prompt: &str) -> anyhow::Result<Option<PathBuf>> {
+    Ok(ask_optional_text(dtheme, prompt)?.map(PathBuf::from))
 }
 
 /// Flattens existing `RegionConfig`s (parent-by-name) into the ordered
