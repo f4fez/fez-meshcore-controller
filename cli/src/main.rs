@@ -96,6 +96,46 @@ enum RepeaterCommand {
     },
 }
 
+/// Saves `config` to `path` and reports it — used right after the setup
+/// wizard exits with a confirmed save. The wizard only asks about the
+/// most common settings, so the tip below points at the file for
+/// anything else (log level/dir, managed repeaters, hashtag channels,
+/// MQTT TLS certs, ...) — see `config.example.toml`.
+fn save_and_report(config: &Config, path: &std::path::Path) -> anyhow::Result<()> {
+    config.save_to(path)?;
+    theme::success_line(&format!("configuration saved to {}", path.display()));
+    println!();
+    theme::tip_line(&format!(
+        "the full configuration — including parameters not covered by the wizard — is \
+         available in {}",
+        path.display()
+    ));
+    println!();
+    Ok(())
+}
+
+/// Reports that the wizard exited without saving — used when the user
+/// declines the final "Save this configuration?" confirmation. This is a
+/// normal, deliberate choice, not an error, so it's reported the same
+/// mild way as [`save_and_report`], not as a failure.
+fn report_not_saved(path: &std::path::Path) {
+    theme::info_line("configuration not saved — no changes were made.");
+    println!();
+    if path.exists() {
+        theme::tip_line(&format!(
+            "the existing configuration is still available, unchanged, in {}",
+            path.display()
+        ));
+    } else {
+        theme::tip_line(&format!(
+            "no configuration file exists yet — run `fez-mesh-controller setup` again anytime \
+             to create one at {}",
+            path.display()
+        ));
+    }
+    println!();
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -109,18 +149,30 @@ async fn main() -> anyhow::Result<()> {
     let config = match &cli.command {
         Some(Command::Setup) => {
             let existing = Config::load_from(&config_path).ok();
-            let config = wizard::run(existing.as_ref()).await?;
-            config.save_to(&config_path)?;
-            theme::success_line(&format!("configuration saved to {}", config_path.display()));
-            config
+            match wizard::run(existing.as_ref()).await? {
+                Some(config) => {
+                    save_and_report(&config, &config_path)?;
+                    config
+                }
+                None => {
+                    report_not_saved(&config_path);
+                    return Ok(());
+                }
+            }
         }
         _ if config_path.exists() => Config::load_from(&config_path)?,
         _ => {
             theme::info_line("no configuration found, launching the setup wizard 🧙");
-            let config = wizard::run(None).await?;
-            config.save_to(&config_path)?;
-            theme::success_line(&format!("configuration saved to {}", config_path.display()));
-            config
+            match wizard::run(None).await? {
+                Some(config) => {
+                    save_and_report(&config, &config_path)?;
+                    config
+                }
+                None => {
+                    report_not_saved(&config_path);
+                    return Ok(());
+                }
+            }
         }
     };
 

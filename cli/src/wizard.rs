@@ -19,13 +19,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use console::style;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
-use crossterm::{execute, ExecutableCommand};
-use dialoguer::theme::ColorfulTheme;
+use console::{style, Key, Term};
+use dialoguer::theme::{ColorfulTheme, Theme};
 use dialoguer::{Confirm, Input, Password, Select};
 use fez_mesh_controller_core::{
     region, Config, ConnectionConfig, DaemonConfig, MqttBrokerConfig, MqttTransportProtocol,
@@ -33,11 +28,6 @@ use fez_mesh_controller_core::{
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use names::Generator;
-use ratatui::backend::CrosstermBackend;
-use ratatui::style::{Color, Modifier as RatatuiModifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Terminal;
 
 use crate::theme::{self, accent, muted, primary};
 
@@ -51,7 +41,10 @@ fn random_node_label() -> String {
         .unwrap_or_else(|| "fez-mesh-controller".to_string())
 }
 
-pub async fn run(existing: Option<&Config>) -> anyhow::Result<Config> {
+/// Runs the interactive setup wizard. Returns `Ok(None)` (not an error) if
+/// the user declines to save at the final confirmation — callers should
+/// treat that as a normal, deliberate cancellation, not a failure.
+pub async fn run(existing: Option<&Config>) -> anyhow::Result<Option<Config>> {
     theme::section("Setup wizard", "🧙");
     println!(
         "  {}",
@@ -64,49 +57,77 @@ pub async fn run(existing: Option<&Config>) -> anyhow::Result<Config> {
 
     let dtheme = ColorfulTheme::default();
 
-    let node_label: String = Input::with_theme(&dtheme)
-        .with_prompt("🏷️  Name of this controller")
-        .default(
-            existing
-                .map(|c| c.node_label.clone())
-                .unwrap_or_else(random_node_label),
-        )
-        .interact_text()?;
+    // Working state, seeded from `existing` (or defaults) before
+    // branching below, so both flows mutate the same variables and the
+    // `Config` assembly further down doesn't need to know which flow ran.
+    let mut node_label = existing
+        .map(|c| c.node_label.clone())
+        .unwrap_or_else(random_node_label);
+    let mut refresh_interval_secs = existing
+        .map(|c| c.daemon.refresh_interval_secs)
+        .unwrap_or(5);
+    let mut regions = existing.map(|c| c.regions.clone()).unwrap_or_default();
+    let mut connection = existing.map(|c| c.connection.clone());
+    let mut mqtt_brokers = existing.map(|c| c.mqtt_brokers.clone()).unwrap_or_default();
 
-    let connection = ask_connection(&dtheme, existing.map(|c| &c.connection)).await?;
+    if existing.is_none() {
+        // First run: chain the three sections, numbered.
+        run_general_section(
+            &dtheme,
+            Some((1, 3)),
+            &mut node_label,
+            &mut refresh_interval_secs,
+            &mut regions,
+        )?;
+        connection =
+            Some(run_connection_section(&dtheme, Some((2, 3)), connection.as_ref()).await?);
+        run_mqtt_section(&dtheme, Some((3, 3)), &mut mqtt_brokers)?;
+    } else {
+        // Re-run: let the user pick which section to revisit, as many
+        // times as they like, until they're done.
+        loop {
+            let items = ["🔧 General", "📡 Connection", "📶 MQTT", "✅ Terminate"];
+            let choice = Select::with_theme(&dtheme)
+                .with_prompt("What would you like to configure?")
+                .items(&items)
+                .default(0)
+                .interact()?;
+
+            match choice {
+                0 => run_general_section(
+                    &dtheme,
+                    None,
+                    &mut node_label,
+                    &mut refresh_interval_secs,
+                    &mut regions,
+                )?,
+                1 => {
+                    connection =
+                        Some(run_connection_section(&dtheme, None, connection.as_ref()).await?)
+                }
+                2 => run_mqtt_section(&dtheme, None, &mut mqtt_brokers)?,
+                _ => break,
+            }
+        }
+    }
+
+    let connection = connection.expect("set by the first-run chain or the re-run menu above");
 
     let socket_path = existing
         .map(|c| c.daemon.socket_path.clone())
         .unwrap_or_else(fez_mesh_controller_core::config::default_socket_path);
-
-    println!();
-    let refresh_interval_secs: u64 = Input::with_theme(&dtheme)
-        .with_prompt("⏱️  Refresh interval (seconds)")
-        .default(
-            existing
-                .map(|c| c.daemon.refresh_interval_secs)
-                .unwrap_or(5),
-        )
-        .interact_text()?;
-
     let log_level = existing
         .map(|c| c.daemon.log_level.clone())
         .unwrap_or_else(|| "info".to_string());
     let log_dir = existing
         .map(|c| c.daemon.log_dir.clone())
         .unwrap_or_else(fez_mesh_controller_core::config::default_log_dir);
-
     let managed_repeaters = existing
         .map(|c| c.managed_repeaters.clone())
         .unwrap_or_default();
-
-    let existing_regions = existing.map(|c| c.regions.as_slice()).unwrap_or(&[]);
-    let regions = ask_regions(existing_regions, &dtheme)?;
     let hashtag_channels = existing
         .map(|c| c.hashtag_channels.clone())
         .unwrap_or_default();
-    let existing_mqtt_brokers = existing.map(|c| c.mqtt_brokers.as_slice()).unwrap_or(&[]);
-    let mqtt_brokers = ask_mqtt_brokers(existing_mqtt_brokers, &dtheme)?;
 
     let config = Config {
         node_label,
@@ -144,6 +165,28 @@ pub async fn run(existing: Option<&Config>) -> anyhow::Result<Config> {
         "   ⏱️  Refresh      : {}",
         accent().apply_to(format!("{}s", config.daemon.refresh_interval_secs))
     );
+    if config.regions.is_empty() {
+        println!("   🧩 Regions      : {}", muted().apply_to("(none)"));
+    } else {
+        println!(
+            "   🧩 Regions      : {}",
+            accent().apply_to(format!("{} configured", config.regions.len()))
+        );
+        for (depth, region) in region::flatten_region_tree(&config.regions) {
+            println!("        {}{}", "  ".repeat(depth), region.name);
+        }
+    }
+    if config.mqtt_brokers.is_empty() {
+        println!("   📡 MQTT brokers : {}", muted().apply_to("(none)"));
+    } else {
+        println!(
+            "   📡 MQTT brokers : {}",
+            accent().apply_to(format!("{} configured", config.mqtt_brokers.len()))
+        );
+        for broker in &config.mqtt_brokers {
+            println!("        {} ({}:{})", broker.name, broker.host, broker.port);
+        }
+    }
     println!();
 
     let confirmed = Confirm::with_theme(&dtheme)
@@ -152,10 +195,69 @@ pub async fn run(existing: Option<&Config>) -> anyhow::Result<Config> {
         .interact()?;
 
     if !confirmed {
-        anyhow::bail!("configuration cancelled by user");
+        return Ok(None);
     }
 
-    Ok(config)
+    Ok(Some(config))
+}
+
+/// Prints a section's header: `[step/total] Title` when chained during
+/// first-run setup, or just `Title` when reached via the re-run menu
+/// (`step: None`) — see [`run`].
+fn print_section_header(step: Option<(usize, usize)>, emoji: &str, title: &str) {
+    match step {
+        Some((n, total)) => theme::section(&format!("[{n}/{total}] {title}"), emoji),
+        None => theme::section(title, emoji),
+    }
+}
+
+/// The "General" section: controller name, refresh interval, and the
+/// cluster region hierarchy — grouped together as the settings that are
+/// neither connection- nor MQTT-specific. See [`run`].
+fn run_general_section(
+    dtheme: &ColorfulTheme,
+    step: Option<(usize, usize)>,
+    node_label: &mut String,
+    refresh_interval_secs: &mut u64,
+    regions: &mut Vec<RegionConfig>,
+) -> anyhow::Result<()> {
+    print_section_header(step, "🔧", "General");
+
+    *node_label = Input::with_theme(dtheme)
+        .with_prompt("🏷️  Name of this controller")
+        .default(node_label.clone())
+        .interact_text()?;
+
+    println!();
+    *refresh_interval_secs = Input::with_theme(dtheme)
+        .with_prompt("⏱️  Refresh interval (seconds)")
+        .default(*refresh_interval_secs)
+        .interact_text()?;
+
+    *regions = ask_regions(regions, dtheme)?;
+
+    Ok(())
+}
+
+/// The "Connection" section — see [`run`].
+async fn run_connection_section(
+    dtheme: &ColorfulTheme,
+    step: Option<(usize, usize)>,
+    existing: Option<&ConnectionConfig>,
+) -> anyhow::Result<ConnectionConfig> {
+    print_section_header(step, "📡", "Connection");
+    ask_connection(dtheme, existing).await
+}
+
+/// The "MQTT" section — see [`run`].
+fn run_mqtt_section(
+    dtheme: &ColorfulTheme,
+    step: Option<(usize, usize)>,
+    mqtt_brokers: &mut Vec<MqttBrokerConfig>,
+) -> anyhow::Result<()> {
+    print_section_header(step, "📶", "MQTT");
+    *mqtt_brokers = ask_mqtt_brokers(mqtt_brokers, dtheme)?;
+    Ok(())
 }
 
 async fn ask_connection(
@@ -321,19 +423,15 @@ async fn ask_ble(
     Ok(ConnectionConfig::Ble { name })
 }
 
-/// A region name at a given indentation depth while interactively
-/// arranging the hierarchy. Order + depth together determine the parent
-/// (the nearest preceding entry one level shallower) — see
-/// `regions_from_outline`.
+/// A region name at a given indentation depth while interactively editing
+/// the hierarchy in [`edit_region_tree`]. Order + depth together imply
+/// the parent (the nearest preceding entry one level shallower) — see
+/// [`regions_from_outline`].
 type RegionOutline = Vec<(String, usize)>;
 
-/// Prompts for the cluster's region names, then — if there are at least
-/// two — a small embedded screen to arrange them into a hierarchy
-/// (indent/unindent with the arrow keys), mirroring the MeshCore node
-/// firmware's own region tree. `dialoguer` has no tree/indent widget
-/// (only `Sort`, for flat reordering), so arranging needs a custom screen;
-/// entering names stays a normal `Input` loop, consistent with the rest of
-/// the wizard.
+/// Prompts for the cluster's region hierarchy via a single interactive
+/// tree editor (add/rename/delete/reorder/reparent all within one
+/// widget) — see [`edit_region_tree`].
 fn ask_regions(
     existing: &[RegionConfig],
     dtheme: &ColorfulTheme,
@@ -350,28 +448,305 @@ fn ask_regions(
     );
     println!(
         "  {}",
-        muted().apply_to("MeshCore node firmware's own region concept. Leave empty to skip.")
+        muted().apply_to("MeshCore node firmware's own region concept. Arrange the tree below;")
     );
+    println!(
+        "  {}",
+        muted().apply_to("Enter to confirm, Esc to cancel any changes made here.")
+    );
+    println!();
 
-    let mut outline = outline_from_regions(existing);
+    edit_region_tree(existing, dtheme, &Term::stderr())
+}
+
+/// Flattens `regions` (parent-by-name) into the ordered `(name, depth)`
+/// outline [`edit_region_tree`] edits, so re-running the wizard starts
+/// from whatever hierarchy was already configured.
+fn outline_from_regions(regions: &[RegionConfig]) -> RegionOutline {
+    region::flatten_region_tree(regions)
+        .into_iter()
+        .map(|(depth, r)| (r.name.clone(), depth))
+        .collect()
+}
+
+/// Converts an edited `(name, depth)` outline back into `RegionConfig`s:
+/// each entry's parent is the name of the nearest *preceding* entry one
+/// depth shallower (`None` for a depth-0 root).
+fn regions_from_outline(outline: &RegionOutline) -> Vec<RegionConfig> {
+    outline
+        .iter()
+        .enumerate()
+        .map(|(i, (name, depth))| {
+            let parent = if *depth == 0 {
+                None
+            } else {
+                outline[..i]
+                    .iter()
+                    .rev()
+                    .find(|(_, d)| *d == depth - 1)
+                    .map(|(n, _)| n.clone())
+            };
+            RegionConfig {
+                name: name.clone(),
+                parent,
+            }
+        })
+        .collect()
+}
+
+/// The new depth for indenting (`delta > 0`) or unindenting (`delta < 0`)
+/// the entry at `index`. Indenting is capped at one level deeper than the
+/// *immediately preceding* entry (can't skip a level — the same rule
+/// outliners like Workflowy/org-mode use), and the very first entry can
+/// never be indented (nothing precedes it to nest under). Unindenting is
+/// floored at 0.
+fn clamp_indent(outline: &RegionOutline, index: usize, delta: i32) -> usize {
+    let current = outline[index].1;
+    if delta > 0 {
+        let max_depth = if index == 0 {
+            0
+        } else {
+            outline[index - 1].1 + 1
+        };
+        (current + 1).min(max_depth)
+    } else {
+        current.saturating_sub(1)
+    }
+}
+
+/// Removes the entry at `index`, promoting its entire subtree (direct
+/// children *and* deeper descendants) up one depth level first — every
+/// following entry with depth greater than the removed one's, until an
+/// entry at depth ≤ its own is reached, has its depth decremented by 1.
+/// Decrementing only direct children and leaving grandchildren alone
+/// would silently double-nest them relative to their now-shifted parent.
+fn delete_outline_entry(outline: &mut RegionOutline, index: usize) {
+    let depth = outline[index].1;
+    let mut end = index + 1;
+    while end < outline.len() && outline[end].1 > depth {
+        outline[end].1 -= 1;
+        end += 1;
+    }
+    outline.remove(index);
+}
+
+/// Interactive single-widget tree editor for the cluster's region
+/// hierarchy — a custom `dialoguer`-style component. `dialoguer` has no
+/// built-in tree/outline widget, and this stays away from
+/// `ratatui`/full-screen alternate-screen rendering (matching the rest of
+/// this wizard): it renders inline in the normal scrollback via
+/// `console::Term`, the same underlying mechanism `dialoguer`'s own
+/// `Select`/`Sort` prompts use internally (`term.read_key()` for
+/// single-keypress input, `term.clear_last_lines()` + redraw for
+/// updates), reusing the public `Theme` trait's
+/// `format_select_prompt`/`format_select_prompt_item`/
+/// `format_input_prompt` so the look matches the rest of the wizard
+/// exactly (dialoguer's own renderer that backs those calls internally,
+/// `theme::render::TermThemeRenderer`, is crate-private — not reusable
+/// from here).
+///
+/// Keys: `↑`/`↓` move the cursor, `←`/`→` (or `h`/`l`) indent/unindent
+/// (reparent), `j`/`k` reorder (swap the selected entry with the
+/// next/previous one), `a` add a sibling, `r` rename, `d`/Delete/
+/// Backspace delete (promoting the deleted entry's subtree, see
+/// [`delete_outline_entry`]), Enter confirm, Esc cancel (discarding every
+/// edit made this session).
+fn edit_region_tree(
+    initial: &[RegionConfig],
+    theme: &dyn Theme,
+    term: &Term,
+) -> anyhow::Result<Vec<RegionConfig>> {
+    let mut outline = outline_from_regions(initial);
+    let mut selected: usize = 0;
+    let mut previous_line_count = 0;
+
+    term.hide_cursor()?;
+
+    let result = (|| -> anyhow::Result<Vec<RegionConfig>> {
+        loop {
+            previous_line_count =
+                render_region_tree(term, theme, &outline, selected, previous_line_count, None)?;
+
+            match term.read_key()? {
+                Key::ArrowUp => selected = selected.saturating_sub(1),
+                Key::ArrowDown => {
+                    if selected + 1 < outline.len() {
+                        selected += 1;
+                    }
+                }
+                Key::ArrowRight | Key::Char('l') if !outline.is_empty() => {
+                    outline[selected].1 = clamp_indent(&outline, selected, 1);
+                }
+                Key::ArrowLeft | Key::Char('h') if !outline.is_empty() => {
+                    outline[selected].1 = clamp_indent(&outline, selected, -1);
+                }
+                Key::Char('k') if selected > 0 => {
+                    outline.swap(selected, selected - 1);
+                    selected -= 1;
+                }
+                Key::Char('j') if selected + 1 < outline.len() => {
+                    outline.swap(selected, selected + 1);
+                    selected += 1;
+                }
+                Key::Char('a') => {
+                    // A blank placeholder, right after the selected entry
+                    // (or the first root if the tree is empty), edited in
+                    // place at its correct position/indentation — see
+                    // `edit_outline_entry_inline`. Removed again below if
+                    // left empty (Esc, or confirmed with no text).
+                    let depth = outline.get(selected).map(|(_, d)| *d).unwrap_or(0);
+                    let insert_at = if outline.is_empty() { 0 } else { selected + 1 };
+                    outline.insert(insert_at, (String::new(), depth));
+                    selected = insert_at;
+
+                    let (name, lines) = edit_outline_entry_inline(
+                        term,
+                        theme,
+                        &outline,
+                        selected,
+                        previous_line_count,
+                    )?;
+                    previous_line_count = lines;
+
+                    match name.map(|n| n.trim().to_string()) {
+                        Some(name) if !name.is_empty() => outline[selected].0 = name,
+                        _ => {
+                            outline.remove(selected);
+                            selected = selected.saturating_sub(1);
+                        }
+                    }
+                }
+                Key::Char('r') if !outline.is_empty() => {
+                    let original = outline[selected].0.clone();
+                    let (name, lines) = edit_outline_entry_inline(
+                        term,
+                        theme,
+                        &outline,
+                        selected,
+                        previous_line_count,
+                    )?;
+                    previous_line_count = lines;
+
+                    outline[selected].0 = match name.map(|n| n.trim().to_string()) {
+                        Some(name) if !name.is_empty() => name,
+                        _ => original,
+                    };
+                }
+                Key::Char('d') | Key::Backspace | Key::Del if !outline.is_empty() => {
+                    delete_outline_entry(&mut outline, selected);
+                    if selected >= outline.len() {
+                        selected = outline.len().saturating_sub(1);
+                    }
+                }
+                Key::Enter => return Ok(regions_from_outline(&outline)),
+                Key::Escape => return Ok(initial.to_vec()),
+                _ => {}
+            }
+        }
+    })();
+
+    term.clear_last_lines(previous_line_count)?;
+    term.show_cursor()?;
+
+    result
+}
+
+/// Redraws the whole tree-editor widget in place: clears
+/// `previous_line_count` lines from the last frame, prints the
+/// prompt/header line, one line per outline entry (indented; the
+/// selected one styled via `theme.format_select_prompt_item`, matching
+/// `Select`/`Sort`'s own active-item look), then a keybinding legend.
+/// Returns the number of lines just printed, to pass back in as
+/// `previous_line_count` next frame.
+///
+/// `editing`, when set, is `(index, in-progress buffer)` for
+/// [`edit_outline_entry_inline`]: that entry's row renders the raw buffer
+/// (with a trailing cursor mark) instead of `outline[index].0`, still at
+/// its correct indentation, and the footer swaps to the text-edit legend.
+fn render_region_tree(
+    term: &Term,
+    theme: &dyn Theme,
+    outline: &RegionOutline,
+    selected: usize,
+    previous_line_count: usize,
+    editing: Option<(usize, &str)>,
+) -> anyhow::Result<usize> {
+    term.clear_last_lines(previous_line_count)?;
+
+    let mut lines = Vec::new();
+
+    let mut prompt_line = String::new();
+    theme.format_select_prompt(&mut prompt_line, "Region hierarchy")?;
+    lines.push(prompt_line);
+
+    if outline.is_empty() {
+        lines.push("  (no regions yet — press 'a' to add one)".to_string());
+    } else {
+        for (i, (name, depth)) in outline.iter().enumerate() {
+            let indent = "  ".repeat(*depth);
+            let text = match editing {
+                Some((edit_idx, buf)) if edit_idx == i => format!("{indent}{buf}▏"),
+                _ => format!("{indent}{name}"),
+            };
+            let is_active = editing.map_or(i == selected, |(edit_idx, _)| edit_idx == i);
+            let mut item_line = String::new();
+            theme.format_select_prompt_item(&mut item_line, &text, is_active)?;
+            lines.push(item_line);
+        }
+    }
+
+    lines.push(String::new());
+    let legend = if editing.is_some() {
+        "Type the region name — Enter confirm   Esc cancel"
+    } else {
+        "↑/↓ move   ←/→ nest   j/k reorder   a add   r rename   d delete   Enter done   Esc cancel"
+    };
+    lines.push(style(legend).dim().to_string());
+
+    for line in &lines {
+        term.write_line(line)?;
+    }
+
+    Ok(lines.len())
+}
+
+/// Edits the outline entry at `index` **in place, live, as part of the
+/// tree's own rendering** (correct row, correct indentation) — used by
+/// [`edit_region_tree`]'s `a`/`r` keys instead of a separate prompt line
+/// below the tree. `Char` appends, `Backspace` removes the last
+/// character, `Enter` commits (returns the typed text — possibly empty
+/// or unchanged, callers decide what that means), `Esc` cancels (`None`).
+/// Read-only on `outline`: only reads `outline[index].0` for the initial
+/// buffer and never writes to it — the caller applies the result.
+fn edit_outline_entry_inline(
+    term: &Term,
+    theme: &dyn Theme,
+    outline: &RegionOutline,
+    index: usize,
+    mut previous_line_count: usize,
+) -> anyhow::Result<(Option<String>, usize)> {
+    let mut buf = outline[index].0.clone();
 
     loop {
-        let name: String = Input::with_theme(dtheme)
-            .with_prompt("🧩 Add a region name (leave empty to continue)")
-            .allow_empty(true)
-            .interact_text()?;
-        let name = name.trim();
-        if name.is_empty() {
-            break;
+        previous_line_count = render_region_tree(
+            term,
+            theme,
+            outline,
+            index,
+            previous_line_count,
+            Some((index, buf.as_str())),
+        )?;
+
+        match term.read_key()? {
+            Key::Char(c) if !c.is_control() => buf.push(c),
+            Key::Backspace => {
+                buf.pop();
+            }
+            Key::Enter => return Ok((Some(buf), previous_line_count)),
+            Key::Escape => return Ok((None, previous_line_count)),
+            _ => {}
         }
-        outline.push((name.to_string(), 0));
     }
-
-    if outline.len() >= 2 {
-        outline = arrange_region_hierarchy(outline)?;
-    }
-
-    Ok(regions_from_outline(&outline))
 }
 
 /// Interactively builds the list of MQTT brokers to forward received mesh
@@ -383,12 +758,6 @@ fn ask_mqtt_brokers(
     existing: &[MqttBrokerConfig],
     dtheme: &ColorfulTheme,
 ) -> anyhow::Result<Vec<MqttBrokerConfig>> {
-    println!();
-    println!(
-        "{} {}",
-        style("📡").bold(),
-        primary().apply_to("MQTT brokers")
-    );
     println!(
         "  {}",
         muted().apply_to("Forward received mesh events to MQTT brokers, using the same topics")
@@ -550,155 +919,6 @@ fn ask_optional_path(dtheme: &ColorfulTheme, prompt: &str) -> anyhow::Result<Opt
     Ok(ask_optional_text(dtheme, prompt)?.map(PathBuf::from))
 }
 
-/// Flattens existing `RegionConfig`s (parent-by-name) into the ordered
-/// `(name, depth)` outline the arrange screen edits, so re-running the
-/// wizard preserves whatever hierarchy was already configured.
-fn outline_from_regions(regions: &[RegionConfig]) -> RegionOutline {
-    region::flatten_region_tree(regions)
-        .into_iter()
-        .map(|(depth, r)| (r.name.clone(), depth))
-        .collect()
-}
-
-/// Converts the arranged `(name, depth)` outline back into `RegionConfig`s:
-/// each entry's parent is the name of the nearest *preceding* entry one
-/// depth shallower (`None` for a depth-0 root).
-fn regions_from_outline(outline: &RegionOutline) -> Vec<RegionConfig> {
-    outline
-        .iter()
-        .enumerate()
-        .map(|(i, (name, depth))| {
-            let parent = if *depth == 0 {
-                None
-            } else {
-                outline[..i]
-                    .iter()
-                    .rev()
-                    .find(|(_, d)| *d == depth - 1)
-                    .map(|(n, _)| n.clone())
-            };
-            RegionConfig {
-                name: name.clone(),
-                parent,
-            }
-        })
-        .collect()
-}
-
-/// The new depth for indenting (`delta > 0`) or unindenting (`delta < 0`)
-/// the entry at `index`. Indenting is capped at one level deeper than the
-/// *immediately preceding* entry (can't skip a level — the same rule
-/// outliners like Workflowy/org-mode use), and the very first entry can
-/// never be indented (nothing precedes it to nest under). Unindenting is
-/// floored at 0.
-fn clamp_indent(outline: &RegionOutline, index: usize, delta: i32) -> usize {
-    let current = outline[index].1;
-    if delta > 0 {
-        let max_depth = if index == 0 {
-            0
-        } else {
-            outline[index - 1].1 + 1
-        };
-        (current + 1).min(max_depth)
-    } else {
-        current.saturating_sub(1)
-    }
-}
-
-/// Runs the embedded raw-mode screen for arranging `outline` into a
-/// hierarchy. Returns the arranged outline on `Enter`, or the original
-/// (pre-arrangement) outline unchanged on `Esc`. Enters/exits raw mode +
-/// the alternate screen the same way `cli/src/tui/mod.rs`'s
-/// `setup_terminal`/`restore_terminal` do; not shared with that module
-/// since this is simple enough not to be worth coupling the two.
-fn arrange_region_hierarchy(outline: RegionOutline) -> anyhow::Result<RegionOutline> {
-    let original = outline.clone();
-    let mut outline = outline;
-    let mut selected: usize = 0;
-
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    stdout.execute(EnterAlternateScreen)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-
-    let result = (|| -> anyhow::Result<RegionOutline> {
-        loop {
-            terminal.draw(|frame| draw_arrange_screen(frame, &outline, selected))?;
-
-            let Event::Key(key) = event::read()? else {
-                continue;
-            };
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-
-            match key.code {
-                KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    if selected > 0 {
-                        outline.swap(selected, selected - 1);
-                        selected -= 1;
-                    }
-                }
-                KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    if selected + 1 < outline.len() {
-                        outline.swap(selected, selected + 1);
-                        selected += 1;
-                    }
-                }
-                KeyCode::Up => selected = selected.saturating_sub(1),
-                KeyCode::Down => {
-                    if selected + 1 < outline.len() {
-                        selected += 1;
-                    }
-                }
-                KeyCode::Right => outline[selected].1 = clamp_indent(&outline, selected, 1),
-                KeyCode::Left => outline[selected].1 = clamp_indent(&outline, selected, -1),
-                KeyCode::Enter => return Ok(outline.clone()),
-                KeyCode::Esc => return Ok(original.clone()),
-                _ => {}
-            }
-        }
-    })();
-
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-
-    result
-}
-
-fn draw_arrange_screen(frame: &mut ratatui::Frame, outline: &RegionOutline, selected: usize) {
-    let mut lines = vec![
-        Line::from(Span::styled(
-            "Arrange the region hierarchy",
-            Style::default().add_modifier(RatatuiModifier::BOLD),
-        )),
-        Line::from(""),
-    ];
-
-    for (i, (name, depth)) in outline.iter().enumerate() {
-        let cursor = if i == selected { "➤ " } else { "  " };
-        let text = format!("{cursor}{}{name}", "  ".repeat(*depth));
-        let style = if i == selected {
-            Style::default()
-                .add_modifier(RatatuiModifier::BOLD)
-                .bg(Color::Rgb(0x2a, 0x2e, 0x3a))
-        } else {
-            Style::default()
-        };
-        lines.push(Line::from(Span::styled(text, style)));
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "↑/↓ select   Shift+↑/↓ move   →/← indent/unindent   Enter confirm   Esc cancel",
-        Style::default().fg(Color::DarkGray),
-    )));
-
-    let block = Block::default().borders(Borders::ALL).title(" 🧩 Regions ");
-    frame.render_widget(Paragraph::new(lines).block(block), frame.area());
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -795,5 +1015,42 @@ mod tests {
         assert_eq!(clamp_indent(&o, 1, 1), 1); // indent under World
         let o2 = outline(&[("World", 0), ("Europe", 1)]);
         assert_eq!(clamp_indent(&o2, 1, -1), 0); // unindent back to root
+    }
+
+    // --- delete_outline_entry ------------------------------------------------
+
+    #[test]
+    fn delete_outline_entry_leaf_leaves_the_rest_untouched() {
+        let mut o = outline(&[("World", 0), ("Europe", 1), ("France", 2), ("Asia", 1)]);
+
+        delete_outline_entry(&mut o, 2); // France
+
+        assert_eq!(o, outline(&[("World", 0), ("Europe", 1), ("Asia", 1)]));
+    }
+
+    #[test]
+    fn delete_outline_entry_promotes_the_whole_subtree_one_level() {
+        // World > Europe > France > Paris (Paris is a grandchild of Europe)
+        let mut o = outline(&[("World", 0), ("Europe", 1), ("France", 2), ("Paris", 3)]);
+
+        delete_outline_entry(&mut o, 1); // Europe
+
+        // France (was Europe's direct child) is promoted to depth 1; Paris
+        // (was France's child, a grandchild of Europe) is promoted to
+        // depth 2 too, staying one level below France.
+        assert_eq!(o, outline(&[("World", 0), ("France", 1), ("Paris", 2)]));
+        assert_eq!(
+            regions_from_outline(&o)[2].parent.as_deref(),
+            Some("France")
+        );
+    }
+
+    #[test]
+    fn delete_outline_entry_deleting_a_root_promotes_children_to_top_level() {
+        let mut o = outline(&[("World", 0), ("Europe", 1), ("Asia", 1)]);
+
+        delete_outline_entry(&mut o, 0); // World
+
+        assert_eq!(o, outline(&[("Europe", 0), ("Asia", 0)]));
     }
 }

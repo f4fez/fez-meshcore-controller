@@ -72,3 +72,7 @@ pub fn error_line(text: &str) {
 pub fn info_line(text: &str) {
     println!("  {} {text}", style("ℹ️").cyan());
 }
+
+pub fn tip_line(text: &str) {
+    println!("  {} {text}", style("💡").yellow());
+}
