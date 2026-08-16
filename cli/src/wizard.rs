@@ -69,6 +69,9 @@ pub async fn run(existing: Option<&Config>) -> anyhow::Result<Option<Config>> {
     let mut regions = existing.map(|c| c.regions.clone()).unwrap_or_default();
     let mut connection = existing.map(|c| c.connection.clone());
     let mut mqtt_brokers = existing.map(|c| c.mqtt_brokers.clone()).unwrap_or_default();
+    let mut observer_node_managed_config = existing
+        .map(|c| c.daemon.observer_node_managed_config)
+        .unwrap_or(true);
 
     if existing.is_none() {
         // First run: chain the three sections, numbered.
@@ -79,8 +82,15 @@ pub async fn run(existing: Option<&Config>) -> anyhow::Result<Option<Config>> {
             &mut refresh_interval_secs,
             &mut regions,
         )?;
-        connection =
-            Some(run_connection_section(&dtheme, Some((2, 3)), connection.as_ref()).await?);
+        connection = Some(
+            run_connection_section(
+                &dtheme,
+                Some((2, 3)),
+                connection.as_ref(),
+                &mut observer_node_managed_config,
+            )
+            .await?,
+        );
         run_mqtt_section(&dtheme, Some((3, 3)), &mut mqtt_brokers)?;
     } else {
         // Re-run: let the user pick which section to revisit, as many
@@ -102,8 +112,15 @@ pub async fn run(existing: Option<&Config>) -> anyhow::Result<Option<Config>> {
                     &mut regions,
                 )?,
                 1 => {
-                    connection =
-                        Some(run_connection_section(&dtheme, None, connection.as_ref()).await?)
+                    connection = Some(
+                        run_connection_section(
+                            &dtheme,
+                            None,
+                            connection.as_ref(),
+                            &mut observer_node_managed_config,
+                        )
+                        .await?,
+                    )
                 }
                 2 => run_mqtt_section(&dtheme, None, &mut mqtt_brokers)?,
                 _ => break,
@@ -140,6 +157,7 @@ pub async fn run(existing: Option<&Config>) -> anyhow::Result<Option<Config>> {
             packet_log_capacity: fez_mesh_controller_core::config::default_packet_log_capacity(),
             discovered_nodes_capacity:
                 fez_mesh_controller_core::config::default_discovered_nodes_capacity(),
+            observer_node_managed_config,
         },
         managed_repeaters,
         regions,
@@ -164,6 +182,14 @@ pub async fn run(existing: Option<&Config>) -> anyhow::Result<Option<Config>> {
     println!(
         "   ⏱️  Refresh      : {}",
         accent().apply_to(format!("{}s", config.daemon.refresh_interval_secs))
+    );
+    println!(
+        "   🔒 Observer lock: {}",
+        accent().apply_to(if config.daemon.observer_node_managed_config {
+            "Yes"
+        } else {
+            "No"
+        })
     );
     if config.regions.is_empty() {
         println!("   🧩 Regions      : {}", muted().apply_to("(none)"));
@@ -244,9 +270,33 @@ async fn run_connection_section(
     dtheme: &ColorfulTheme,
     step: Option<(usize, usize)>,
     existing: Option<&ConnectionConfig>,
+    observer_node_managed_config: &mut bool,
 ) -> anyhow::Result<ConnectionConfig> {
     print_section_header(step, "📡", "Connection");
-    ask_connection(dtheme, existing).await
+    let connection = ask_connection(dtheme, existing).await?;
+
+    println!();
+    println!(
+        "  {}",
+        muted().apply_to(
+            "When enabled, the daemon locks this node to an observer-only state on every"
+        )
+    );
+    println!(
+        "  {}",
+        muted()
+            .apply_to("connect: disables its contact auto-add, clears all channels, and keeps its")
+    );
+    println!(
+        "  {}",
+        muted().apply_to("contact list in sync with the managed repeaters below.")
+    );
+    *observer_node_managed_config = Confirm::with_theme(dtheme)
+        .with_prompt("🔒 Enforce observer-only node configuration?")
+        .default(*observer_node_managed_config)
+        .interact()?;
+
+    Ok(connection)
 }
 
 /// The "MQTT" section — see [`run`].

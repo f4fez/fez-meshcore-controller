@@ -383,6 +383,11 @@ fn event_line(ev: &MeshEvent) -> Line<'static> {
             ),
             GREEN,
         ),
+        MeshEventKind::ObserverNodeConfigEnforced { detail } => (
+            "🔒",
+            format!("Observer node config enforced: {detail}"),
+            GREEN,
+        ),
         MeshEventKind::RepeaterHeard { name, prefix_hex } => (
             "🔍",
             format!(

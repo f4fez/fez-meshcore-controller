@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use fez_mesh_controller_core::ipc::MeshEvent;
 use fez_mesh_controller_core::mesh::{
-    build_packet_log_entry, extract_discovered_node, is_repeater_or_room, map_event, ContactDto,
-    MeshClient, MeshEventKind,
+    build_packet_log_entry, contacts_to_prune, extract_discovered_node, is_repeater_or_room,
+    map_event, ContactDto, MeshClient, MeshEventKind,
 };
 use fez_mesh_controller_core::{ConnectionConfig, ManagedRepeater};
 use futures::StreamExt;
@@ -62,6 +62,7 @@ pub async fn run(
                 });
 
                 reconcile_managed_repeaters(&client, &state).await;
+                enforce_observer_node_config(&client, &state).await;
 
                 let mut events = client.event_stream();
                 let mut ticker = tokio::time::interval(refresh_interval);
@@ -155,9 +156,25 @@ pub async fn run(
 /// Rebuilds the contact list shown to clients: the companion's own
 /// contacts (annotated with whether each is managed), plus any discovered
 /// repeater not already among them.
+///
+/// Always fetches fresh from the node rather than reading the cached
+/// contact list: the node never pushes a notification for contact-list
+/// changes *we* initiated (`declare_contact`/`remove_contact`, e.g. from
+/// `reconcile_managed_repeaters`, `set_managed_repeater`, `add_repeater`,
+/// `enforce_observer_node_config`), so the cache would otherwise stay
+/// stale until an unrelated node-pushed event happened to mark it dirty.
 async fn build_snapshot_contacts(client: &MeshClient, state: &AppState) -> Vec<ContactDto> {
     let managed_repeaters = state.config.read().await.managed_repeaters.clone();
-    let mut contacts = client.contacts().await;
+    let mut contacts = match client.fetch_contacts().await {
+        Ok(contacts) => contacts,
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to fetch fresh contacts from the node, using possibly-stale cache"
+            );
+            client.contacts().await
+        }
+    };
     for contact in &mut contacts {
         contact.managed = managed_repeaters
             .iter()
@@ -280,6 +297,97 @@ async fn reconcile_managed_repeaters(client: &MeshClient, state: &AppState) {
     }
 }
 
+/// When `observer_node_managed_config` is enabled, locks the connected node
+/// to an observer-only state: disables its own contact auto-add, wipes
+/// every channel slot (Public and private/hashtag alike), and prunes any
+/// contact that isn't in `managed_repeaters`. Each correction is
+/// independent -- a failure in one doesn't stop the others from being
+/// attempted, mirroring [`reconcile_managed_repeaters`].
+async fn enforce_observer_node_config(client: &MeshClient, state: &AppState) {
+    if !state
+        .config
+        .read()
+        .await
+        .daemon
+        .observer_node_managed_config
+    {
+        return;
+    }
+
+    match client.autoadd_enabled().await {
+        Ok(true) => match client.disable_auto_add_contacts().await {
+            Ok(()) => {
+                info!("disabled contact auto-add on the observation node");
+                state.broadcast_event(MeshEvent {
+                    at_unix: now_unix(),
+                    kind: MeshEventKind::ObserverNodeConfigEnforced {
+                        detail: "disabled contact auto-add".to_string(),
+                    },
+                });
+            }
+            Err(err) => warn!(error = %err, "failed to disable contact auto-add on the node"),
+        },
+        Ok(false) => {} // already compliant
+        Err(err) => warn!(error = %err, "failed to query the node's auto-add configuration"),
+    }
+
+    if let Some(max_channels) = client.max_channels().await {
+        for idx in 0..max_channels {
+            match client.get_channel(idx).await {
+                Ok(channel) if !channel.name.is_empty() || channel.secret != [0u8; 16] => {
+                    match client.remove_channel(idx).await {
+                        Ok(()) => {
+                            info!(
+                                channel_idx = idx,
+                                "removed channel from the observation node"
+                            );
+                            state.broadcast_event(MeshEvent {
+                                at_unix: now_unix(),
+                                kind: MeshEventKind::ObserverNodeConfigEnforced {
+                                    detail: format!("removed channel {idx}"),
+                                },
+                            });
+                        }
+                        Err(err) => {
+                            warn!(channel_idx = idx, error = %err, "failed to remove channel from the node")
+                        }
+                    }
+                }
+                Ok(_) => {} // already empty
+                Err(err) => {
+                    warn!(channel_idx = idx, error = %err, "failed to query channel from the node")
+                }
+            }
+        }
+    }
+
+    let managed_repeaters = state.config.read().await.managed_repeaters.clone();
+    let known = client.contacts().await;
+    let mut pruned_any = false;
+
+    for contact in contacts_to_prune(&known, &managed_repeaters) {
+        match client.remove_contact(&contact.public_key_prefix_hex).await {
+            Ok(()) => {
+                pruned_any = true;
+                info!(contact = %contact.name, "pruned non-managed contact from the observation node");
+                state.broadcast_event(MeshEvent {
+                    at_unix: now_unix(),
+                    kind: MeshEventKind::ObserverNodeConfigEnforced {
+                        detail: format!("pruned non-managed contact {}", contact.name),
+                    },
+                });
+            }
+            Err(err) => {
+                warn!(contact = %contact.name, error = %err, "failed to prune non-managed contact from the node")
+            }
+        }
+    }
+
+    if pruned_any {
+        refresh_snapshot_contacts(client, state).await;
+    }
+}
+
 /// Runs a command issued by an IPC client against the live MeshCore
 /// connection and reports the outcome back through its reply channel.
 async fn handle_command(cmd: DaemonCommand, client: &MeshClient, state: &AppState) {
@@ -334,10 +442,6 @@ async fn finalize_contact_removal(
             .unwrap_or_else(|| public_key_prefix_hex.to_string())
     };
 
-    client
-        .fetch_contacts()
-        .await
-        .map_err(|err| format!("contact removed, but failed to refresh contacts: {err}"))?;
     refresh_snapshot_contacts(client, state).await;
 
     state.broadcast_event(MeshEvent {
@@ -546,6 +650,7 @@ mod tests {
                 log_dir: PathBuf::from("/tmp/fez-mesh-controller-test/logs"),
                 packet_log_capacity: 500,
                 discovered_nodes_capacity: 200,
+                observer_node_managed_config: true,
             },
             managed_repeaters,
             regions: vec![],

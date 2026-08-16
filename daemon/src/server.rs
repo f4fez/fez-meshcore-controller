@@ -232,6 +232,7 @@ mod tests {
                 log_dir: PathBuf::from("/tmp/fez-mesh-controller-test/logs"),
                 packet_log_capacity: 500,
                 discovered_nodes_capacity: 200,
+                observer_node_managed_config: true,
             },
             managed_repeaters: vec![],
             regions: vec![],
@@ -340,6 +341,7 @@ mod tests {
                 log_dir: PathBuf::from("/tmp/fez-mesh-controller-test/logs"),
                 packet_log_capacity: 500,
                 discovered_nodes_capacity: 200,
+                observer_node_managed_config: true,
             },
             managed_repeaters: vec![],
             regions: vec![RegionConfig {
@@ -380,6 +382,7 @@ mod tests {
                 log_dir: PathBuf::from("/tmp/fez-mesh-controller-test/logs"),
                 packet_log_capacity: 500,
                 discovered_nodes_capacity: 200,
+                observer_node_managed_config: true,
             },
             managed_repeaters: vec![],
             regions: vec![],

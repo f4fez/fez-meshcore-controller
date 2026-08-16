@@ -284,6 +284,13 @@ pub struct DaemonConfig {
     /// discovered-nodes cache, least-recently-seen evicted first.
     #[serde(default = "default_discovered_nodes_capacity")]
     pub discovered_nodes_capacity: usize,
+    /// When true, the daemon actively locks this node down to an
+    /// observer-only state on every (re)connect: disables the node's own
+    /// contact auto-add, removes every channel (Public and
+    /// private/hashtag), and prunes any contact that isn't in
+    /// [`Config::managed_repeaters`].
+    #[serde(default = "default_observer_node_managed_config")]
+    pub observer_node_managed_config: bool,
 }
 
 impl Default for DaemonConfig {
@@ -295,6 +302,7 @@ impl Default for DaemonConfig {
             log_dir: default_log_dir(),
             packet_log_capacity: default_packet_log_capacity(),
             discovered_nodes_capacity: default_discovered_nodes_capacity(),
+            observer_node_managed_config: default_observer_node_managed_config(),
         }
     }
 }
@@ -335,6 +343,12 @@ pub fn default_packet_log_capacity() -> usize {
 /// Default number of entries kept in the discovered-nodes cache.
 pub fn default_discovered_nodes_capacity() -> usize {
     200
+}
+
+/// Default for [`DaemonConfig::observer_node_managed_config`] — enforce the
+/// observer-only lock by default once a node is connected.
+pub fn default_observer_node_managed_config() -> bool {
+    true
 }
 
 impl Config {
@@ -389,6 +403,7 @@ mod tests {
                 log_dir: PathBuf::from("/tmp/fez-mesh-controller/logs"),
                 packet_log_capacity: 500,
                 discovered_nodes_capacity: 200,
+                observer_node_managed_config: true,
             },
             managed_repeaters: vec![ManagedRepeater {
                 name: "F4FEZ Repeater".to_string(),
@@ -492,6 +507,11 @@ mod tests {
     }
 
     #[test]
+    fn daemon_config_default_enables_observer_node_managed_config() {
+        assert!(DaemonConfig::default().observer_node_managed_config);
+    }
+
+    #[test]
     fn config_save_and_load_roundtrip() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
@@ -545,6 +565,7 @@ mod tests {
         assert_eq!(config.daemon.packet_log_capacity, 500);
         assert_eq!(config.daemon.discovered_nodes_capacity, 200);
         assert_eq!(config.daemon.log_dir, default_log_dir());
+        assert!(config.daemon.observer_node_managed_config);
     }
 
     #[test]

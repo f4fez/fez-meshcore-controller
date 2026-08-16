@@ -125,6 +125,22 @@ pub fn is_repeater_or_room(contact_type: u8) -> bool {
     matches!(contact_type, 2 | 3)
 }
 
+/// Contacts that aren't in `managed_repeaters` and should be pruned when
+/// `observer_node_managed_config` is enforced.
+pub fn contacts_to_prune<'a>(
+    contacts: &'a [ContactDto],
+    managed_repeaters: &[ManagedRepeater],
+) -> Vec<&'a ContactDto> {
+    contacts
+        .iter()
+        .filter(|c| {
+            !managed_repeaters
+                .iter()
+                .any(|r| r.matches(&c.public_key_prefix_hex))
+        })
+        .collect()
+}
+
 /// A node's full identity, resolved from an overheard advertisement via RF
 /// log data (see [`extract_discovered_node`]) rather than from the
 /// companion's own (prefix-only) [`EventType::Advertisement`] push. This is
@@ -592,6 +608,12 @@ pub enum MeshEventKind {
     ManagedRepeaterDeclared {
         name: String,
     },
+    /// `observer_node_managed_config` corrected something on the connected
+    /// node (auto-add, a channel, or a non-managed contact) to keep it in
+    /// an observer-only state.
+    ObserverNodeConfigEnforced {
+        detail: String,
+    },
     /// A repeater's advertisement was overheard for the first time (its
     /// full identity resolved via RF log data); it now shows up in the
     /// contact list as "discovered" until registered.
@@ -709,6 +731,21 @@ impl MeshClient {
             .map(DeviceInfoDto::from)
     }
 
+    /// Number of channel slots the node has, if it answers the query.
+    /// Not exposed via [`DeviceInfoDto`]/the IPC snapshot -- only needed
+    /// internally by `observer_node_managed_config` enforcement, which
+    /// must iterate every slot.
+    pub async fn max_channels(&self) -> Option<u8> {
+        self.inner
+            .commands()
+            .lock()
+            .await
+            .send_device_query()
+            .await
+            .ok()
+            .and_then(|info| info.max_channels)
+    }
+
     pub async fn contacts(&self) -> Vec<ContactDto> {
         self.inner
             .contacts()
@@ -728,7 +765,9 @@ impl MeshClient {
     /// cache. Needed after [`Self::remove_contact`] or
     /// [`Self::declare_contact`]: the node has no push notification for
     /// contact list changes it wasn't the one to initiate, so the cache
-    /// would otherwise stay stale.
+    /// would otherwise stay stale. The daemon's snapshot-building code
+    /// always uses this rather than [`Self::contacts`] for exactly this
+    /// reason — see `daemon::mesh_task::build_snapshot_contacts`.
     pub async fn fetch_contacts(&self) -> Result<Vec<ContactDto>> {
         let contacts = self.inner.commands().lock().await.get_contacts(0).await?;
         Ok(contacts.iter().map(ContactDto::from).collect())
@@ -798,6 +837,57 @@ impl MeshClient {
             .lock()
             .await
             .add_contact(&contact)
+            .await?;
+        Ok(())
+    }
+
+    /// Whether the node currently auto-adds contacts from overheard
+    /// adverts (any bit set in its auto-add configuration bitmask).
+    pub async fn autoadd_enabled(&self) -> Result<bool> {
+        Ok(self
+            .inner
+            .commands()
+            .lock()
+            .await
+            .get_autoadd_config()
+            .await?
+            != 0)
+    }
+
+    /// Disables the node's own contact auto-add for every contact type.
+    pub async fn disable_auto_add_contacts(&self) -> Result<()> {
+        self.inner
+            .commands()
+            .lock()
+            .await
+            .set_autoadd_config(0, None)
+            .await?;
+        Ok(())
+    }
+
+    /// Fetches a channel slot's current name/secret from the node.
+    pub async fn get_channel(
+        &self,
+        channel_idx: u8,
+    ) -> Result<meshcore_rs::events::ChannelInfoData> {
+        Ok(self
+            .inner
+            .commands()
+            .lock()
+            .await
+            .get_channel(channel_idx)
+            .await?)
+    }
+
+    /// Removes a channel slot from the node (per `docs/companion_protocol.md`'s
+    /// "Channel Lifecycle": setting an empty name and all-zero secret deletes
+    /// the channel).
+    pub async fn remove_channel(&self, channel_idx: u8) -> Result<()> {
+        self.inner
+            .commands()
+            .lock()
+            .await
+            .set_channel(channel_idx, "", &[0u8; meshcore_rs::CHANNEL_SECRET_LEN])
             .await?;
         Ok(())
     }
@@ -1816,6 +1906,51 @@ mod tests {
         assert!(is_repeater_or_room(3)); // Room
         assert!(!is_repeater_or_room(4)); // Sensor
         assert!(!is_repeater_or_room(0));
+    }
+
+    // --- contacts_to_prune ---------------------------------------------------
+
+    fn sample_contact(prefix_hex: &str) -> ContactDto {
+        ContactDto {
+            name: format!("Node {prefix_hex}"),
+            public_key_prefix_hex: prefix_hex.to_string(),
+            last_advert_unix: 0,
+            lat: 0.0,
+            lon: 0.0,
+            registered: true,
+            managed: false,
+            contact_type: 2,
+        }
+    }
+
+    #[test]
+    fn contacts_to_prune_keeps_managed_contacts() {
+        let contacts = vec![sample_contact("aabbcc")];
+        let managed = vec![ManagedRepeater {
+            name: "Repeater A".to_string(),
+            public_key_hex: "aabbcc".repeat(10) + "aaaa",
+        }];
+
+        assert!(contacts_to_prune(&contacts, &managed).is_empty());
+    }
+
+    #[test]
+    fn contacts_to_prune_prunes_non_managed_contacts() {
+        let contacts = vec![sample_contact("aabbcc"), sample_contact("ddeeff")];
+        let managed = vec![ManagedRepeater {
+            name: "Repeater A".to_string(),
+            public_key_hex: "aabbcc".repeat(10) + "aaaa",
+        }];
+
+        let pruned = contacts_to_prune(&contacts, &managed);
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].public_key_prefix_hex, "ddeeff");
+    }
+
+    #[test]
+    fn contacts_to_prune_prunes_everything_when_nothing_is_managed() {
+        let contacts = vec![sample_contact("aabbcc"), sample_contact("ddeeff")];
+        assert_eq!(contacts_to_prune(&contacts, &[]).len(), 2);
     }
 
     // --- reconstruct_raw_packet_hex ----------------------------------------

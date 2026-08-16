@@ -12,7 +12,7 @@ description = "Controller and monitor for a MeshCore network"
 
 [workspace.dependencies]
 fez-mesh-controller-core = { path = "core" }
-meshcore-rs = "0.1"
+meshcore-rs = "0.2"
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -35,8 +35,9 @@ opt-level = 3
 lto = true
 strip = true
 
-# Temporary: use the local meshcore-rs checkout (with the RawData/LogData
-# decoding and tokio feature trim from PR #59) instead of the published
-# crates.io version, until it's merged and released.
+# Temporary: use the local meshcore-rs checkout (with the get_/set_autoadd_config
+# commands needed for observer_node_managed_config) instead of the published
+# crates.io version, until they're merged and released. RawData/LogData decoding
+# and the tokio feature trim landed in the published 0.2.0.
 [patch.crates-io]
 meshcore-rs = { path = "../meshcore-rs" }
