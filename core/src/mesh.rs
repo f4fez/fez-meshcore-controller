@@ -83,6 +83,93 @@ impl From<&meshcore_rs::events::DeviceInfoData> for DeviceInfoDto {
     }
 }
 
+/// Core device stats — see [`MeshClient::node_stats`]. Field names match
+/// `meshcore-rs`'s `CoreStatsData` (itself matching `meshcore_py`'s
+/// `reader.py` dict keys), for MQTT/JSON compatibility with downstream
+/// tools that already consume that shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreStatsDto {
+    pub battery_mv: u16,
+    pub uptime_secs: u32,
+    pub errors: u16,
+    pub queue_len: u8,
+}
+
+impl From<meshcore_rs::events::CoreStatsData> for CoreStatsDto {
+    fn from(stats: meshcore_rs::events::CoreStatsData) -> Self {
+        Self {
+            battery_mv: stats.battery_mv,
+            uptime_secs: stats.uptime_secs,
+            errors: stats.errors,
+            queue_len: stats.queue_len,
+        }
+    }
+}
+
+/// Radio stats — see [`MeshClient::node_stats`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RadioStatsDto {
+    pub noise_floor: i16,
+    pub last_rssi: i8,
+    pub last_snr: f32,
+    pub tx_air_secs: u32,
+    pub rx_air_secs: u32,
+}
+
+impl From<meshcore_rs::events::RadioStatsData> for RadioStatsDto {
+    fn from(stats: meshcore_rs::events::RadioStatsData) -> Self {
+        Self {
+            noise_floor: stats.noise_floor,
+            last_rssi: stats.last_rssi,
+            last_snr: stats.last_snr,
+            tx_air_secs: stats.tx_air_secs,
+            rx_air_secs: stats.rx_air_secs,
+        }
+    }
+}
+
+/// Packet counters — see [`MeshClient::node_stats`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PacketStatsDto {
+    pub recv: u32,
+    pub sent: u32,
+    pub flood_tx: u32,
+    pub direct_tx: u32,
+    pub flood_rx: u32,
+    pub direct_rx: u32,
+    pub recv_errors: Option<u32>,
+}
+
+impl From<meshcore_rs::events::PacketStatsData> for PacketStatsDto {
+    fn from(stats: meshcore_rs::events::PacketStatsData) -> Self {
+        Self {
+            recv: stats.recv,
+            sent: stats.sent,
+            flood_tx: stats.flood_tx,
+            direct_tx: stats.direct_tx,
+            flood_rx: stats.flood_rx,
+            direct_rx: stats.direct_rx,
+            recv_errors: stats.recv_errors,
+        }
+    }
+}
+
+/// Node stats, fetched best-effort per category — see
+/// [`MeshClient::node_stats`]. Each category is `None` if its RPC failed
+/// (e.g. older firmware pre-dating `CMD_GET_STATS`), independent of
+/// whether the others succeeded. Flattened when serialized (JSON keys
+/// merge into one flat object, matching `agessaman/meshcore-packet-capture`'s
+/// own `stats` shape) rather than nested `core`/`radio`/`packets` objects.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NodeStatsDto {
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub core: Option<CoreStatsDto>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub radio: Option<RadioStatsDto>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub packets: Option<PacketStatsDto>,
+}
+
 /// A contact (remote node) known to the mesh network, ready to display.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContactDto {
@@ -744,6 +831,24 @@ impl MeshClient {
             .await
             .ok()
             .and_then(|info| info.max_channels)
+    }
+
+    /// Fetches core/radio/packet stats from the node, best-effort per
+    /// category: one RPC failing (e.g. older firmware pre-dating
+    /// `CMD_GET_STATS`, companion-v1.11.0) doesn't blank out the others,
+    /// matching `agessaman/meshcore-packet-capture`'s own per-category
+    /// try/except when refreshing stats.
+    pub async fn node_stats(&self) -> NodeStatsDto {
+        let commands = self.inner.commands();
+        let core = commands.lock().await.get_core_stats().await.ok();
+        let radio = commands.lock().await.get_radio_stats().await.ok();
+        let packets = commands.lock().await.get_packet_stats().await.ok();
+
+        NodeStatsDto {
+            core: core.map(CoreStatsDto::from),
+            radio: radio.map(RadioStatsDto::from),
+            packets: packets.map(PacketStatsDto::from),
+        }
     }
 
     pub async fn contacts(&self) -> Vec<ContactDto> {
@@ -1833,6 +1938,69 @@ mod tests {
         assert_eq!(dto.tx_power_dbm, 22);
         assert_eq!(dto.lat, 48.85);
         assert_eq!(dto.lon, 2.35);
+    }
+
+    #[test]
+    fn node_stats_dto_serializes_flat_when_all_categories_present() {
+        let dto = NodeStatsDto {
+            core: Some(CoreStatsDto {
+                battery_mv: 4012,
+                uptime_secs: 123456,
+                errors: 0,
+                queue_len: 0,
+            }),
+            radio: Some(RadioStatsDto {
+                noise_floor: -120,
+                last_rssi: -80,
+                last_snr: 8.25,
+                tx_air_secs: 120,
+                rx_air_secs: 340,
+            }),
+            packets: Some(PacketStatsDto {
+                recv: 1000,
+                sent: 500,
+                flood_tx: 100,
+                direct_tx: 400,
+                flood_rx: 200,
+                direct_rx: 800,
+                recv_errors: None,
+            }),
+        };
+
+        let json = serde_json::to_value(&dto).unwrap();
+        // Flat, not nested under "core"/"radio"/"packets".
+        assert_eq!(json["battery_mv"], 4012);
+        assert_eq!(json["noise_floor"], -120);
+        assert_eq!(json["recv"], 1000);
+        // recv_errors stays present (explicit null), not omitted -- matches
+        // meshcore_py's legacy-frame behavior.
+        assert!(json.get("recv_errors").is_some());
+        assert!(json["recv_errors"].is_null());
+    }
+
+    #[test]
+    fn node_stats_dto_omits_missing_categories_entirely() {
+        let dto = NodeStatsDto {
+            core: Some(CoreStatsDto {
+                battery_mv: 4012,
+                uptime_secs: 1,
+                errors: 0,
+                queue_len: 0,
+            }),
+            radio: None,
+            packets: None,
+        };
+
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["battery_mv"], 4012);
+        assert!(json.get("noise_floor").is_none());
+        assert!(json.get("recv").is_none());
+    }
+
+    #[test]
+    fn node_stats_dto_default_serializes_to_empty_object() {
+        let json = serde_json::to_value(NodeStatsDto::default()).unwrap();
+        assert_eq!(json, serde_json::json!({}));
     }
 
     #[test]

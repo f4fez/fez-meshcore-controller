@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use fez_mesh_controller_core::ipc::{MeshEvent, MqttBrokerStatus, Snapshot};
-use fez_mesh_controller_core::mesh::{DeviceInfoDto, DiscoveredNode, PacketLogEntry};
+use fez_mesh_controller_core::mesh::{DeviceInfoDto, DiscoveredNode, NodeStatsDto, PacketLogEntry};
 use fez_mesh_controller_core::Config;
 use meshcore_rs::MeshCoreEvent;
 use tokio::sync::{broadcast, mpsc, RwLock};
@@ -66,6 +66,11 @@ pub struct AppState {
     /// connection (see `crate::mesh_task::run`) — consumed by
     /// `crate::mqtt`'s status message, not exposed over IPC.
     pub device_info: RwLock<Option<DeviceInfoDto>>,
+    /// Last-known core/radio/packet stats, queried once per connection and
+    /// refreshed on demand (see `DaemonCommand::RefreshNodeStats`) — read
+    /// by `crate::mqtt`'s status message and exposed over IPC via
+    /// [`Snapshot::node_stats`].
+    pub node_stats: RwLock<Option<NodeStatsDto>>,
 }
 
 impl AppState {
@@ -95,6 +100,7 @@ impl AppState {
             raw_events_tx,
             mqtt_broker_status: RwLock::new(HashMap::new()),
             device_info: RwLock::new(None),
+            node_stats: RwLock::new(None),
         }
     }
 
@@ -128,6 +134,12 @@ impl AppState {
     /// `crate::mqtt` when building the MQTT status message.
     pub async fn set_device_info(&self, info: Option<DeviceInfoDto>) {
         *self.device_info.write().await = info;
+    }
+
+    /// Records the node's latest stats, read back by `crate::mqtt`'s
+    /// status message and [`crate::server::run`]'s `Snapshot` population.
+    pub async fn set_node_stats(&self, stats: NodeStatsDto) {
+        *self.node_stats.write().await = Some(stats);
     }
 
     pub fn next_packet_id(&self) -> u64 {

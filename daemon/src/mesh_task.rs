@@ -55,6 +55,7 @@ pub async fn run(
                     snap.generated_at_unix = now_unix();
                 }
                 state.set_device_info(client.device_info().await).await;
+                state.set_node_stats(client.node_stats().await).await;
                 refresh_snapshot_contacts(&client, &state).await;
                 state.broadcast_event(MeshEvent {
                     at_unix: now_unix(),
@@ -421,6 +422,11 @@ async fn handle_command(cmd: DaemonCommand, client: &MeshClient, state: &AppStat
         } => {
             let result = add_repeater(client, state, &public_key_hex, &name, managed).await;
             let _ = reply.send(result);
+        }
+        DaemonCommand::RefreshNodeStats { reply } => {
+            let stats = client.node_stats().await;
+            state.set_node_stats(stats.clone()).await;
+            let _ = reply.send(stats);
         }
     }
 }

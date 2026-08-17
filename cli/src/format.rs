@@ -39,6 +39,21 @@ pub fn format_last_seen(unix_ts: u32) -> String {
     }
 }
 
+/// Formats a duration in seconds as a compact "Xd Yh"/"Xh Ym"/"Xm" (the two
+/// most significant non-zero units) — e.g. a node's reported uptime.
+pub fn format_uptime(total_secs: u32) -> String {
+    let days = total_secs / 86_400;
+    let hours = (total_secs % 86_400) / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else {
+        format!("{minutes}m")
+    }
+}
+
 pub fn format_coords(lat: f64, lon: f64) -> String {
     if lat == 0.0 && lon == 0.0 {
         "—".to_string()
@@ -89,5 +104,13 @@ mod tests {
     fn strip_flag_emoji_leaves_ordinary_text_and_emoji_untouched() {
         assert_eq!(strip_flag_emoji("F4FEZ Repeater 🛰️"), "F4FEZ Repeater 🛰️");
         assert_eq!(strip_flag_emoji(""), "");
+    }
+
+    #[test]
+    fn format_uptime_shows_the_two_most_significant_units() {
+        assert_eq!(format_uptime(45), "0m");
+        assert_eq!(format_uptime(125), "2m");
+        assert_eq!(format_uptime(3_725), "1h 2m");
+        assert_eq!(format_uptime(93_784), "1d 2h");
     }
 }

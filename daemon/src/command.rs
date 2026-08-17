@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use fez_mesh_controller_core::mesh::NodeStatsDto;
 use tokio::sync::oneshot;
 
 /// A command issued by an IPC client that needs to run against the live
@@ -34,5 +35,12 @@ pub enum DaemonCommand {
         name: String,
         managed: bool,
         reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Not IPC-originated -- sent by `crate::mqtt`'s status-publish path,
+    /// which doesn't hold the live connection itself either. Best-effort:
+    /// no error case, a partial/failed fetch just yields a `NodeStatsDto`
+    /// with fewer fields set rather than blocking the status publish.
+    RefreshNodeStats {
+        reply: oneshot::Sender<NodeStatsDto>,
     },
 }

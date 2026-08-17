@@ -16,7 +16,7 @@ use chrono::{Local, TimeZone};
 use fez_mesh_controller_core::channel;
 use fez_mesh_controller_core::ipc::{MeshEvent, MqttBrokerStatus, MqttBrokerStatusDto};
 use fez_mesh_controller_core::mesh::{
-    ContactDto, ControlPayloadInfo, MeshEventKind, PacketHeaderInfo, PacketLogEntry,
+    ContactDto, ControlPayloadInfo, MeshEventKind, NodeStatsDto, PacketHeaderInfo, PacketLogEntry,
 };
 use fez_mesh_controller_core::region;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -27,7 +27,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::format::{format_coords, format_last_seen, strip_flag_emoji};
+use crate::format::{format_coords, format_last_seen, format_uptime, strip_flag_emoji};
 use crate::tui::app::{App, Page};
 use crate::tui::packet_group::{path_hop_hashes, PacketGroup};
 
@@ -174,10 +174,68 @@ fn draw_self_info(frame: &mut Frame, app: &App, area: Rect) {
         lines.extend(app.snapshot.mqtt_brokers.iter().map(mqtt_broker_line));
     }
 
+    if let Some(stats) = &app.snapshot.node_stats {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Stats:",
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        )));
+        lines.extend(node_stats_lines(stats));
+    }
+
     frame.render_widget(
         Paragraph::new(lines).block(block("🛰️  Observer node")),
         area,
     );
+}
+
+/// Lines for the Observer node block's "Stats:" subsection — one line per
+/// available category (core/radio/packets), omitted entirely when its RPC
+/// never succeeded (see [`fez_mesh_controller_core::mesh::MeshClient::node_stats`]).
+fn node_stats_lines(stats: &NodeStatsDto) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    if let Some(core) = &stats.core {
+        lines.push(field_line(
+            "  🔋 Battery",
+            format!(
+                "{} mV, up {}",
+                core.battery_mv,
+                format_uptime(core.uptime_secs)
+            ),
+        ));
+        lines.push(field_line(
+            "  ⚠️  Errors",
+            format!("{} (queue: {})", core.errors, core.queue_len),
+        ));
+    }
+
+    if let Some(radio) = &stats.radio {
+        lines.push(field_line(
+            "  📡 Radio",
+            format!(
+                "NF {} RSSI {} SNR {:.1}dB",
+                radio.noise_floor, radio.last_rssi, radio.last_snr
+            ),
+        ));
+        lines.push(field_line(
+            "  ✈️  Airtime",
+            format!("TX {}s / RX {}s", radio.tx_air_secs, radio.rx_air_secs),
+        ));
+    }
+
+    if let Some(packets) = &stats.packets {
+        let errors = packets
+            .recv_errors
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "n/a".to_string());
+        lines.push(field_line(
+            "  📦 Packets",
+            format!("↓{} ↑{}, errors {errors}", packets.recv, packets.sent),
+        ));
+    }
+
+    lines
 }
 
 /// One line for a configured MQTT broker in the Observer node block: its
@@ -1559,6 +1617,89 @@ mod render_tests {
         assert!(text.contains("Connected"));
         assert!(text.contains("Backup"));
         assert!(text.contains("Error: connection refused"));
+    }
+
+    #[test]
+    fn observer_node_block_hides_stats_section_when_node_stats_unavailable() {
+        let mut app = App::new();
+
+        let text = render(&mut app, 120, 30);
+
+        assert!(!text.contains("Stats:"));
+    }
+
+    #[test]
+    fn observer_node_block_shows_node_stats_when_available() {
+        use fez_mesh_controller_core::ipc::Snapshot;
+        use fez_mesh_controller_core::mesh::{
+            CoreStatsDto, NodeStatsDto, PacketStatsDto, RadioStatsDto,
+        };
+
+        let mut app = App::new();
+        app.apply_snapshot(Snapshot {
+            node_stats: Some(NodeStatsDto {
+                core: Some(CoreStatsDto {
+                    battery_mv: 4012,
+                    uptime_secs: 3_725,
+                    errors: 2,
+                    queue_len: 1,
+                }),
+                radio: Some(RadioStatsDto {
+                    noise_floor: -120,
+                    last_rssi: -80,
+                    last_snr: 8.3,
+                    tx_air_secs: 120,
+                    rx_air_secs: 340,
+                }),
+                packets: Some(PacketStatsDto {
+                    recv: 1000,
+                    sent: 500,
+                    flood_tx: 100,
+                    direct_tx: 400,
+                    flood_rx: 200,
+                    direct_rx: 800,
+                    recv_errors: Some(3),
+                }),
+            }),
+            ..Default::default()
+        });
+
+        let text = render(&mut app, 140, 30);
+
+        assert!(text.contains("Stats:"));
+        assert!(text.contains("4012 mV"));
+        assert!(text.contains("1h 2m"));
+        assert!(text.contains("NF -120 RSSI -80 SNR 8.3dB"));
+        assert!(text.contains("TX 120s / RX 340s"));
+        assert!(text.contains("errors 3"));
+    }
+
+    #[test]
+    fn observer_node_block_omits_categories_missing_from_node_stats() {
+        use fez_mesh_controller_core::ipc::Snapshot;
+        use fez_mesh_controller_core::mesh::{CoreStatsDto, NodeStatsDto};
+
+        let mut app = App::new();
+        app.apply_snapshot(Snapshot {
+            node_stats: Some(NodeStatsDto {
+                core: Some(CoreStatsDto {
+                    battery_mv: 4012,
+                    uptime_secs: 1,
+                    errors: 0,
+                    queue_len: 0,
+                }),
+                radio: None,
+                packets: None,
+            }),
+            ..Default::default()
+        });
+
+        let text = render(&mut app, 140, 30);
+
+        assert!(text.contains("Stats:"));
+        assert!(text.contains("4012 mV"));
+        assert!(!text.contains("Airtime"));
+        assert!(!text.contains("NF "));
     }
 
     #[test]

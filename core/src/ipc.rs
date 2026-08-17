@@ -24,7 +24,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::RegionConfig;
-use crate::mesh::{ContactDto, MeshEventKind, PacketLogEntry, SelfInfoDto};
+use crate::mesh::{ContactDto, MeshEventKind, NodeStatsDto, PacketLogEntry, SelfInfoDto};
 
 /// IPC protocol version, to bump on incompatible changes.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -113,6 +113,10 @@ pub struct Snapshot {
     /// and their live connection status, shown in the TUI's "Observer node"
     /// block.
     pub mqtt_brokers: Vec<MqttBrokerStatusDto>,
+    /// The node's last-known core/radio/packet stats, shown in the TUI's
+    /// "Observer node" block — see
+    /// [`crate::mesh::MeshClient::node_stats`].
+    pub node_stats: Option<NodeStatsDto>,
 }
 
 /// A configured MQTT broker's name and live connection status — see

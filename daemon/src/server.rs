@@ -195,6 +195,8 @@ async fn current_snapshot(state: &Arc<AppState>) -> fez_mesh_controller_core::ip
         )
         .collect();
 
+    snap.node_stats = state.node_stats.read().await.clone();
+
     snap
 }
 

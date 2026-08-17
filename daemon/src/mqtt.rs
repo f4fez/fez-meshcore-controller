@@ -38,7 +38,7 @@ use fez_mesh_controller_core::config::{MqttBrokerConfig, MqttTransportProtocol};
 use fez_mesh_controller_core::ipc::{MeshEvent, MqttBrokerStatus};
 use fez_mesh_controller_core::mesh::{
     build_packet_log_entry, hex_encode, reconstruct_raw_packet_hex, DeviceInfoDto, MeshEventKind,
-    PacketLogEntry, SelfInfoDto,
+    NodeStatsDto, PacketLogEntry, SelfInfoDto,
 };
 use meshcore_rs::events::EventPayload;
 use meshcore_rs::{EventType, MeshCoreEvent};
@@ -46,11 +46,19 @@ use rumqttc::{AsyncClient, Event as MqttEvent, LastWill, MqttOptions, Packet, Qo
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::oneshot;
 use tracing::{info, warn};
 
+use crate::command::DaemonCommand;
 use crate::state::AppState;
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+/// Cap on how long a status publish waits for a fresh stats fetch (3 RPC
+/// round-trips to the node) before falling back to the cached value —
+/// stats are best-effort, this must never stall the status publish for
+/// long, e.g. while the mesh is disconnected and nobody is polling
+/// `command_rx`.
+const STATS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Identifies this daemon as the publisher, mirroring the `<name>/<version>`
 /// shape the Python bridges use for their own `client_version` field.
@@ -421,8 +429,8 @@ fn raw_json(entry: &PacketLogEntry, self_info: &SelfInfoDto, now: DateTime<Utc>)
 
 /// Publishes the bridge's own connection-status topic (`<prefix>/status`),
 /// retained — matches `agessaman/meshcore-packet-capture`'s own
-/// `publish_status()` JSON shape (verified against its source; `stats` is
-/// intentionally omitted, see `status_message_json`). Publishes **nothing**
+/// `publish_status()` JSON shape (verified against its source), including
+/// its `stats` field — see [`status_message_json`]. Publishes **nothing**
 /// until `self_info` (i.e. `origin`/`origin_id`) is known — never sends a
 /// message with placeholder/undefined values.
 async fn publish_current_status(
@@ -438,7 +446,14 @@ async fn publish_current_status(
         return;
     };
     let device_info = state.device_info.read().await.clone();
-    let body = status_message_json(mesh_connected, &self_info, device_info.as_ref(), Utc::now());
+    let node_stats = refresh_node_stats(state).await;
+    let body = status_message_json(
+        mesh_connected,
+        &self_info,
+        device_info.as_ref(),
+        node_stats.as_ref(),
+        Utc::now(),
+    );
     let topic = resolve_topic_template(&config.status_topic, config, &self_info);
     if let Err(err) = client
         .publish(
@@ -453,11 +468,32 @@ async fn publish_current_status(
     }
 }
 
+/// Fetches a fresh [`NodeStatsDto`] before a status publish, mirroring
+/// `agessaman`'s own `refresh_stats(force=True)` right before
+/// `publish_status`. `mqtt.rs` doesn't hold the live `MeshClient` (only
+/// `mesh_task.rs` does), so this asks for a refresh via
+/// [`DaemonCommand::RefreshNodeStats`] and waits briefly — on timeout
+/// (e.g. the mesh is currently disconnected and nobody is polling
+/// `command_rx`) or a dropped reply, falls back to whatever's already
+/// cached in [`AppState::node_stats`] rather than failing the publish.
+async fn refresh_node_stats(state: &AppState) -> Option<NodeStatsDto> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if state
+        .command_tx
+        .send(DaemonCommand::RefreshNodeStats { reply: reply_tx })
+        .await
+        .is_ok()
+    {
+        if let Ok(Ok(stats)) = tokio::time::timeout(STATS_REFRESH_TIMEOUT, reply_rx).await {
+            return Some(stats);
+        }
+    }
+    state.node_stats.read().await.clone()
+}
+
 /// Builds the `<prefix>/status` message body — matches
 /// `agessaman/meshcore-packet-capture`'s `publish_status()`
-/// (`packet_capture.py:2792-2830`) field-for-field, except `stats` (omitted;
-/// would require new `meshcore-rs` support for the `STATS_CORE`/`RADIO`/
-/// `PACKETS` device commands — a separate follow-up).
+/// (`packet_capture.py:2792-2830`) field-for-field, including `stats`.
 ///
 /// `self_info` is required (not `Option`) rather than falling back to a
 /// placeholder — callers must already have confirmed it's known, so this
@@ -469,10 +505,19 @@ async fn publish_current_status(
 /// keep their last-known values (`AppState` never clears them,
 /// `mesh_task.rs`), so `"offline"` naturally still carries the last-known
 /// `model`/`firmware_version`/`radio` rather than resetting them.
+///
+/// `stats`, when present, is only included while `status == "online"` —
+/// matching `agessaman`'s own `if status.lower() == "online"` gate exactly
+/// (`packet_capture.py:2806-2810`) — with `packets_sent`/`packets_received`
+/// aliases added on top of the packet counters
+/// (`agessaman`'s `normalize_packet_stats`, `packet_capture.py:2850-2858`,
+/// not part of `meshcore_py`/`meshcore-rs` itself, so added here rather
+/// than on [`fez_mesh_controller_core::mesh::PacketStatsDto`]).
 fn status_message_json(
     mesh_connected: bool,
     self_info: &SelfInfoDto,
     device_info: Option<&DeviceInfoDto>,
+    node_stats: Option<&NodeStatsDto>,
     now: DateTime<Utc>,
 ) -> Value {
     let status = if mesh_connected && device_info.is_some() {
@@ -510,6 +555,23 @@ fn status_message_json(
         )),
     );
     fields.insert("client_version".to_string(), json!(CLIENT_VERSION));
+
+    if status == "online" {
+        if let Some(node_stats) = node_stats {
+            if let Value::Object(mut stats_fields) = serde_json::to_value(node_stats)
+                .unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
+            {
+                if let Some(packets) = &node_stats.packets {
+                    stats_fields.insert("packets_sent".to_string(), json!(packets.sent));
+                    stats_fields.insert("packets_received".to_string(), json!(packets.recv));
+                }
+                if !stats_fields.is_empty() {
+                    fields.insert("stats".to_string(), Value::Object(stats_fields));
+                }
+            }
+        }
+    }
+
     Value::Object(fields)
 }
 
@@ -730,6 +792,7 @@ fn screaming_snake_case(pascal_case: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fez_mesh_controller_core::mesh::{CoreStatsDto, PacketStatsDto, RadioStatsDto};
     use meshcore_rs::events::{ChannelMessage, ContactMessage, LogData, MeshPacketHeader};
     use meshcore_rs::packets::RouteType;
     use meshcore_rs::PayloadType;
@@ -909,12 +972,40 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    fn sample_node_stats() -> NodeStatsDto {
+        NodeStatsDto {
+            core: Some(CoreStatsDto {
+                battery_mv: 4012,
+                uptime_secs: 123456,
+                errors: 0,
+                queue_len: 0,
+            }),
+            radio: Some(RadioStatsDto {
+                noise_floor: -120,
+                last_rssi: -80,
+                last_snr: 8.25,
+                tx_air_secs: 120,
+                rx_air_secs: 340,
+            }),
+            packets: Some(PacketStatsDto {
+                recv: 1000,
+                sent: 500,
+                flood_tx: 100,
+                direct_tx: 400,
+                flood_rx: 200,
+                direct_rx: 800,
+                recv_errors: Some(3),
+            }),
+        }
+    }
+
     #[test]
     fn status_message_json_is_online_when_mesh_connected_and_device_info_known() {
         let value = status_message_json(
             true,
             &sample_self_info(),
             Some(&sample_device_info()),
+            None,
             sample_now(),
         );
 
@@ -936,10 +1027,48 @@ mod tests {
     }
 
     #[test]
+    fn status_message_json_includes_stats_when_online_with_packets_aliases() {
+        let value = status_message_json(
+            true,
+            &sample_self_info(),
+            Some(&sample_device_info()),
+            Some(&sample_node_stats()),
+            sample_now(),
+        );
+
+        assert_eq!(value["status"], "online");
+        let stats = &value["stats"];
+        // Flat, matching agessaman's own merged shape -- not nested under
+        // "core"/"radio"/"packets".
+        assert_eq!(stats["battery_mv"], 4012);
+        assert_eq!(stats["noise_floor"], -120);
+        assert_eq!(stats["recv"], 1000);
+        assert_eq!(stats["recv_errors"], 3);
+        // agessaman's own normalize_packet_stats aliases.
+        assert_eq!(stats["packets_sent"], 500);
+        assert_eq!(stats["packets_received"], 1000);
+    }
+
+    #[test]
+    fn status_message_json_omits_stats_when_offline_even_if_present() {
+        // Mirrors agessaman's own `if status.lower() == "online"` gate.
+        let value = status_message_json(
+            false,
+            &sample_self_info(),
+            Some(&sample_device_info()),
+            Some(&sample_node_stats()),
+            sample_now(),
+        );
+
+        assert_eq!(value["status"], "offline");
+        assert!(value.get("stats").is_none());
+    }
+
+    #[test]
     fn status_message_json_is_offline_and_omits_device_fields_when_device_info_unknown() {
         // Connected, but the device-info query hasn't succeeded (yet, or ever)
         // — per the user's rule, publish only what's known, status offline.
-        let value = status_message_json(true, &sample_self_info(), None, sample_now());
+        let value = status_message_json(true, &sample_self_info(), None, None, sample_now());
 
         assert_eq!(value["status"], "offline");
         assert_eq!(value["origin"], "F4FEZ_BRIDGE");
@@ -961,6 +1090,7 @@ mod tests {
             false,
             &sample_self_info(),
             Some(&sample_device_info()),
+            None,
             sample_now(),
         );
 
