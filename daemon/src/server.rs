@@ -219,7 +219,7 @@ mod tests {
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
     use tokio::sync::mpsc;
 
-    fn make_state() -> (Arc<AppState>, mpsc::Receiver<DaemonCommand>) {
+    async fn make_state() -> (Arc<AppState>, mpsc::Receiver<DaemonCommand>) {
         let (command_tx, command_rx) = mpsc::channel(8);
         let config = Config {
             node_label: "test-node".to_string(),
@@ -233,7 +233,7 @@ mod tests {
                 log_level: "info".to_string(),
                 log_dir: PathBuf::from("/tmp/fez-mesh-controller-test/logs"),
                 packet_log_capacity: 500,
-                discovered_nodes_capacity: 200,
+                db_path: PathBuf::from(":memory:"),
                 observer_node_managed_config: true,
             },
             managed_repeaters: vec![],
@@ -241,11 +241,15 @@ mod tests {
             hashtag_channels: vec![],
             mqtt_brokers: vec![],
         };
-        let state = Arc::new(AppState::new(
-            command_tx,
-            config,
-            PathBuf::from("/tmp/fez-mesh-controller-test.toml"),
-        ));
+        let state = Arc::new(
+            AppState::new(
+                command_tx,
+                config,
+                PathBuf::from("/tmp/fez-mesh-controller-test.toml"),
+            )
+            .await
+            .expect("AppState::new with an in-memory DB should never fail"),
+        );
         (state, command_rx)
     }
 
@@ -295,7 +299,7 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_sends_hello_snapshot_then_packet_log() {
-        let (state, _command_rx) = make_state();
+        let (state, _command_rx) = make_state().await;
         let (mut reader, _writer) = spawn_client(state);
 
         match recv(&mut reader).await {
@@ -314,7 +318,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_snapshot_returns_a_fresh_snapshot() {
-        let (state, _command_rx) = make_state();
+        let (state, _command_rx) = make_state().await;
         let (mut reader, mut writer) = spawn_client(state);
         drain_handshake(&mut reader).await;
 
@@ -342,7 +346,7 @@ mod tests {
                 log_level: "info".to_string(),
                 log_dir: PathBuf::from("/tmp/fez-mesh-controller-test/logs"),
                 packet_log_capacity: 500,
-                discovered_nodes_capacity: 200,
+                db_path: PathBuf::from(":memory:"),
                 observer_node_managed_config: true,
             },
             managed_repeaters: vec![],
@@ -353,11 +357,15 @@ mod tests {
             hashtag_channels: vec![],
             mqtt_brokers: vec![],
         };
-        let state = Arc::new(AppState::new(
-            command_tx,
-            config,
-            PathBuf::from("/tmp/fez-mesh-controller-test.toml"),
-        ));
+        let state = Arc::new(
+            AppState::new(
+                command_tx,
+                config,
+                PathBuf::from("/tmp/fez-mesh-controller-test.toml"),
+            )
+            .await
+            .expect("AppState::new with an in-memory DB should never fail"),
+        );
 
         let snap = current_snapshot(&state).await;
 
@@ -383,7 +391,7 @@ mod tests {
                 log_level: "info".to_string(),
                 log_dir: PathBuf::from("/tmp/fez-mesh-controller-test/logs"),
                 packet_log_capacity: 500,
-                discovered_nodes_capacity: 200,
+                db_path: PathBuf::from(":memory:"),
                 observer_node_managed_config: true,
             },
             managed_repeaters: vec![],
@@ -440,11 +448,15 @@ mod tests {
                 },
             ],
         };
-        let state = Arc::new(AppState::new(
-            command_tx,
-            config,
-            PathBuf::from("/tmp/fez-mesh-controller-test.toml"),
-        ));
+        let state = Arc::new(
+            AppState::new(
+                command_tx,
+                config,
+                PathBuf::from("/tmp/fez-mesh-controller-test.toml"),
+            )
+            .await
+            .expect("AppState::new with an in-memory DB should never fail"),
+        );
         state
             .set_mqtt_broker_status("Home Assistant", MqttBrokerStatus::Connected)
             .await;
@@ -469,7 +481,7 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_event_is_forwarded_to_the_client() {
-        let (state, _command_rx) = make_state();
+        let (state, _command_rx) = make_state().await;
         let (mut reader, _writer) = spawn_client(state.clone());
         drain_handshake(&mut reader).await;
 
@@ -483,7 +495,7 @@ mod tests {
 
     #[tokio::test]
     async fn recorded_packet_is_forwarded_to_the_client() {
-        let (state, _command_rx) = make_state();
+        let (state, _command_rx) = make_state().await;
         let (mut reader, _writer) = spawn_client(state.clone());
         drain_handshake(&mut reader).await;
 
@@ -507,7 +519,7 @@ mod tests {
 
     #[tokio::test]
     async fn mutating_command_success_sends_no_error() {
-        let (state, mut command_rx) = make_state();
+        let (state, mut command_rx) = make_state().await;
         let (mut reader, mut writer) = spawn_client(state);
         drain_handshake(&mut reader).await;
 
@@ -537,7 +549,7 @@ mod tests {
 
     #[tokio::test]
     async fn mutating_command_failure_sends_an_error() {
-        let (state, mut command_rx) = make_state();
+        let (state, mut command_rx) = make_state().await;
         let (mut reader, mut writer) = spawn_client(state);
         drain_handshake(&mut reader).await;
 
@@ -563,7 +575,7 @@ mod tests {
 
     #[tokio::test]
     async fn mutating_command_without_a_consumer_fails_fast() {
-        let (state, command_rx) = make_state();
+        let (state, command_rx) = make_state().await;
         drop(command_rx); // nobody will ever receive the command
         let (mut reader, mut writer) = spawn_client(state);
         drain_handshake(&mut reader).await;

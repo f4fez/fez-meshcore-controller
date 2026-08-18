@@ -329,10 +329,10 @@ pub struct DaemonConfig {
     /// page F3), oldest evicted first.
     #[serde(default = "default_packet_log_capacity")]
     pub packet_log_capacity: usize,
-    /// Number of overheard-but-not-yet-a-contact nodes kept in the
-    /// discovered-nodes cache, least-recently-seen evicted first.
-    #[serde(default = "default_discovered_nodes_capacity")]
-    pub discovered_nodes_capacity: usize,
+    /// Path of the SQLite database persisting overheard-but-not-yet-a-contact
+    /// repeaters/room-servers ("heard" network state) across restarts.
+    #[serde(default = "default_db_path")]
+    pub db_path: PathBuf,
     /// When true, the daemon actively locks this node down to an
     /// observer-only state on every (re)connect: disables the node's own
     /// contact auto-add, removes every channel (Public and
@@ -350,7 +350,7 @@ impl Default for DaemonConfig {
             log_level: "info".to_string(),
             log_dir: default_log_dir(),
             packet_log_capacity: default_packet_log_capacity(),
-            discovered_nodes_capacity: default_discovered_nodes_capacity(),
+            db_path: default_db_path(),
             observer_node_managed_config: default_observer_node_managed_config(),
         }
     }
@@ -389,9 +389,15 @@ pub fn default_packet_log_capacity() -> usize {
     500
 }
 
-/// Default number of entries kept in the discovered-nodes cache.
-pub fn default_discovered_nodes_capacity() -> usize {
-    200
+/// Default path of the "heard" repeaters/room-servers SQLite database (same
+/// fallback chain as [`default_log_dir`]: XDG state directory, then local
+/// data directory, then the OS temp directory).
+pub fn default_db_path() -> PathBuf {
+    dirs::state_dir()
+        .or_else(dirs::data_local_dir)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(APP_DIR_NAME)
+        .join("repeaters.sqlite3")
 }
 
 /// Default for [`DaemonConfig::observer_node_managed_config`] — enforce the
@@ -451,7 +457,7 @@ mod tests {
                 log_level: "info".to_string(),
                 log_dir: PathBuf::from("/tmp/fez-mesh-controller/logs"),
                 packet_log_capacity: 500,
-                discovered_nodes_capacity: 200,
+                db_path: PathBuf::from("/tmp/fez-mesh-controller/repeaters.sqlite3"),
                 observer_node_managed_config: true,
             },
             managed_repeaters: vec![ManagedRepeater {
@@ -554,8 +560,11 @@ mod tests {
     }
 
     #[test]
-    fn daemon_config_default_uses_200_discovered_nodes_capacity() {
-        assert_eq!(DaemonConfig::default().discovered_nodes_capacity, 200);
+    fn daemon_config_default_db_path_ends_with_repeaters_sqlite3() {
+        assert_eq!(
+            DaemonConfig::default().db_path.file_name().unwrap(),
+            "repeaters.sqlite3"
+        );
     }
 
     #[test]
@@ -615,7 +624,7 @@ mod tests {
         assert!(config.hashtag_channels.is_empty());
         assert!(config.mqtt_brokers.is_empty());
         assert_eq!(config.daemon.packet_log_capacity, 500);
-        assert_eq!(config.daemon.discovered_nodes_capacity, 200);
+        assert_eq!(config.daemon.db_path, default_db_path());
         assert_eq!(config.daemon.log_dir, default_log_dir());
         assert!(config.daemon.observer_node_managed_config);
     }

@@ -247,6 +247,15 @@ pub struct DiscoveredNode {
     pub lat: f64,
     pub lon: f64,
     pub last_seen_unix: i64,
+    /// Signal-to-noise ratio of the RF log data this sighting was decoded
+    /// from — `None` if never captured alongside an advertisement.
+    pub last_snr: Option<f32>,
+    /// Received signal strength (dBm) of the RF log data this sighting was
+    /// decoded from.
+    pub last_rssi: Option<i16>,
+    /// Hop count (`path_len`) of the RF log data this sighting was decoded
+    /// from.
+    pub last_hop_count: Option<u8>,
 }
 
 /// Extracts a node's full identity from a raw `meshcore-rs` event, if it's
@@ -274,6 +283,9 @@ pub fn extract_discovered_node(event: &MeshCoreEvent, now_unix: i64) -> Option<D
         lat: adv.lat.map(|v| v as f64 / 1_000_000.0).unwrap_or(0.0),
         lon: adv.lon.map(|v| v as f64 / 1_000_000.0).unwrap_or(0.0),
         last_seen_unix: now_unix,
+        last_snr: Some(log.snr),
+        last_rssi: Some(log.rssi),
+        last_hop_count: Some(header.path_len),
     })
 }
 
@@ -1153,6 +1165,9 @@ mod tests {
         assert_eq!(node.lat, 48.85);
         assert_eq!(node.lon, 2.35);
         assert_eq!(node.last_seen_unix, 1_700_000_042);
+        assert_eq!(node.last_snr, Some(4.0));
+        assert_eq!(node.last_rssi, Some(-90));
+        assert_eq!(node.last_hop_count, Some(2));
     }
 
     #[test]

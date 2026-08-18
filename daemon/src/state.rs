@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,8 +24,10 @@ use fez_mesh_controller_core::mesh::{DeviceInfoDto, DiscoveredNode, NodeStatsDto
 use fez_mesh_controller_core::Config;
 use meshcore_rs::MeshCoreEvent;
 use tokio::sync::{broadcast, mpsc, RwLock};
+use tracing::warn;
 
 use crate::command::DaemonCommand;
+use crate::repeater_db::RepeaterDb;
 
 /// State shared between the mesh connection task and the IPC server.
 pub struct AppState {
@@ -41,11 +44,13 @@ pub struct AppState {
     /// Nodes (repeaters/room servers) overheard but not (yet) a companion
     /// contact, keyed by 12-hex-char public key prefix. Populated from
     /// decoded RF log data, which (unlike the plain `Advertisement` push)
-    /// carries the full public key needed to register them. Bounded to
-    /// `discovered_repeaters_capacity` entries, least-recently-seen
-    /// evicted first — see [`Self::upsert_discovered_node`].
+    /// carries the full public key needed to register them. This is a
+    /// write-through, startup-hydrated mirror of [`Self::repeater_db`] (the
+    /// actual source of truth) — see [`Self::upsert_discovered_node`].
     pub discovered_repeaters: RwLock<HashMap<String, DiscoveredNode>>,
-    pub discovered_repeaters_capacity: usize,
+    /// Persists [`Self::discovered_repeaters`] in SQLite, surviving daemon
+    /// restarts.
+    pub repeater_db: RepeaterDb,
     /// Rotating cache of raw packets (newest first), for the TUI's packet
     /// log page. Bounded to `packet_log_capacity` entries.
     pub packet_log: RwLock<VecDeque<PacketLogEntry>>,
@@ -74,25 +79,30 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(
+    /// Opens/migrates the SQLite repeater DB and hydrates
+    /// [`Self::discovered_repeaters`] from it before returning, so every
+    /// previously-heard repeater/room-server is already known immediately
+    /// at startup, before the mesh connection even completes.
+    pub async fn new(
         command_tx: mpsc::Sender<DaemonCommand>,
         config: Config,
         config_path: PathBuf,
-    ) -> Self {
+    ) -> rusqlite::Result<Self> {
         let (events_tx, _rx) = broadcast::channel(256);
         let (packet_log_tx, _rx) = broadcast::channel(256);
         let (raw_events_tx, _rx) = broadcast::channel(256);
         let packet_log_capacity = config.daemon.packet_log_capacity.max(1);
-        let discovered_repeaters_capacity = config.daemon.discovered_nodes_capacity.max(1);
-        Self {
+        let repeater_db = RepeaterDb::open(config.daemon.db_path.clone()).await?;
+        let discovered_repeaters = repeater_db.load_all().await?;
+        Ok(Self {
             snapshot: RwLock::new(Snapshot::default()),
             events_tx,
             started_at: Instant::now(),
             command_tx,
             config: RwLock::new(config),
             config_path,
-            discovered_repeaters: RwLock::new(HashMap::new()),
-            discovered_repeaters_capacity,
+            discovered_repeaters: RwLock::new(discovered_repeaters),
+            repeater_db,
             packet_log: RwLock::new(VecDeque::with_capacity(packet_log_capacity)),
             packet_log_capacity,
             packet_log_tx,
@@ -101,7 +111,7 @@ impl AppState {
             mqtt_broker_status: RwLock::new(HashMap::new()),
             device_info: RwLock::new(None),
             node_stats: RwLock::new(None),
-        }
+        })
     }
 
     pub fn uptime_secs(&self) -> u64 {
@@ -159,27 +169,43 @@ impl AppState {
         let _ = self.packet_log_tx.send(entry);
     }
 
-    /// Records a newly-overheard node in the discovered-nodes cache
-    /// (refreshing its entry if already known), evicting the
-    /// least-recently-seen one if the cache is at capacity. Returns
-    /// whether this is a genuinely new node, not just an updated
-    /// last-seen timestamp for one already tracked.
+    /// Records a newly-overheard node: persists to [`Self::repeater_db`]
+    /// first (write-through -- logged but not fatal on failure, the
+    /// in-memory mirror must stay usable even if the DB write fails, e.g.
+    /// disk full), then merges it into [`Self::discovered_repeaters`]
+    /// (matching the DB's own "don't erase a previously-known position
+    /// with a sighting that didn't carry one" semantics, see
+    /// [`RepeaterDb::upsert`]) rather than blindly overwriting the whole
+    /// entry. Returns whether this is a genuinely new node, not just an
+    /// updated last-seen timestamp for one already tracked.
     pub async fn upsert_discovered_node(&self, node: DiscoveredNode) -> bool {
-        let mut discovered = self.discovered_repeaters.write().await;
-        let is_new = !discovered.contains_key(&node.public_key_prefix_hex);
-
-        if is_new && discovered.len() >= self.discovered_repeaters_capacity {
-            if let Some(oldest_prefix) = discovered
-                .iter()
-                .min_by_key(|(_, n)| n.last_seen_unix)
-                .map(|(prefix, _)| prefix.clone())
-            {
-                discovered.remove(&oldest_prefix);
-            }
+        if let Err(err) = self.repeater_db.upsert(&node).await {
+            warn!(error = %err, "failed to persist discovered node to the repeater database");
         }
 
-        discovered.insert(node.public_key_prefix_hex.clone(), node);
-        is_new
+        let mut discovered = self.discovered_repeaters.write().await;
+        match discovered.entry(node.public_key_prefix_hex.clone()) {
+            Entry::Occupied(mut entry) => {
+                let existing = entry.get_mut();
+                existing.name = node.name;
+                existing.public_key_hex = node.public_key_hex;
+                existing.adv_type = node.adv_type;
+                existing.is_repeater = node.is_repeater;
+                if node.lat != 0.0 || node.lon != 0.0 {
+                    existing.lat = node.lat;
+                    existing.lon = node.lon;
+                }
+                existing.last_snr = node.last_snr.or(existing.last_snr);
+                existing.last_rssi = node.last_rssi.or(existing.last_rssi);
+                existing.last_hop_count = node.last_hop_count.or(existing.last_hop_count);
+                existing.last_seen_unix = node.last_seen_unix;
+                false
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(node);
+                true
+            }
+        }
     }
 }
 
@@ -189,9 +215,8 @@ mod tests {
     use fez_mesh_controller_core::mesh::MeshEventKind;
     use fez_mesh_controller_core::{Config, ConnectionConfig, DaemonConfig};
 
-    fn make_state(packet_log_capacity: usize) -> AppState {
-        let (command_tx, _command_rx) = mpsc::channel(1);
-        let config = Config {
+    fn sample_config(packet_log_capacity: usize, db_path: PathBuf) -> Config {
+        Config {
             node_label: "test-node".to_string(),
             connection: ConnectionConfig::Tcp {
                 host: "127.0.0.1".to_string(),
@@ -203,19 +228,29 @@ mod tests {
                 log_level: "info".to_string(),
                 log_dir: PathBuf::from("/tmp/fez-mesh-controller-test/logs"),
                 packet_log_capacity,
-                discovered_nodes_capacity: 200,
+                db_path,
                 observer_node_managed_config: true,
             },
             managed_repeaters: vec![],
             regions: vec![],
             hashtag_channels: vec![],
             mqtt_brokers: vec![],
-        };
+        }
+    }
+
+    /// Each call gets its own isolated in-memory DB (`:memory:` opens a
+    /// fresh, private database per connection) -- no cross-test state, no
+    /// filesystem cleanup needed.
+    async fn make_state(packet_log_capacity: usize) -> AppState {
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let config = sample_config(packet_log_capacity, PathBuf::from(":memory:"));
         AppState::new(
             command_tx,
             config,
             PathBuf::from("/tmp/fez-mesh-controller-test.toml"),
         )
+        .await
+        .expect("AppState::new with an in-memory DB should never fail")
     }
 
     fn sample_packet(id: u64) -> PacketLogEntry {
@@ -230,35 +265,6 @@ mod tests {
         }
     }
 
-    fn make_state_with_discovered_capacity(discovered_nodes_capacity: usize) -> AppState {
-        let (command_tx, _command_rx) = mpsc::channel(1);
-        let config = Config {
-            node_label: "test-node".to_string(),
-            connection: ConnectionConfig::Tcp {
-                host: "127.0.0.1".to_string(),
-                port: 5000,
-            },
-            daemon: DaemonConfig {
-                socket_path: PathBuf::from("/tmp/fez-mesh-controller-test.sock"),
-                refresh_interval_secs: 5,
-                log_level: "info".to_string(),
-                log_dir: PathBuf::from("/tmp/fez-mesh-controller-test/logs"),
-                packet_log_capacity: 500,
-                discovered_nodes_capacity,
-                observer_node_managed_config: true,
-            },
-            managed_repeaters: vec![],
-            regions: vec![],
-            hashtag_channels: vec![],
-            mqtt_brokers: vec![],
-        };
-        AppState::new(
-            command_tx,
-            config,
-            PathBuf::from("/tmp/fez-mesh-controller-test.toml"),
-        )
-    }
-
     fn sample_node(prefix: &str, last_seen_unix: i64) -> DiscoveredNode {
         DiscoveredNode {
             name: "Node".to_string(),
@@ -269,51 +275,71 @@ mod tests {
             lat: 0.0,
             lon: 0.0,
             last_seen_unix,
+            last_snr: None,
+            last_rssi: None,
+            last_hop_count: None,
         }
     }
 
-    #[test]
-    fn next_packet_id_increments_starting_at_one() {
-        let state = make_state(500);
+    #[tokio::test]
+    async fn next_packet_id_increments_starting_at_one() {
+        let state = make_state(500).await;
         assert_eq!(state.next_packet_id(), 1);
         assert_eq!(state.next_packet_id(), 2);
         assert_eq!(state.next_packet_id(), 3);
     }
 
-    #[test]
-    fn packet_log_capacity_is_at_least_one() {
+    #[tokio::test]
+    async fn packet_log_capacity_is_at_least_one() {
         // A misconfigured `packet_log_capacity = 0` must not make the cache
         // unusable (and `VecDeque::with_capacity(0)` would be fine, but a
         // capacity of 0 in `record_packet`'s eviction check would drop
         // every entry immediately).
         let (command_tx, _rx) = mpsc::channel(1);
-        let config = Config {
-            node_label: "test-node".to_string(),
-            connection: ConnectionConfig::Tcp {
-                host: "127.0.0.1".to_string(),
-                port: 5000,
-            },
-            daemon: DaemonConfig {
-                socket_path: PathBuf::from("/tmp/fez-mesh-controller-test.sock"),
-                refresh_interval_secs: 5,
-                log_level: "info".to_string(),
-                log_dir: PathBuf::from("/tmp/fez-mesh-controller-test/logs"),
-                packet_log_capacity: 0,
-                discovered_nodes_capacity: 200,
-                observer_node_managed_config: true,
-            },
-            managed_repeaters: vec![],
-            regions: vec![],
-            hashtag_channels: vec![],
-            mqtt_brokers: vec![],
-        };
-        let state = AppState::new(command_tx, config, PathBuf::from("/tmp/x.toml"));
+        let config = sample_config(0, PathBuf::from(":memory:"));
+        let state = AppState::new(command_tx, config, PathBuf::from("/tmp/x.toml"))
+            .await
+            .expect("AppState::new with an in-memory DB should never fail");
         assert_eq!(state.packet_log_capacity, 1);
     }
 
     #[tokio::test]
+    async fn app_state_new_hydrates_discovered_repeaters_from_the_db_path() {
+        // Unlike the other tests, this one needs a real file (not
+        // `:memory:`) since it opens the same DB twice, across two
+        // separate `AppState::new` calls, to prove persistence.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("repeaters.sqlite3");
+
+        let (command_tx, _rx) = mpsc::channel(1);
+        let first = AppState::new(
+            command_tx,
+            sample_config(500, db_path.clone()),
+            PathBuf::from("/tmp/x.toml"),
+        )
+        .await
+        .expect("first AppState::new");
+        first
+            .upsert_discovered_node(sample_node("aaaaaaaaaaaa", 1))
+            .await;
+
+        let (command_tx2, _rx2) = mpsc::channel(1);
+        let second = AppState::new(
+            command_tx2,
+            sample_config(500, db_path),
+            PathBuf::from("/tmp/x.toml"),
+        )
+        .await
+        .expect("second AppState::new, same db_path");
+
+        let discovered = second.discovered_repeaters.read().await;
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered["aaaaaaaaaaaa"].last_seen_unix, 1);
+    }
+
+    #[tokio::test]
     async fn record_packet_keeps_newest_first_up_to_capacity() {
-        let state = make_state(2);
+        let state = make_state(2).await;
 
         state.record_packet(sample_packet(1)).await;
         state.record_packet(sample_packet(2)).await;
@@ -327,7 +353,7 @@ mod tests {
 
     #[tokio::test]
     async fn record_packet_broadcasts_to_subscribers() {
-        let state = make_state(500);
+        let state = make_state(500).await;
         let mut rx = state.packet_log_tx.subscribe();
 
         state.record_packet(sample_packet(1)).await;
@@ -336,9 +362,9 @@ mod tests {
         assert_eq!(received.id, 1);
     }
 
-    #[test]
-    fn broadcast_event_without_subscribers_does_not_panic() {
-        let state = make_state(500);
+    #[tokio::test]
+    async fn broadcast_event_without_subscribers_does_not_panic() {
+        let state = make_state(500).await;
         state.broadcast_event(MeshEvent {
             at_unix: 0,
             kind: MeshEventKind::Connected,
@@ -353,15 +379,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn broadcast_raw_event_without_subscribers_does_not_panic() {
-        let state = make_state(500);
+    #[tokio::test]
+    async fn broadcast_raw_event_without_subscribers_does_not_panic() {
+        let state = make_state(500).await;
         state.broadcast_raw_event(Arc::new(sample_raw_event()));
     }
 
     #[tokio::test]
     async fn broadcast_raw_event_reaches_subscribers() {
-        let state = make_state(500);
+        let state = make_state(500).await;
         let mut rx = state.raw_events_tx.subscribe();
 
         state.broadcast_raw_event(Arc::new(sample_raw_event()));
@@ -372,7 +398,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_mqtt_broker_status_updates_and_overwrites() {
-        let state = make_state(500);
+        let state = make_state(500).await;
 
         state
             .set_mqtt_broker_status("Home Assistant", MqttBrokerStatus::Connecting)
@@ -393,7 +419,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_device_info_updates_and_overwrites() {
-        let state = make_state(500);
+        let state = make_state(500).await;
         assert!(state.device_info.read().await.is_none());
 
         state
@@ -413,7 +439,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_discovered_node_reports_new_vs_already_known() {
-        let state = make_state_with_discovered_capacity(200);
+        let state = make_state(500).await;
 
         assert!(
             state
@@ -433,8 +459,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_discovered_node_evicts_the_least_recently_seen_when_at_capacity() {
-        let state = make_state_with_discovered_capacity(2);
+    async fn upsert_discovered_node_refreshing_an_existing_entry_updates_last_seen() {
+        let state = make_state(500).await;
 
         state
             .upsert_discovered_node(sample_node("aaaaaaaaaaaa", 1))
@@ -442,29 +468,6 @@ mod tests {
         state
             .upsert_discovered_node(sample_node("bbbbbbbbbbbb", 2))
             .await;
-        // At capacity: adding a third node must evict the oldest (prefix "aa...").
-        state
-            .upsert_discovered_node(sample_node("cccccccccccc", 3))
-            .await;
-
-        let discovered = state.discovered_repeaters.read().await;
-        assert_eq!(discovered.len(), 2);
-        assert!(!discovered.contains_key("aaaaaaaaaaaa"));
-        assert!(discovered.contains_key("bbbbbbbbbbbb"));
-        assert!(discovered.contains_key("cccccccccccc"));
-    }
-
-    #[tokio::test]
-    async fn upsert_discovered_node_refreshing_an_existing_entry_does_not_evict() {
-        let state = make_state_with_discovered_capacity(2);
-
-        state
-            .upsert_discovered_node(sample_node("aaaaaaaaaaaa", 1))
-            .await;
-        state
-            .upsert_discovered_node(sample_node("bbbbbbbbbbbb", 2))
-            .await;
-        // Already at capacity, but this just refreshes an existing entry.
         state
             .upsert_discovered_node(sample_node("aaaaaaaaaaaa", 3))
             .await;
@@ -474,9 +477,47 @@ mod tests {
         assert_eq!(discovered["aaaaaaaaaaaa"].last_seen_unix, 3);
     }
 
-    #[test]
-    fn discovered_repeaters_capacity_is_at_least_one() {
-        let state = make_state_with_discovered_capacity(0);
-        assert_eq!(state.discovered_repeaters_capacity, 1);
+    #[tokio::test]
+    async fn upsert_discovered_node_does_not_clear_a_known_position_with_a_positionless_sighting() {
+        let state = make_state(500).await;
+        let mut with_position = sample_node("aaaaaaaaaaaa", 1);
+        with_position.lat = 48.85;
+        with_position.lon = 2.35;
+        state.upsert_discovered_node(with_position).await;
+
+        // Same node seen again, but this sighting's advert didn't carry a
+        // position (lat/lon both 0.0, `DiscoveredNode`'s own "unknown"
+        // sentinel) -- must not erase the previously-known one.
+        state
+            .upsert_discovered_node(sample_node("aaaaaaaaaaaa", 2))
+            .await;
+
+        let discovered = state.discovered_repeaters.read().await;
+        assert_eq!(discovered["aaaaaaaaaaaa"].lat, 48.85);
+        assert_eq!(discovered["aaaaaaaaaaaa"].lon, 2.35);
+        assert_eq!(discovered["aaaaaaaaaaaa"].last_seen_unix, 2);
+    }
+
+    #[tokio::test]
+    async fn upsert_discovered_node_keeps_previous_signal_fields_when_a_sighting_omits_them() {
+        let state = make_state(500).await;
+        let mut first = sample_node("aaaaaaaaaaaa", 1);
+        first.last_snr = Some(4.0);
+        first.last_rssi = Some(-90);
+        first.last_hop_count = Some(2);
+        state.upsert_discovered_node(first).await;
+
+        // A later sighting without decoded signal/hop data must not blank
+        // out the previously-known values.
+        state
+            .upsert_discovered_node(sample_node("aaaaaaaaaaaa", 2))
+            .await;
+
+        let discovered = state.discovered_repeaters.read().await;
+        let node = &discovered["aaaaaaaaaaaa"];
+        assert_eq!(node.last_snr, Some(4.0));
+        assert_eq!(node.last_rssi, Some(-90));
+        assert_eq!(node.last_hop_count, Some(2));
+        assert_eq!(node.last_seen_unix, 2);
     }
 }

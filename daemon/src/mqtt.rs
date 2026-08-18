@@ -957,7 +957,7 @@ mod tests {
     use std::path::PathBuf;
     use tokio::sync::mpsc;
 
-    fn sample_app_state(command_tx: mpsc::Sender<DaemonCommand>) -> AppState {
+    async fn sample_app_state(command_tx: mpsc::Sender<DaemonCommand>) -> AppState {
         let config = Config {
             node_label: "test-node".to_string(),
             connection: ConnectionConfig::Tcp {
@@ -970,7 +970,7 @@ mod tests {
                 log_level: "info".to_string(),
                 log_dir: PathBuf::from("/tmp/fez-mesh-controller-test/logs"),
                 packet_log_capacity: 500,
-                discovered_nodes_capacity: 200,
+                db_path: PathBuf::from(":memory:"),
                 observer_node_managed_config: true,
             },
             managed_repeaters: vec![],
@@ -983,6 +983,8 @@ mod tests {
             config,
             PathBuf::from("/tmp/fez-mesh-controller-test.toml"),
         )
+        .await
+        .expect("AppState::new with an in-memory DB should never fail")
     }
 
     fn event(event_type: EventType, payload: EventPayload) -> MeshCoreEvent {
@@ -1340,7 +1342,7 @@ mod tests {
     #[tokio::test]
     async fn wait_for_self_info_returns_immediately_when_already_known() {
         let (command_tx, _command_rx) = mpsc::channel(8);
-        let state = sample_app_state(command_tx);
+        let state = sample_app_state(command_tx).await;
         state.snapshot.write().await.self_info = Some(sample_self_info());
 
         let result = wait_for_self_info(&state, Duration::from_secs(5)).await;
@@ -1359,7 +1361,7 @@ mod tests {
                 let _ = reply.send(Err("no mesh connection".to_string()));
             }
         });
-        let state = sample_app_state(command_tx);
+        let state = sample_app_state(command_tx).await;
 
         let result = sign_via_mesh(&state, b"signing input").await;
 
@@ -1374,7 +1376,7 @@ mod tests {
                 let _ = reply.send(Ok(vec![0xAB; 64]));
             }
         });
-        let state = sample_app_state(command_tx);
+        let state = sample_app_state(command_tx).await;
         let self_info = sample_self_info();
         let config = sample_broker_config();
 
@@ -1410,7 +1412,7 @@ mod tests {
                 let _ = reply.send(Ok(vec![0u8; 64]));
             }
         });
-        let state = sample_app_state(command_tx);
+        let state = sample_app_state(command_tx).await;
         let self_info = sample_self_info();
         let config = sample_broker_config(); // jwt_audience: None, host: "mqtt.example.com"
 

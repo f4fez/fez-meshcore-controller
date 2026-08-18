@@ -217,9 +217,9 @@ async fn refresh_snapshot_contacts(client: &MeshClient, state: &AppState) {
 }
 
 /// Records a newly-overheard node (full identity resolved from RF log
-/// data) in the (capacity-bounded) discovered-nodes cache and, if it
-/// isn't already known, surfaces it in the contact list as "discovered"
-/// and logs a one-off event the first time it's seen.
+/// data) in the SQLite-backed discovered-nodes store and, if it isn't
+/// already known, surfaces it in the contact list as "discovered" and logs
+/// a one-off event the first time it's seen.
 async fn handle_discovered_node(
     node: fez_mesh_controller_core::mesh::DiscoveredNode,
     client: &MeshClient,
@@ -643,7 +643,7 @@ mod tests {
 
     /// Builds an `AppState` backed by a real (tempdir) config path, so
     /// `save_to` actually persists and can be reloaded to verify.
-    fn make_state(managed_repeaters: Vec<ManagedRepeater>) -> (AppState, tempfile::TempDir) {
+    async fn make_state(managed_repeaters: Vec<ManagedRepeater>) -> (AppState, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let config_path = dir.path().join("config.toml");
         let (command_tx, _command_rx) = mpsc::channel(1);
@@ -659,7 +659,7 @@ mod tests {
                 log_level: "info".to_string(),
                 log_dir: PathBuf::from("/tmp/fez-mesh-controller-test/logs"),
                 packet_log_capacity: 500,
-                discovered_nodes_capacity: 200,
+                db_path: PathBuf::from(":memory:"),
                 observer_node_managed_config: true,
             },
             managed_repeaters,
@@ -667,13 +667,15 @@ mod tests {
             hashtag_channels: vec![],
             mqtt_brokers: vec![],
         };
-        let state = AppState::new(command_tx, config, config_path);
+        let state = AppState::new(command_tx, config, config_path)
+            .await
+            .expect("AppState::new with an in-memory DB should never fail");
         (state, dir)
     }
 
     #[tokio::test]
     async fn upsert_adds_a_new_managed_repeater() {
-        let (state, _dir) = make_state(vec![]);
+        let (state, _dir) = make_state(vec![]).await;
 
         upsert_managed_repeater_config(
             &state,
@@ -696,7 +698,8 @@ mod tests {
         let (state, _dir) = make_state(vec![ManagedRepeater {
             name: "Old Name".to_string(),
             public_key_hex: "aabbccddeeff".to_string(),
-        }]);
+        }])
+        .await;
 
         upsert_managed_repeater_config(&state, "aabbccddeeff", "New Name", true, None)
             .await
@@ -714,7 +717,8 @@ mod tests {
         let (state, _dir) = make_state(vec![ManagedRepeater {
             name: "Repeater A".to_string(),
             public_key_hex: "aabbccddeeff".to_string(),
-        }]);
+        }])
+        .await;
 
         upsert_managed_repeater_config(&state, "aabbccddeeff", "Repeater A", false, None)
             .await
@@ -725,7 +729,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_unmanaging_an_unknown_prefix_is_a_noop() {
-        let (state, _dir) = make_state(vec![]);
+        let (state, _dir) = make_state(vec![]).await;
 
         upsert_managed_repeater_config(&state, "aabbccddeeff", "Nobody", false, None)
             .await
@@ -736,7 +740,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_persists_to_disk() {
-        let (state, _dir) = make_state(vec![]);
+        let (state, _dir) = make_state(vec![]).await;
         let config_path = state.config_path.clone();
 
         upsert_managed_repeater_config(

@@ -16,6 +16,7 @@ mod command;
 mod lock;
 mod mesh_task;
 mod mqtt;
+mod repeater_db;
 mod server;
 mod state;
 
@@ -106,7 +107,7 @@ async fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
     let socket_path = config.daemon.socket_path.clone();
     let mqtt_brokers = config.mqtt_brokers.clone();
 
-    let state = Arc::new(AppState::new(command_tx, config, config_path));
+    let state = Arc::new(AppState::new(command_tx, config, config_path).await?);
 
     let mesh_state = state.clone();
     let mesh_handle = tokio::spawn(mesh_task::run(

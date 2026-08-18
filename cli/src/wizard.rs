@@ -139,6 +139,9 @@ pub async fn run(existing: Option<&Config>) -> anyhow::Result<Option<Config>> {
     let log_dir = existing
         .map(|c| c.daemon.log_dir.clone())
         .unwrap_or_else(fez_mesh_controller_core::config::default_log_dir);
+    let db_path = existing
+        .map(|c| c.daemon.db_path.clone())
+        .unwrap_or_else(fez_mesh_controller_core::config::default_db_path);
     let managed_repeaters = existing
         .map(|c| c.managed_repeaters.clone())
         .unwrap_or_default();
@@ -155,8 +158,7 @@ pub async fn run(existing: Option<&Config>) -> anyhow::Result<Option<Config>> {
             log_level,
             log_dir,
             packet_log_capacity: fez_mesh_controller_core::config::default_packet_log_capacity(),
-            discovered_nodes_capacity:
-                fez_mesh_controller_core::config::default_discovered_nodes_capacity(),
+            db_path,
             observer_node_managed_config,
         },
         managed_repeaters,
