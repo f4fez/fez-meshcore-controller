@@ -851,6 +851,24 @@ impl MeshClient {
         }
     }
 
+    /// Signs arbitrary caller-supplied bytes on-device (`CMD_SIGN_START`/
+    /// `CMD_SIGN_DATA`/`CMD_SIGN_FINISH`) — the node's private key never
+    /// leaves the device. Used for MQTT device-signed auth tokens (see
+    /// [`crate::mqtt_jwt`]); `SIGN_CHUNK_SIZE` has no real effect on a
+    /// signing input this small, but a value is required by the underlying
+    /// `meshcore-rs` API.
+    pub async fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
+        const SIGN_CHUNK_SIZE: usize = 128;
+        let signature = self
+            .inner
+            .commands()
+            .lock()
+            .await
+            .sign(data, SIGN_CHUNK_SIZE)
+            .await?;
+        Ok(signature)
+    }
+
     pub async fn contacts(&self) -> Vec<ContactDto> {
         self.inner
             .contacts()

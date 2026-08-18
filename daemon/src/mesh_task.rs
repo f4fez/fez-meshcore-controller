@@ -428,6 +428,10 @@ async fn handle_command(cmd: DaemonCommand, client: &MeshClient, state: &AppStat
             state.set_node_stats(stats.clone()).await;
             let _ = reply.send(stats);
         }
+        DaemonCommand::SignData { data, reply } => {
+            let result = client.sign(&data).await.map_err(|e| e.to_string());
+            let _ = reply.send(result);
+        }
     }
 }
 

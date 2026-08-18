@@ -23,8 +23,8 @@ use console::{style, Key, Term};
 use dialoguer::theme::{ColorfulTheme, Theme};
 use dialoguer::{Confirm, Input, Password, Select};
 use fez_mesh_controller_core::{
-    region, Config, ConnectionConfig, DaemonConfig, MqttBrokerConfig, MqttTransportProtocol,
-    RegionConfig,
+    region, Config, ConnectionConfig, DaemonConfig, MqttAuthMethod, MqttBrokerConfig,
+    MqttTransportProtocol, RegionConfig,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use names::Generator;
@@ -818,7 +818,15 @@ fn ask_mqtt_brokers(
     );
     println!(
         "  {}",
-        muted().apply_to("stored in plaintext in config.toml, like the rest of this file.")
+        muted().apply_to("stored in plaintext in config.toml, like the rest of this file. The")
+    );
+    println!(
+        "  {}",
+        muted().apply_to("MeshCore Auth Token option never stores or transmits the node's private")
+    );
+    println!(
+        "  {}",
+        muted().apply_to("key -- only its public key and short-lived, on-device-signed tokens.")
     );
 
     let mut brokers = existing.to_vec();
@@ -869,15 +877,32 @@ fn ask_mqtt_brokers(
             )
         };
 
-        let username = ask_optional_text(dtheme, "👤 Username (leave empty for none)")?;
-        let password = if username.is_some() {
-            let password: String = Password::with_theme(dtheme)
-                .with_prompt("🔑 Password (leave empty for none)")
-                .allow_empty_password(true)
-                .interact()?;
-            (!password.is_empty()).then_some(password)
-        } else {
-            None
+        let auth_options = [
+            "🔑 Username/Password",
+            "✍️  MeshCore Auth Token (device-signed, e.g. LetsMesh, MeshMapper)",
+            "🕶️  Anonymous",
+        ];
+        let auth_choice = Select::with_theme(dtheme)
+            .with_prompt("🔐 Authentication")
+            .items(&auth_options)
+            .default(0)
+            .interact()?;
+        let (username, password, auth_method) = match auth_choice {
+            0 => {
+                let username = ask_optional_text(dtheme, "👤 Username (leave empty for none)")?;
+                let password = if username.is_some() {
+                    let password: String = Password::with_theme(dtheme)
+                        .with_prompt("🔑 Password (leave empty for none)")
+                        .allow_empty_password(true)
+                        .interact()?;
+                    (!password.is_empty()).then_some(password)
+                } else {
+                    None
+                };
+                (username, password, MqttAuthMethod::Passwd)
+            }
+            1 => (None, None, MqttAuthMethod::Device),
+            _ => (None, None, MqttAuthMethod::None),
         };
 
         let topic_prefix: String = Input::with_theme(dtheme)
@@ -935,6 +960,9 @@ fn ask_mqtt_brokers(
             port,
             username,
             password,
+            auth_method,
+            jwt_ttl_secs: fez_mesh_controller_core::config::default_mqtt_jwt_ttl_secs(),
+            jwt_audience: None,
             topic_prefix,
             tls_enabled,
             tls_ca_cert,

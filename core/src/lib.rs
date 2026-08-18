@@ -26,10 +26,11 @@ pub mod error;
 pub mod ipc;
 pub mod mesh;
 pub mod meshcore_crypto;
+pub mod mqtt_jwt;
 pub mod region;
 
 pub use config::{
-    Config, ConnectionConfig, DaemonConfig, ManagedRepeater, MqttBrokerConfig,
+    Config, ConnectionConfig, DaemonConfig, ManagedRepeater, MqttAuthMethod, MqttBrokerConfig,
     MqttTransportProtocol, RegionConfig,
 };
 pub use error::{Error, Result};

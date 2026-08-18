@@ -29,6 +29,7 @@ clap = { version = "4", features = ["derive"] }
 sha2 = "0.10"
 hmac = "0.12"
 aes = "0.8"
+base64 = "0.22"
 
 [profile.release]
 opt-level = 3

@@ -43,4 +43,14 @@ pub enum DaemonCommand {
     RefreshNodeStats {
         reply: oneshot::Sender<NodeStatsDto>,
     },
+    /// Not IPC-originated -- sent by `crate::mqtt`'s device-signed auth
+    /// flow, which needs the node to sign a JWT signing input but (like
+    /// `RefreshNodeStats`) doesn't hold the live connection itself. Unlike
+    /// `RefreshNodeStats` this has no best-effort fallback: without a
+    /// signature the broker connection simply cannot authenticate, so
+    /// failures are propagated rather than silently ignored.
+    SignData {
+        data: Vec<u8>,
+        reply: oneshot::Sender<Result<Vec<u8>, String>>,
+    },
 }

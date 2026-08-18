@@ -70,12 +70,29 @@ pub struct MqttBrokerConfig {
     pub host: String,
     #[serde(default = "default_mqtt_port")]
     pub port: u16,
+    /// Only used when [`Self::auth_method`] is [`MqttAuthMethod::Passwd`].
     #[serde(default)]
     pub username: Option<String>,
     /// Stored in plaintext, like the rest of this config file — there is no
-    /// secret-encryption mechanism here today.
+    /// secret-encryption mechanism here today. Only used when
+    /// [`Self::auth_method`] is [`MqttAuthMethod::Passwd`].
     #[serde(default)]
     pub password: Option<String>,
+    /// How to authenticate with this broker.
+    #[serde(default)]
+    pub auth_method: MqttAuthMethod,
+    /// Lifetime, in seconds, of a device-signed auth token before it's
+    /// refreshed. Only used when [`Self::auth_method`] is
+    /// [`MqttAuthMethod::Device`]. The refresh happens 6 minutes before
+    /// expiry, matching `Colorado-Mesh/mesh-client`'s own refresh margin.
+    #[serde(default = "default_mqtt_jwt_ttl_secs")]
+    pub jwt_ttl_secs: u32,
+    /// `aud` claim for a device-signed auth token. Defaults to
+    /// [`Self::host`] if unset, which is what LetsMesh/MeshMapper expect
+    /// (`letsMeshJwtAudience()`: the exact MQTT connect hostname). Only used
+    /// when [`Self::auth_method`] is [`MqttAuthMethod::Device`].
+    #[serde(default)]
+    pub jwt_audience: Option<String>,
     /// Prefix prepended to every published topic (`<prefix>/advertisement`,
     /// `<prefix>/status`, ...), matching `ipnet-mesh/meshcore-mqtt`'s own
     /// `topic_prefix` config key.
@@ -162,6 +179,31 @@ pub enum MqttTransportProtocol {
     Websocket,
 }
 
+/// How to authenticate with an MQTT broker — see
+/// [`MqttBrokerConfig::auth_method`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MqttAuthMethod {
+    /// [`MqttBrokerConfig::username`]/[`MqttBrokerConfig::password`], the
+    /// pre-existing default — either both set, or both left unset for an
+    /// anonymous connection under this mode too.
+    #[default]
+    Passwd,
+    /// A MeshCore device-signed token — required by LetsMesh and
+    /// MeshMapper's public brokers. The MQTT username is derived as
+    /// `v1_<node public key, uppercase hex>`; the password is a JWT-style
+    /// token signed on-device (the node's private key is never extracted —
+    /// see [`crate::mesh::MeshClient::sign`]), matching
+    /// `michaelhart/meshcore-decoder`'s `createAuthToken` format
+    /// (`crate::mqtt_jwt`). [`MqttBrokerConfig::username`]/
+    /// [`MqttBrokerConfig::password`] are ignored under this mode.
+    Device,
+    /// Always connects anonymously, ignoring
+    /// [`MqttBrokerConfig::username`]/[`MqttBrokerConfig::password`] even if
+    /// set.
+    None,
+}
+
 /// Default MQTT broker port (`ipnet-mesh/meshcore-mqtt`'s own default).
 pub fn default_mqtt_port() -> u16 {
     1883
@@ -176,6 +218,13 @@ pub fn default_mqtt_topic_prefix() -> String {
 /// (`agessaman/meshcore-packet-capture`'s own `STATS_REFRESH_INTERVAL` default).
 pub fn default_mqtt_status_refresh_interval_secs() -> u32 {
     300
+}
+
+/// Default lifetime, in seconds, of a device-signed MQTT auth token — one
+/// hour, refreshed 6 minutes before expiry (see
+/// [`MqttBrokerConfig::jwt_ttl_secs`]).
+pub fn default_mqtt_jwt_ttl_secs() -> u32 {
+    3600
 }
 
 /// Default for [`MqttBrokerConfig::enable_high_level_messages`] — publish by
@@ -426,6 +475,9 @@ mod tests {
                 port: 8883,
                 username: Some("fez".to_string()),
                 password: Some("hunter2".to_string()),
+                auth_method: MqttAuthMethod::Passwd,
+                jwt_ttl_secs: 3600,
+                jwt_audience: None,
                 topic_prefix: "meshcore".to_string(),
                 tls_enabled: true,
                 tls_ca_cert: Some(PathBuf::from("/etc/mqtt/ca.pem")),
@@ -607,6 +659,38 @@ mod tests {
         assert_eq!(broker.status_topic, "{prefix}/status");
         assert_eq!(broker.transport_protocol, MqttTransportProtocol::Tcp);
         assert_eq!(broker.websocket_path, "/mqtt");
+        assert_eq!(broker.auth_method, MqttAuthMethod::Passwd);
+        assert_eq!(broker.jwt_ttl_secs, 3600);
+        assert_eq!(broker.jwt_audience, None);
+    }
+
+    #[test]
+    fn mqtt_broker_config_parses_device_auth_method() {
+        let toml = r#"
+            name = "LetsMesh"
+            host = "mqtt-us-v1.letsmesh.net"
+            auth_method = "device"
+            jwt_ttl_secs = 1800
+            jwt_audience = "mqtt-us-v1.letsmesh.net"
+        "#;
+        let broker: MqttBrokerConfig = toml::from_str(toml).expect("parse device-signed broker");
+        assert_eq!(broker.auth_method, MqttAuthMethod::Device);
+        assert_eq!(broker.jwt_ttl_secs, 1800);
+        assert_eq!(
+            broker.jwt_audience,
+            Some("mqtt-us-v1.letsmesh.net".to_string())
+        );
+    }
+
+    #[test]
+    fn mqtt_broker_config_parses_none_auth_method() {
+        let toml = r#"
+            name = "Public"
+            host = "mqtt.example.com"
+            auth_method = "none"
+        "#;
+        let broker: MqttBrokerConfig = toml::from_str(toml).expect("parse anonymous broker");
+        assert_eq!(broker.auth_method, MqttAuthMethod::None);
     }
 
     #[test]
@@ -617,6 +701,9 @@ mod tests {
             port: 8883,
             username: Some("fez".to_string()),
             password: Some("hunter2".to_string()),
+            auth_method: MqttAuthMethod::Passwd,
+            jwt_ttl_secs: 3600,
+            jwt_audience: None,
             topic_prefix: "meshcore".to_string(),
             tls_enabled: true,
             tls_ca_cert: Some(PathBuf::from("/etc/mqtt/ca.pem")),

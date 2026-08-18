@@ -34,12 +34,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use fez_mesh_controller_core::config::{MqttBrokerConfig, MqttTransportProtocol};
+use fez_mesh_controller_core::config::{MqttAuthMethod, MqttBrokerConfig, MqttTransportProtocol};
 use fez_mesh_controller_core::ipc::{MeshEvent, MqttBrokerStatus};
 use fez_mesh_controller_core::mesh::{
     build_packet_log_entry, hex_encode, reconstruct_raw_packet_hex, DeviceInfoDto, MeshEventKind,
     NodeStatsDto, PacketLogEntry, SelfInfoDto,
 };
+use fez_mesh_controller_core::mqtt_jwt::{self, AuthTokenClaims};
 use meshcore_rs::events::EventPayload;
 use meshcore_rs::{EventType, MeshCoreEvent};
 use rumqttc::{AsyncClient, Event as MqttEvent, LastWill, MqttOptions, Packet, QoS, Transport};
@@ -59,6 +60,16 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// long, e.g. while the mesh is disconnected and nobody is polling
 /// `command_rx`.
 const STATS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Cap on how long a device-signed auth token request waits for the node to
+/// sign it, matching `MeshClient::sign`'s own `sign_finish` budget.
+const SIGN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long to wait, at broker startup, for `self_info` to become known
+/// before giving up on building device-signed credentials (it's populated
+/// by `mesh_task::run`, a separate task racing this one at daemon startup).
+const SELF_INFO_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long before a device-signed auth token's expiry to refresh it —
+/// matches `Colorado-Mesh/mesh-client`'s own fixed 6-minute margin.
+const JWT_REFRESH_MARGIN_SECS: u64 = 360;
 
 /// Identifies this daemon as the publisher, mirroring the `<name>/<version>`
 /// shape the Python bridges use for their own `client_version` field.
@@ -88,8 +99,44 @@ pub async fn run_broker(config: MqttBrokerConfig, state: Arc<AppState>) {
     };
     options.set_keep_alive(Duration::from_secs(60));
 
-    if let (Some(username), Some(password)) = (&config.username, &config.password) {
-        options.set_credentials(username.clone(), password.clone());
+    match config.auth_method {
+        MqttAuthMethod::Device => {
+            let Some(self_info) = wait_for_self_info(&state, SELF_INFO_WAIT_TIMEOUT).await else {
+                warn!(
+                    broker = %config.name,
+                    "timed out waiting for mesh self_info; cannot build device-signed MQTT credentials"
+                );
+                state
+                    .set_mqtt_broker_status(
+                        &config.name,
+                        MqttBrokerStatus::Error {
+                            reason: "timed out waiting for mesh connection to build \
+                                     device-signed auth credentials"
+                                .to_string(),
+                        },
+                    )
+                    .await;
+                return;
+            };
+            match build_device_signed_credentials(&state, &self_info, &config).await {
+                Ok((username, token)) => {
+                    options.set_credentials(username, token);
+                }
+                Err(reason) => {
+                    warn!(broker = %config.name, %reason, "failed to build device-signed MQTT credentials");
+                    state
+                        .set_mqtt_broker_status(&config.name, MqttBrokerStatus::Error { reason })
+                        .await;
+                    return;
+                }
+            }
+        }
+        MqttAuthMethod::Passwd => {
+            if let (Some(username), Some(password)) = (&config.username, &config.password) {
+                options.set_credentials(username.clone(), password.clone());
+            }
+        }
+        MqttAuthMethod::None => {}
     }
 
     if config.tls_enabled {
@@ -139,6 +186,12 @@ pub async fn run_broker(config: MqttBrokerConfig, state: Arc<AppState>) {
             config.status_refresh_interval_secs as u64,
         ))
     });
+    let mut jwt_refresh = (config.auth_method == MqttAuthMethod::Device).then(|| {
+        let refresh_period_secs = (config.jwt_ttl_secs as u64)
+            .saturating_sub(JWT_REFRESH_MARGIN_SECS)
+            .max(1);
+        tokio::time::interval(Duration::from_secs(refresh_period_secs))
+    });
 
     loop {
         tokio::select! {
@@ -173,6 +226,37 @@ pub async fn run_broker(config: MqttBrokerConfig, state: Arc<AppState>) {
             }
             _ = tick_optional(&mut heartbeat), if mqtt_connected => {
                 publish_current_status(&client, &config, &state, mesh_connected).await;
+            }
+            _ = tick_optional(&mut jwt_refresh) => {
+                let Some(self_info) = state.snapshot.read().await.self_info.clone() else {
+                    warn!(
+                        broker = %config.name,
+                        "mesh self_info unknown; skipping device-signed MQTT credential refresh"
+                    );
+                    continue;
+                };
+                match build_device_signed_credentials(&state, &self_info, &config).await {
+                    Ok((username, token)) => {
+                        eventloop.mqtt_options.set_credentials(username, token);
+                        // MQTT 3.1.1 has no in-band re-auth packet -- a
+                        // refreshed credential only takes effect on the
+                        // *next* CONNECT, so force one when currently
+                        // connected. If not connected, the next natural
+                        // reconnect already picks up `mqtt_options` above.
+                        if mqtt_connected {
+                            if let Err(err) = client.disconnect().await {
+                                warn!(
+                                    broker = %config.name,
+                                    error = %err,
+                                    "failed to force MQTT reconnect for auth token refresh"
+                                );
+                            }
+                        }
+                    }
+                    Err(reason) => {
+                        warn!(broker = %config.name, %reason, "failed to refresh device-signed MQTT credentials");
+                    }
+                }
             }
             mesh_event = mesh_events.recv() => {
                 match mesh_event {
@@ -213,6 +297,78 @@ async fn tick_optional(interval: &mut Option<tokio::time::Interval>) {
         }
         None => std::future::pending().await,
     }
+}
+
+/// Polls `state.snapshot`'s `self_info` until it's known, needed before
+/// building device-signed MQTT credentials (the JWT payload's `publicKey`
+/// requires it) — `self_info` is populated by `mesh_task::run`, a separate
+/// task racing this one at daemon startup. Returns `None` if it never
+/// becomes known within `timeout`.
+async fn wait_for_self_info(state: &AppState, timeout: Duration) -> Option<SelfInfoDto> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(info) = state.snapshot.read().await.self_info.clone() {
+            return Some(info);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Asks the mesh connection task to sign `data` on-device (see
+/// [`DaemonCommand::SignData`]) — `mqtt.rs` doesn't hold the live
+/// `MeshClient` itself, only `mesh_task.rs` does (same reasoning as
+/// `refresh_node_stats`). Unlike `refresh_node_stats`, failures here are
+/// propagated rather than falling back to stale data: without a fresh
+/// signature a device-signed broker simply cannot authenticate.
+async fn sign_via_mesh(state: &AppState, data: &[u8]) -> Result<Vec<u8>, String> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    state
+        .command_tx
+        .send(DaemonCommand::SignData {
+            data: data.to_vec(),
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "mesh connection task is not running".to_string())?;
+
+    match tokio::time::timeout(SIGN_TIMEOUT, reply_rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("mesh connection task dropped the sign request".to_string()),
+        Err(_) => Err("timed out waiting for the node to sign the auth token".to_string()),
+    }
+}
+
+/// Builds `(username, password)` for a device-signed MQTT broker: username
+/// `v1_<node public key, uppercase hex>`, password a JWT-style token signed
+/// on-device — matches `Colorado-Mesh/mesh-client`'s `letsmesh-mqtt-auth.md`
+/// scheme (see [`MqttBrokerConfig::auth_method`]'s doc comment and
+/// [`fez_mesh_controller_core::mqtt_jwt`]). The node's private key never
+/// leaves the device: only the signing input bytes are sent to it.
+async fn build_device_signed_credentials(
+    state: &AppState,
+    self_info: &SelfInfoDto,
+    config: &MqttBrokerConfig,
+) -> Result<(String, String), String> {
+    let username = format!("v1_{}", self_info.public_key_hex.to_uppercase());
+    let iat = Utc::now().timestamp();
+    let claims = AuthTokenClaims {
+        public_key_hex: self_info.public_key_hex.clone(),
+        iat,
+        exp: iat + config.jwt_ttl_secs as i64,
+        aud: config
+            .jwt_audience
+            .clone()
+            .unwrap_or_else(|| config.host.clone()),
+    };
+    let signing_input = mqtt_jwt::signing_input(&claims);
+    let signature = sign_via_mesh(state, signing_input.as_bytes()).await?;
+    Ok((
+        username,
+        mqtt_jwt::assemble_token(&signing_input, &signature),
+    ))
 }
 
 /// Builds a `rumqttc` TLS `Transport` from the broker's cert/key paths —
@@ -793,10 +949,41 @@ fn screaming_snake_case(pascal_case: &str) -> String {
 mod tests {
     use super::*;
     use fez_mesh_controller_core::mesh::{CoreStatsDto, PacketStatsDto, RadioStatsDto};
+    use fez_mesh_controller_core::{Config, ConnectionConfig, DaemonConfig};
     use meshcore_rs::events::{ChannelMessage, ContactMessage, LogData, MeshPacketHeader};
     use meshcore_rs::packets::RouteType;
     use meshcore_rs::PayloadType;
     use std::collections::HashMap;
+    use std::path::PathBuf;
+    use tokio::sync::mpsc;
+
+    fn sample_app_state(command_tx: mpsc::Sender<DaemonCommand>) -> AppState {
+        let config = Config {
+            node_label: "test-node".to_string(),
+            connection: ConnectionConfig::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: 5000,
+            },
+            daemon: DaemonConfig {
+                socket_path: PathBuf::from("/tmp/fez-mesh-controller-test.sock"),
+                refresh_interval_secs: 5,
+                log_level: "info".to_string(),
+                log_dir: PathBuf::from("/tmp/fez-mesh-controller-test/logs"),
+                packet_log_capacity: 500,
+                discovered_nodes_capacity: 200,
+                observer_node_managed_config: true,
+            },
+            managed_repeaters: vec![],
+            regions: vec![],
+            hashtag_channels: vec![],
+            mqtt_brokers: vec![],
+        };
+        AppState::new(
+            command_tx,
+            config,
+            PathBuf::from("/tmp/fez-mesh-controller-test.toml"),
+        )
+    }
 
     fn event(event_type: EventType, payload: EventPayload) -> MeshCoreEvent {
         MeshCoreEvent {
@@ -1130,6 +1317,9 @@ mod tests {
             port: 1883,
             username: None,
             password: None,
+            auth_method: MqttAuthMethod::Passwd,
+            jwt_ttl_secs: 3600,
+            jwt_audience: None,
             topic_prefix: "meshcore".to_string(),
             tls_enabled: false,
             tls_ca_cert: None,
@@ -1145,6 +1335,88 @@ mod tests {
             transport_protocol: MqttTransportProtocol::Tcp,
             websocket_path: "/mqtt".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn wait_for_self_info_returns_immediately_when_already_known() {
+        let (command_tx, _command_rx) = mpsc::channel(8);
+        let state = sample_app_state(command_tx);
+        state.snapshot.write().await.self_info = Some(sample_self_info());
+
+        let result = wait_for_self_info(&state, Duration::from_secs(5)).await;
+
+        assert_eq!(
+            result.map(|i| i.public_key_hex),
+            Some(sample_self_info().public_key_hex)
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_via_mesh_propagates_a_signing_error() {
+        let (command_tx, mut command_rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            if let Some(DaemonCommand::SignData { reply, .. }) = command_rx.recv().await {
+                let _ = reply.send(Err("no mesh connection".to_string()));
+            }
+        });
+        let state = sample_app_state(command_tx);
+
+        let result = sign_via_mesh(&state, b"signing input").await;
+
+        assert_eq!(result, Err("no mesh connection".to_string()));
+    }
+
+    #[tokio::test]
+    async fn build_device_signed_credentials_uses_the_signed_token() {
+        let (command_tx, mut command_rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            if let Some(DaemonCommand::SignData { reply, .. }) = command_rx.recv().await {
+                let _ = reply.send(Ok(vec![0xAB; 64]));
+            }
+        });
+        let state = sample_app_state(command_tx);
+        let self_info = sample_self_info();
+        let config = sample_broker_config();
+
+        let (username, token) = build_device_signed_credentials(&state, &self_info, &config)
+            .await
+            .expect("signing succeeds");
+
+        assert_eq!(
+            username,
+            format!("v1_{}", self_info.public_key_hex.to_uppercase())
+        );
+        assert_eq!(token.matches('.').count(), 2);
+        assert!(token.ends_with(&"AB".repeat(64)));
+    }
+
+    #[tokio::test]
+    async fn build_device_signed_credentials_uses_host_as_default_audience() {
+        let (command_tx, mut command_rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            if let Some(DaemonCommand::SignData { data, reply }) = command_rx.recv().await {
+                // Round-trips the signing input's `aud` claim back out so the
+                // test can assert on it without duplicating JWT parsing here.
+                let signing_input = String::from_utf8(data).expect("ascii signing input");
+                let payload_b64 = signing_input.split('.').nth(1).expect("payload segment");
+                let payload_json = base64::Engine::decode(
+                    &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                    payload_b64,
+                )
+                .expect("valid base64url");
+                let payload: serde_json::Value =
+                    serde_json::from_slice(&payload_json).expect("valid JSON");
+                assert_eq!(payload["aud"], "mqtt.example.com");
+                let _ = reply.send(Ok(vec![0u8; 64]));
+            }
+        });
+        let state = sample_app_state(command_tx);
+        let self_info = sample_self_info();
+        let config = sample_broker_config(); // jwt_audience: None, host: "mqtt.example.com"
+
+        build_device_signed_credentials(&state, &self_info, &config)
+            .await
+            .expect("signing succeeds");
     }
 
     fn packet_log_entry(route_type: RouteType, path_len: u8, payload: Vec<u8>) -> PacketLogEntry {

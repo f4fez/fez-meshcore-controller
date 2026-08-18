@@ -14,7 +14,10 @@ enable/disable switches).
 | `name` | string | — | Internal identification for this broker, shown in the TUI's "Observer node" block. |
 | `host` | string | — | Broker hostname or IP. |
 | `port` | number | `1883` | Broker port. |
-| `username` / `password` | string, optional | none | Broker credentials. Stored in **plaintext** in `config.toml`, like the rest of this file. |
+| `auth_method` | `"passwd"` \| `"device"` \| `"none"` | `"passwd"` | How to authenticate with this broker. `"passwd"` uses `username`/`password` below (optionally both left unset, for an anonymous connection under this mode too); `"device"` uses a MeshCore device-signed token instead — required by LetsMesh and MeshMapper's public brokers, see [Device-signed authentication](#device-signed-authentication-letsmesh-meshmapper) below; `"none"` always connects anonymously, ignoring `username`/`password` even if set. |
+| `username` / `password` | string, optional | none | Broker credentials. Stored in **plaintext** in `config.toml`, like the rest of this file. Only used when `auth_method = "passwd"`. |
+| `jwt_ttl_secs` | number | `3600` | Lifetime, in seconds, of a device-signed auth token before it's refreshed (6 minutes before expiry). Only used when `auth_method = "device"`. |
+| `jwt_audience` | string, optional | `host` | `aud` claim for a device-signed auth token. Defaults to `host`, which is what LetsMesh/MeshMapper expect. Only used when `auth_method = "device"`. |
 | `topic_prefix` | string | `"meshcore"` | Prefix substituted for `{prefix}` in every topic route below. |
 | `status_topic` | string | `"{prefix}/status"` | Topic route for the status topic (see below). |
 | `status_refresh_interval_secs` | number | `300` | How often (seconds) to republish the retained status message while connected, so its `timestamp` stays fresh. `0` disables the periodic republish (status is still published on connect/disconnect). |
@@ -46,6 +49,87 @@ expects exactly `meshcore/<area-code>/<node-id>/<kind>` (4 segments; `kind` one 
 `"{prefix}/{public_key}/packets"`.
 
 Every decoded-event topic below is fixed at `{prefix}/<name>` (not independently configurable).
+
+### Device-signed authentication (LetsMesh, MeshMapper)
+
+Some public community MQTT brokers — verified against
+[`Colorado-Mesh/mesh-client`](https://github.com/Colorado-Mesh/mesh-client)'s
+`docs/letsmesh-mqtt-auth.md`, not assumed — require **device-signed** auth rather than a static
+username/password: the MQTT username is `v1_<node public key, uppercase hex>`, and the password
+is a short-lived JWT-style token signed by the node's own private key. Set `auth_method = "device"`
+to use this instead of `username`/`password` (the setup wizard offers it as a third "MeshCore Auth
+Token" option alongside "Username/Password" and "Anonymous", which map to `auth_method = "passwd"`
+and `auth_method = "none"` respectively).
+
+The node's private key **never leaves the device**: this daemon builds the token's header/payload
+and asks the node to sign those bytes over the existing companion link (the same mechanism the
+node's own firmware exposes for this purpose), then assembles the final token. The token is
+automatically refreshed 6 minutes before `jwt_ttl_secs` expires, forcing a reconnect so the
+broker sees the fresh credentials (MQTT 3.1.1 has no in-band re-authentication).
+
+Known presets:
+
+| Preset | Host | Port | WebSocket path |
+|---|---|---|---|
+| LetsMesh (US) | `mqtt-us-v1.letsmesh.net` | `443` | `/ws` |
+| LetsMesh (EU) | `mqtt-eu-v1.letsmesh.net` | `443` | `/ws` |
+| MeshMapper | `mqtt.meshmapper.net` | `443` | `/ws` |
+
+To point a broker entry at one of these: `host` = the hostname above, `port = 443`,
+`transport_protocol = "websocket"`, `websocket_path = "/ws"`, `tls_enabled = true`,
+`auth_method = "device"`.
+
+**MeshMapper requires a specific topic structure** — verified against their own
+[`wiki.meshmapper.net/mqtt-python`](https://wiki.meshmapper.net/mqtt-python/), not assumed:
+`meshcore/{IATA}/{PUBLIC_KEY}/status` and `meshcore/{IATA}/{PUBLIC_KEY}/packets`, where `{IATA}` is
+a 3-letter IATA code (e.g. `SEA`, `LAX`, `YOW`, `LON`) identifying which MeshMapper region your
+observer belongs to — pick your own region's code, this daemon has no way to infer it. This
+project's existing `{prefix}`/`{public_key}` topic template placeholders (see above) already cover
+this shape: set `topic_prefix = "meshcore/<your IATA code>"` and `status_topic`/
+`packet_trafic_topic` to `"{prefix}/{public_key}/status"` / `"{prefix}/{public_key}/packets"`, as
+in the ready-to-use entry below. LetsMesh has no equivalent region-in-topic requirement — its
+packet logger topic (`{topicPrefix}/{pubKey}/packets` or `{topicPrefix}/meshcore/packets`) matches
+this daemon's own default `<prefix>/packets` shape closely enough to leave `topic_prefix` at its
+default, though the exact envelope isn't guaranteed identical — check against your operator's
+current docs before relying on it.
+
+Ready-to-use `[[mqtt_brokers]]` entries:
+
+```toml
+[[mqtt_brokers]]
+name = "LetsMesh (US)"
+host = "mqtt-us-v1.letsmesh.net"
+port = 443
+auth_method = "device"
+transport_protocol = "websocket"
+websocket_path = "/ws"
+tls_enabled = true
+
+[[mqtt_brokers]]
+name = "LetsMesh (EU)"
+host = "mqtt-eu-v1.letsmesh.net"
+port = 443
+auth_method = "device"
+transport_protocol = "websocket"
+websocket_path = "/ws"
+tls_enabled = true
+
+[[mqtt_brokers]]
+name = "MeshMapper"
+host = "mqtt.meshmapper.net"
+port = 443
+auth_method = "device"
+transport_protocol = "websocket"
+websocket_path = "/ws"
+tls_enabled = true
+topic_prefix = "meshcore/SEA"                     # replace SEA with your own 3-letter IATA code
+status_topic = "{prefix}/{public_key}/status"
+packet_trafic_topic = "{prefix}/{public_key}/packets"
+```
+
+Only one broker is needed to reach a given operator — add all three only if you actually want to
+forward to every one of them. `jwt_ttl_secs`/`jwt_audience` are left at their defaults (3600s,
+`aud` = `host`) above; override them only if an operator's requirements differ.
 
 ## Topics published
 
