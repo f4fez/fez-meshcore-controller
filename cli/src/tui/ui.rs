@@ -462,6 +462,22 @@ fn event_line(ev: &MeshEvent) -> Line<'static> {
             ),
             GREEN,
         ),
+        MeshEventKind::RepeaterStatusChanged { name, status } => (
+            "🔖",
+            match status {
+                Some(RepeaterStatus::Managed) => {
+                    format!("{} is now managed", strip_flag_emoji(name))
+                }
+                Some(RepeaterStatus::Known) => {
+                    format!("{} is now known", strip_flag_emoji(name))
+                }
+                Some(RepeaterStatus::Supervised) => {
+                    format!("{} is now supervised", strip_flag_emoji(name))
+                }
+                None => format!("{} is no longer managed", strip_flag_emoji(name)),
+            },
+            MAGENTA,
+        ),
         MeshEventKind::ObserverNodeConfigEnforced { detail } => (
             "🔒",
             format!("Observer node config enforced: {detail}"),
@@ -1899,6 +1915,24 @@ mod render_tests {
 
         assert!(text.contains("Telemetry from Repeater A: Voltage: 3.71V"));
         assert_eq!(fg_of_text(&buffer, "Telemetry from"), Some(CYAN));
+    }
+
+    #[test]
+    fn event_log_shows_repeater_status_changed() {
+        let mut app = App::new();
+        app.push_event(MeshEvent {
+            at_unix: 0,
+            kind: MeshEventKind::RepeaterStatusChanged {
+                name: "Repeater A".to_string(),
+                status: Some(RepeaterStatus::Supervised),
+            },
+        });
+
+        let buffer = render_buffer(&mut app, 140, 20);
+        let text = render(&mut app, 140, 20);
+
+        assert!(text.contains("Repeater A is now supervised"));
+        assert_eq!(fg_of_text(&buffer, "Repeater A is now"), Some(MAGENTA));
     }
 
     // --- Dashboard layout ----------------------------------------------------

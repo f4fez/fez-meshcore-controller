@@ -964,6 +964,20 @@ pub enum MeshEventKind {
     ManagedRepeaterDeclared {
         name: String,
     },
+    /// A repeater's configured management tier (`RepeaterStatus`) was
+    /// created, changed or cleared via `ClientMessage::SetRepeaterStatus`
+    /// (the TUI's `m`/`k`/`s` keys or `repeater manage`/`unmanage`).
+    /// Distinct from `ManagedRepeaterDeclared` (which only fires when the
+    /// repeater becomes a companion contact for the first time): this
+    /// fires on *every* status change, including changing an
+    /// already-registered repeater's tier or clearing it -- clients need
+    /// this to know to refresh, since a tier change on an already-known
+    /// contact wouldn't otherwise trigger any event at all.
+    RepeaterStatusChanged {
+        name: String,
+        /// `None` if cleared (removed from `managed_repeaters` entirely).
+        status: Option<RepeaterStatus>,
+    },
     /// `observer_node_managed_config` corrected something on the connected
     /// node (auto-add, a channel, or a non-managed contact) to keep it in
     /// an observer-only state.

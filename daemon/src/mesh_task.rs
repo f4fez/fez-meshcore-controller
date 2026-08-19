@@ -582,6 +582,19 @@ async fn set_repeater_status(
     )
     .await?;
 
+    // Unlike `ManagedRepeaterDeclared` above (only broadcast when a fresh
+    // `declare_contact` happens), this fires unconditionally -- changing an
+    // already-registered repeater's tier (or clearing it) wouldn't
+    // otherwise broadcast anything, leaving connected clients' contact
+    // lists stale until an unrelated event happened to refresh them.
+    state.broadcast_event(MeshEvent {
+        at_unix: now_unix(),
+        kind: MeshEventKind::RepeaterStatusChanged {
+            name: name.to_string(),
+            status,
+        },
+    });
+
     refresh_snapshot_contacts(client, state).await;
     Ok(())
 }

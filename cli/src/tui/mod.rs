@@ -297,9 +297,10 @@ async fn apply_ui_event(app: &mut App, event: UiEvent, cmd_tx: &mpsc::Sender<Cli
             ServerMessage::Event(event) => {
                 // These events mean the daemon's own cache
                 // (self_info/contacts) just changed — on (re)connection,
-                // because this same client's own `d` (delete) request
-                // succeeded, or because the companion auto-added a newly
-                // heard node as a contact — but that freshness isn't
+                // because this same client's own `d` (delete) or
+                // `m`/`k`/`s` (status) request succeeded, or because the
+                // companion auto-added a newly heard node as a contact —
+                // but that freshness isn't
                 // pushed to clients on its own (the daemon only replies to
                 // a request with success/failure, it doesn't broadcast a
                 // new `Snapshot`). Ask for a fresh one so the dashboard
@@ -311,6 +312,7 @@ async fn apply_ui_event(app: &mut App, event: UiEvent, cmd_tx: &mpsc::Sender<Cli
                         | MeshEventKind::NewContact { .. }
                         | MeshEventKind::ConfigReloaded { .. }
                         | MeshEventKind::TelemetryReceived { .. }
+                        | MeshEventKind::RepeaterStatusChanged { .. }
                 );
                 app.push_event(event);
                 if needs_fresh_snapshot {
@@ -454,6 +456,28 @@ mod tests {
             &mut app,
             server_event(MeshEventKind::NewContact {
                 name: "Repeater".to_string(),
+            }),
+            &cmd_tx,
+        )
+        .await;
+
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(ClientMessage::RequestSnapshot)
+        ));
+        assert_eq!(app.events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn repeater_status_changed_event_requests_a_fresh_snapshot() {
+        let mut app = App::new();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<ClientMessage>(8);
+
+        apply_ui_event(
+            &mut app,
+            server_event(MeshEventKind::RepeaterStatusChanged {
+                name: "Repeater".to_string(),
+                status: Some(fez_mesh_controller_core::RepeaterStatus::Known),
             }),
             &cmd_tx,
         )
