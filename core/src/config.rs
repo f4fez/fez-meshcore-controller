@@ -269,6 +269,27 @@ pub struct RegionConfig {
     pub parent: Option<String>,
 }
 
+/// A repeater's configured management tier — see [`ManagedRepeater::status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RepeaterStatus {
+    /// Full current behavior: declared as a companion contact, protected
+    /// from observer-node pruning, shown with the "🛰️ Managed" badge.
+    #[default]
+    Managed,
+    /// Declared as a contact and protected from pruning, exactly like
+    /// `Managed`, but without the "Managed" badge -- the deliberate,
+    /// config-driven version of what's otherwise an organic outcome (a
+    /// companion contact that simply isn't in `managed_repeaters`).
+    Known,
+    /// Reserved for future telemetry-based health monitoring. Behaves
+    /// exactly like `Managed` today (declared, protected from pruning,
+    /// counted as "managed" everywhere that matters) -- the TUI shows it
+    /// with a distinct badge so it's visually distinguishable ahead of
+    /// that feature landing.
+    Supervised,
+}
+
 /// A repeater managed by this application, identified by name and public key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagedRepeater {
@@ -277,6 +298,21 @@ pub struct ManagedRepeater {
     /// Public key (hex-encoded). May be the full 32-byte key or just a
     /// prefix; matched against a contact's public key prefix.
     pub public_key_hex: String,
+    /// Admin or guest password for logging into this repeater before it
+    /// will answer authenticated requests (e.g. telemetry). Stored in
+    /// plaintext, like every other secret in this file. Optional -- if
+    /// unset, a best-effort guest login is attempted instead (see
+    /// `DEFAULT_GUEST_PASSWORD` in `daemon::mesh_task`), which may or may
+    /// not be sufficient depending on this repeater's own configuration.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// This repeater's management tier -- see [`RepeaterStatus`]. The TOML
+    /// key is `managed` (not `status`) so an entry reads naturally as
+    /// `managed = "known"` / `"supervised"` / `"managed"`. Defaults to
+    /// `Managed` when omitted, matching every config written before this
+    /// field existed.
+    #[serde(rename = "managed", default)]
+    pub status: RepeaterStatus,
 }
 
 impl ManagedRepeater {
@@ -289,7 +325,7 @@ impl ManagedRepeater {
 }
 
 /// Connection method used by the daemon to talk to the MeshCore node.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ConnectionConfig {
     /// Serial connection (USB/UART), the most common for a companion radio.
@@ -313,7 +349,7 @@ impl std::fmt::Display for ConnectionConfig {
 }
 
 /// Settings specific to the daemon service (IPC socket exposed to the CLI, etc).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DaemonConfig {
     /// Path of the Unix socket used for daemon <-> CLI IPC.
     pub socket_path: PathBuf,
@@ -463,6 +499,8 @@ mod tests {
             managed_repeaters: vec![ManagedRepeater {
                 name: "F4FEZ Repeater".to_string(),
                 public_key_hex: "ab".repeat(32),
+                password: None,
+                status: RepeaterStatus::Managed,
             }],
             regions: vec![
                 RegionConfig {
@@ -508,6 +546,8 @@ mod tests {
             name: "Repeater".to_string(),
             public_key_hex: "AaBbCc0011223344556677889900aabbccddeeff00112233445566778899aa"
                 .to_string(),
+            password: None,
+            status: RepeaterStatus::Managed,
         };
 
         assert!(repeater.matches("aabbcc001122"));
@@ -522,9 +562,69 @@ mod tests {
         let repeater = ManagedRepeater {
             name: "Repeater".to_string(),
             public_key_hex: "ab".repeat(32),
+            password: None,
+            status: RepeaterStatus::Managed,
         };
         // Every key starts with the empty prefix.
         assert!(repeater.matches(""));
+    }
+
+    #[test]
+    fn managed_repeater_password_defaults_to_none_when_omitted() {
+        let toml = r#"
+            name = "Repeater"
+            public_key_hex = "ab"
+        "#;
+        let repeater: ManagedRepeater = toml::from_str(toml).expect("parse");
+        assert_eq!(repeater.password, None);
+    }
+
+    #[test]
+    fn managed_repeater_password_round_trips() {
+        let repeater = ManagedRepeater {
+            name: "Repeater".to_string(),
+            public_key_hex: "ab".repeat(32),
+            password: Some("hunter2".to_string()),
+            status: RepeaterStatus::Managed,
+        };
+        let toml = toml::to_string(&repeater).expect("serialize");
+        let reloaded: ManagedRepeater = toml::from_str(&toml).expect("deserialize");
+        assert_eq!(reloaded.password, Some("hunter2".to_string()));
+    }
+
+    // --- RepeaterStatus / ManagedRepeater.status ----------------------------
+
+    #[test]
+    fn managed_repeater_status_defaults_to_managed_when_omitted() {
+        let toml = r#"
+            name = "Repeater"
+            public_key_hex = "ab"
+        "#;
+        let repeater: ManagedRepeater = toml::from_str(toml).expect("parse");
+        assert_eq!(repeater.status, RepeaterStatus::Managed);
+    }
+
+    #[test]
+    fn repeater_status_round_trips_through_toml_as_the_managed_key() {
+        for (status, expected_value) in [
+            (RepeaterStatus::Managed, "managed"),
+            (RepeaterStatus::Known, "known"),
+            (RepeaterStatus::Supervised, "supervised"),
+        ] {
+            let repeater = ManagedRepeater {
+                name: "Repeater".to_string(),
+                public_key_hex: "ab".repeat(32),
+                password: None,
+                status,
+            };
+            let toml = toml::to_string(&repeater).expect("serialize");
+            assert!(
+                toml.contains(&format!("managed = \"{expected_value}\"")),
+                "expected `managed = \"{expected_value}\"` in:\n{toml}"
+            );
+            let reloaded: ManagedRepeater = toml::from_str(&toml).expect("deserialize");
+            assert_eq!(reloaded.status, status);
+        }
     }
 
     #[test]

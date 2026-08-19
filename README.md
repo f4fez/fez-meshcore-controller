@@ -67,6 +67,13 @@ Configuration is stored in `~/.config/fez-mesh-controller/config.toml` (re-run t
 `fez-mesh-controller setup`). See [`config.example.toml`](config.example.toml) for every
 available parameter, with comments.
 
+Sending the daemon a `SIGHUP` (e.g. `kill -HUP $(pgrep fez-mesh-controller-daemon)`) reloads
+`config.toml` without a restart, applying `managed_repeaters`, `regions`, `hashtag_channels` and
+`mqtt_brokers` changes live (MQTT broker connections are individually started/stopped/restarted
+to match). Changing the node connection, IPC socket path, database path, packet-log capacity,
+refresh interval, or log level/directory still requires a full restart — the daemon logs a
+warning identifying exactly which changed field wasn't applied.
+
 MQTT broker forwarding is also available — see
 [`documentation/mqtt.md`](documentation/mqtt.md) for configuration and message formats.
 

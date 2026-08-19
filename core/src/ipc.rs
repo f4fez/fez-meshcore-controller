@@ -24,10 +24,13 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::RegionConfig;
-use crate::mesh::{ContactDto, MeshEventKind, NodeStatsDto, PacketLogEntry, SelfInfoDto};
+use crate::mesh::{
+    ContactDto, MeshEventKind, NodeStatsDto, PacketLogEntry, RepeaterDetailCategory, SelfInfoDto,
+    TelemetryDto,
+};
 
 /// IPC protocol version, to bump on incompatible changes.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Message sent by the CLI/TUI to the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,33 +43,57 @@ pub enum ClientMessage {
     /// all clients; on failure, a [`ServerMessage::Error`] is sent back to
     /// the requesting client only.
     RemoveContact { public_key_prefix_hex: String },
-    /// Add or remove a contact from the config's managed-repeater list,
-    /// identified by its public key prefix (hex). If `managed` is `true`
-    /// and the contact isn't already registered in the companion, the
-    /// daemon declares it first (using the full public key resolved from
-    /// overheard RF log data, see
-    /// [`crate::mesh::extract_discovered_node`]) — a managed repeater is
-    /// always registered. On success, an updated [`Snapshot`] is broadcast
-    /// to all clients; on failure, a [`ServerMessage::Error`] is sent back
-    /// to the requesting client only.
-    SetManagedRepeater {
+    /// Sets, changes or clears a repeater's status in the config's
+    /// managed-repeater list, identified by its public key prefix (hex).
+    /// `status: None` removes the entry entirely; `Some(status)` creates it
+    /// (if new) or updates its tier (if it already exists). If `status` is
+    /// `Some(_)` and the contact isn't already registered in the companion,
+    /// the daemon declares it first (using the full public key resolved
+    /// from overheard RF log data, see
+    /// [`crate::mesh::extract_discovered_node`]) — every tier requires the
+    /// repeater to be a real companion contact, not just `Managed`. On
+    /// success, an updated [`Snapshot`] is broadcast to all clients; on
+    /// failure, a [`ServerMessage::Error`] is sent back to the requesting
+    /// client only.
+    SetRepeaterStatus {
         public_key_prefix_hex: String,
         name: String,
-        managed: bool,
+        status: Option<crate::config::RepeaterStatus>,
     },
     /// Declares a new contact directly from its full public key (hex),
     /// without requiring it to have been overheard on the mesh first —
-    /// unlike [`ClientMessage::SetManagedRepeater`], which can only resolve
+    /// unlike [`ClientMessage::SetRepeaterStatus`], which can only resolve
     /// a full key for a node already known (registered or discovered). If
     /// `managed` is `true`, it's also added to the config's
-    /// managed-repeater list. On success, an updated [`Snapshot`] is
-    /// broadcast to all clients; on failure, a [`ServerMessage::Error`] is
-    /// sent back to the requesting client only.
+    /// managed-repeater list with status `Managed` (this entry point
+    /// doesn't expose the `Known`/`Supervised` tiers). On success, an
+    /// updated [`Snapshot`] is broadcast to all clients; on failure, a
+    /// [`ServerMessage::Error`] is sent back to the requesting client only.
     AddRepeater {
         public_key_hex: String,
         name: String,
         managed: bool,
     },
+    /// Requests a fresh telemetry read from a known contact (typically a
+    /// managed repeater), identified by its public key prefix (hex). A
+    /// prior login is attempted automatically if the matching
+    /// `managed_repeaters` config entry has a `password` set. On success,
+    /// a [`ServerMessage::TelemetryResult`] is sent back to the requesting
+    /// client only (mesh round trips are too slow to wait for a snapshot
+    /// refresh); on failure, a [`ServerMessage::Error`] is sent instead.
+    RequestTelemetry { public_key_prefix_hex: String },
+    /// Requests status + telemetry + neighbours + region hierarchy from a
+    /// known contact together, as one combined command (one login, then all
+    /// four requests sequentially — see
+    /// `daemon::mesh_task::request_repeater_detail`). Best-effort and
+    /// progressive: each category is sent back as its own
+    /// [`ServerMessage::RepeaterDetailCategory`] as soon as it's available,
+    /// rather than waiting for all four — so the requesting client can
+    /// render the popup incrementally instead of all at once. A
+    /// [`ServerMessage::Error`] is only sent for a transport-level failure
+    /// (e.g. the mesh connection task isn't running, or it goes silent for
+    /// too long).
+    RequestRepeaterDetail { public_key_prefix_hex: String },
 }
 
 /// Message sent by the daemon to a connected client.
@@ -88,6 +115,22 @@ pub enum ServerMessage {
     PacketLogEntry(Box<PacketLogEntry>),
     /// Non-fatal error to report to the client (e.g. lost mesh connection).
     Error(String),
+    /// Direct reply to [`ClientMessage::RequestTelemetry`], sent only to
+    /// the requesting connection (not broadcast).
+    TelemetryResult {
+        public_key_prefix_hex: String,
+        telemetry: TelemetryDto,
+    },
+    /// One category of a [`ClientMessage::RequestRepeaterDetail`] fetch's
+    /// outcome, sent to the requesting connection only (not broadcast) as
+    /// soon as it's available — several of these arrive per request, one
+    /// per category, in the order attempted (status, telemetry, neighbours,
+    /// regions). See [`crate::mesh::RepeaterDetailDto::apply_category`] for
+    /// how the client folds them into a single accumulated view.
+    RepeaterDetailCategory {
+        public_key_prefix_hex: String,
+        category: RepeaterDetailCategory,
+    },
 }
 
 /// Full snapshot of the state known by the daemon at a given point in time.
@@ -180,10 +223,21 @@ mod tests {
         assert_roundtrips_as_single_line(&ClientMessage::RemoveContact {
             public_key_prefix_hex: "aabbccddeeff".to_string(),
         });
-        assert_roundtrips_as_single_line(&ClientMessage::SetManagedRepeater {
+        assert_roundtrips_as_single_line(&ClientMessage::SetRepeaterStatus {
             public_key_prefix_hex: "aabbccddeeff".to_string(),
             name: "Repeater".to_string(),
-            managed: true,
+            status: Some(crate::config::RepeaterStatus::Known),
+        });
+        assert_roundtrips_as_single_line(&ClientMessage::SetRepeaterStatus {
+            public_key_prefix_hex: "aabbccddeeff".to_string(),
+            name: "Repeater".to_string(),
+            status: None,
+        });
+        assert_roundtrips_as_single_line(&ClientMessage::RequestTelemetry {
+            public_key_prefix_hex: "aabbccddeeff".to_string(),
+        });
+        assert_roundtrips_as_single_line(&ClientMessage::RequestRepeaterDetail {
+            public_key_prefix_hex: "aabbccddeeff".to_string(),
         });
     }
 
@@ -210,6 +264,42 @@ mod tests {
             },
         )));
         assert_roundtrips_as_single_line(&ServerMessage::Error("oops".to_string()));
+        assert_roundtrips_as_single_line(&ServerMessage::TelemetryResult {
+            public_key_prefix_hex: "aabbccddeeff".to_string(),
+            telemetry: TelemetryDto {
+                fetched_at_unix: 0,
+                readings: vec![crate::telemetry::TelemetryReading {
+                    channel: 1,
+                    label: "Voltage".to_string(),
+                    value: 3.71,
+                    unit: "V".to_string(),
+                }],
+            },
+        });
+        assert_roundtrips_as_single_line(&ServerMessage::RepeaterDetailCategory {
+            public_key_prefix_hex: "aabbccddeeff".to_string(),
+            category: RepeaterDetailCategory::Telemetry(Ok(TelemetryDto {
+                fetched_at_unix: 0,
+                readings: vec![],
+            })),
+        });
+        assert_roundtrips_as_single_line(&ServerMessage::RepeaterDetailCategory {
+            public_key_prefix_hex: "aabbccddeeff".to_string(),
+            category: RepeaterDetailCategory::Status(Err("timed out".to_string())),
+        });
+        assert_roundtrips_as_single_line(&ServerMessage::RepeaterDetailCategory {
+            public_key_prefix_hex: "aabbccddeeff".to_string(),
+            category: RepeaterDetailCategory::Regions(Ok(crate::mesh::RegionHierarchyDto {
+                fetched_at_unix: 0,
+                entries: vec![crate::mesh::RegionHierarchyEntryDto {
+                    name: "World".to_string(),
+                    depth: 0,
+                    is_home: false,
+                    flood_allowed: true,
+                }],
+                raw_text: "World F".to_string(),
+            })),
+        });
     }
 
     #[test]

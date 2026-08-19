@@ -16,6 +16,7 @@ mod command;
 mod lock;
 mod mesh_task;
 mod mqtt;
+mod reload;
 mod repeater_db;
 mod server;
 mod state;
@@ -122,9 +123,15 @@ async fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
     // the `select!` below (mirrors `mesh_task::run`'s own
     // reconnect-forever style, just one level up).
     for broker in mqtt_brokers {
-        let broker_state = state.clone();
-        tokio::spawn(mqtt::run_broker(broker, broker_state));
+        let name = broker.name.clone();
+        let handle = mqtt::spawn(state.clone(), broker);
+        state.mqtt_broker_tasks.lock().await.insert(name, handle);
     }
+
+    // Also fire-and-forget: reloads config on every SIGHUP for the
+    // daemon's entire lifetime, independent of the shutdown `select!`
+    // below (which would otherwise end the daemon on the first signal).
+    tokio::spawn(reload::watch(state.clone()));
 
     let server_state = state.clone();
     let server_socket_path = socket_path.clone();

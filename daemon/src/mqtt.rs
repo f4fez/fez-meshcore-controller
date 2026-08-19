@@ -75,6 +75,13 @@ const JWT_REFRESH_MARGIN_SECS: u64 = 360;
 /// shape the Python bridges use for their own `client_version` field.
 const CLIENT_VERSION: &str = concat!("fez-mesh-controller/", env!("CARGO_PKG_VERSION"));
 
+/// Spawns [`run_broker`] as its own task and returns a handle that can abort
+/// it — used both at daemon startup and by `crate::reload` when a config
+/// reload adds, removes or changes a broker.
+pub fn spawn(state: Arc<AppState>, broker: MqttBrokerConfig) -> tokio::task::AbortHandle {
+    tokio::spawn(run_broker(broker, state)).abort_handle()
+}
+
 /// Runs the publish loop for one configured broker: connects (rumqttc
 /// retries internally as long as `poll()` keeps being called), subscribes
 /// to every raw mesh event the daemon receives, and publishes the ones

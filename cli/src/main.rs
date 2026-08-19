@@ -94,6 +94,15 @@ enum RepeaterCommand {
         #[arg(short, long)]
         yes: bool,
     },
+    /// Fetch fresh telemetry (battery voltage, temperature, ...) from a
+    /// repeater over the mesh. Logs in first if it has a `password`
+    /// configured (see `config.example.toml`); most repeaters require
+    /// this. Can take a while (a real multi-hop mesh round trip).
+    Telemetry {
+        /// Public key prefix (hex, see `repeater list`); may be
+        /// abbreviated as long as it's unambiguous
+        prefix: String,
+    },
 }
 
 /// Saves `config` to `path` and reports it — used right after the setup
@@ -193,6 +202,7 @@ async fn main() -> anyhow::Result<()> {
             RepeaterCommand::Remove { prefix, yes } => {
                 repeater::remove(&config, &prefix, yes).await
             }
+            RepeaterCommand::Telemetry { prefix } => repeater::telemetry(&config, &prefix).await,
         },
         None => tui::run(&config).await,
     }

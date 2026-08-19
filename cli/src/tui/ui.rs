@@ -16,19 +16,21 @@ use chrono::{Local, TimeZone};
 use fez_mesh_controller_core::channel;
 use fez_mesh_controller_core::ipc::{MeshEvent, MqttBrokerStatus, MqttBrokerStatusDto};
 use fez_mesh_controller_core::mesh::{
-    ContactDto, ControlPayloadInfo, MeshEventKind, NodeStatsDto, PacketHeaderInfo, PacketLogEntry,
+    adv_type_name, ContactDto, ControlPayloadInfo, MeshEventKind, NodeStatsDto, PacketHeaderInfo,
+    PacketLogEntry, RepeaterDetailDto,
 };
 use fez_mesh_controller_core::region;
+use fez_mesh_controller_core::RepeaterStatus;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap,
+    Block, BorderType, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap,
 };
 use ratatui::Frame;
 
 use crate::format::{format_coords, format_last_seen, format_uptime, strip_flag_emoji};
-use crate::tui::app::{App, Page};
+use crate::tui::app::{contact_advert_interval_secs, App, Page, RepeaterDetailView};
 use crate::tui::packet_group::{path_hop_hashes, PacketGroup};
 
 const CYAN: Color = Color::Rgb(0x4d, 0xd0, 0xe1);
@@ -76,6 +78,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.page == Page::PacketLog {
         if let Some(group) = &app.packet_detail {
             draw_packet_detail_popup(frame, group, &app.region_keys, &app.channel_keys);
+        }
+    }
+
+    if app.page == Page::Dashboard {
+        if let Some(view) = &app.repeater_detail {
+            draw_repeater_detail_popup(
+                frame,
+                view,
+                &app.snapshot.contacts,
+                &app.packets,
+                &mut app.neighbours_list_state,
+            );
         }
     }
 
@@ -309,22 +323,29 @@ fn draw_repeaters(frame: &mut Frame, app: &mut App, area: Rect) {
         let prefix: String = c.public_key_prefix_hex.chars().take(8).collect();
         let name = strip_flag_emoji(&c.name);
 
-        let name_cell = if c.managed {
-            Cell::from(Line::from(vec![
+        let name_cell = match c.repeater_status {
+            Some(RepeaterStatus::Managed) => Cell::from(Line::from(vec![
                 Span::raw("🛰️ "),
                 Span::styled(
                     name,
                     Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
                 ),
-            ]))
-        } else {
-            Cell::from(name)
+            ])),
+            Some(RepeaterStatus::Supervised) => Cell::from(Line::from(vec![
+                Span::raw("🛡️ "),
+                Span::styled(
+                    name,
+                    Style::default().fg(MAGENTA).add_modifier(Modifier::BOLD),
+                ),
+            ])),
+            _ => Cell::from(name),
         };
 
-        let (status_text, status_color) = match (c.registered, c.managed) {
-            (_, true) => ("🛰️ Managed", GREEN),
-            (true, false) => ("📟 Known", MUTED),
-            (false, false) => ("🔍 Discovered", YELLOW),
+        let (status_text, status_color) = match (c.repeater_status, c.registered) {
+            (Some(RepeaterStatus::Managed), _) => ("🛰️ Managed", GREEN),
+            (Some(RepeaterStatus::Supervised), _) => ("🛡️ Supervised", MAGENTA),
+            (Some(RepeaterStatus::Known), _) | (None, true) => ("📟 Known", MUTED),
+            (None, false) => ("🔍 Discovered", YELLOW),
         };
         let status_cell = Cell::from(Span::styled(status_text, Style::default().fg(status_color)));
 
@@ -463,6 +484,14 @@ fn event_line(ev: &MeshEvent) -> Line<'static> {
                 &prefix_hex[..prefix_hex.len().min(8)]
             ),
             RED,
+        ),
+        MeshEventKind::ConfigReloaded { summary } => {
+            ("🔄", format!("Config reloaded: {summary}"), Color::Blue)
+        }
+        MeshEventKind::TelemetryReceived { name, summary } => (
+            "📡",
+            format!("Telemetry from {}: {summary}", strip_flag_emoji(name)),
+            CYAN,
         ),
         MeshEventKind::Other { label } => ("🔎", label.clone(), MUTED),
     };
@@ -1092,6 +1121,264 @@ fn draw_packet_detail_popup(
     frame.render_widget(popup, area);
 }
 
+/// Popup with a repeater's contact info, local configuration, and fetched
+/// status/telemetry/neighbours/regions — the [`App::repeater_detail`] analog
+/// of [`draw_packet_detail_popup`]. Split horizontally: the left column
+/// (Contact/Configuration/Status/Telemetry/Regions, always started
+/// immediately — Contact/Configuration are local, no fetch needed) and the
+/// right column (Neighbours, a scrollable list — see
+/// [`App::select_next_neighbour`]/[`App::select_prev_neighbour`]).
+/// Status/Telemetry/Neighbours/Regions each resolve independently as their
+/// own `ServerMessage::RepeaterDetailCategory` streams in (see
+/// [`App::apply_repeater_detail_category`]): every section starts showing a
+/// ⏳ heading and a "fetching…" placeholder, then flips to either its data
+/// or the matching entry from `detail.errors` the moment *that* category
+/// arrives — sections don't wait on each other.
+fn draw_repeater_detail_popup(
+    frame: &mut Frame,
+    view: &RepeaterDetailView,
+    contacts: &[ContactDto],
+    packets: &[PacketLogEntry],
+    neighbours_list_state: &mut ListState,
+) {
+    let area = centered_rect(80, 88, frame.area());
+    frame.render_widget(Clear, area);
+
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+        .split(area);
+
+    let contact = contacts
+        .iter()
+        .find(|c| c.public_key_prefix_hex == view.public_key_prefix_hex);
+    let detail = &view.detail;
+
+    // --- Left column: Contact, Configuration, Status, Telemetry, Regions ---
+    let mut lines = vec![section_title(format!(
+        "— {} —",
+        strip_flag_emoji(&view.name)
+    ))];
+
+    lines.push(Line::from(""));
+    lines.push(section_title("Contact"));
+    match contact {
+        Some(c) => {
+            lines.push(field_line("  Public key", c.public_key_prefix_hex.clone()));
+            lines.push(field_line("  Type", adv_type_name(c.contact_type)));
+            lines.push(field_line(
+                "  Status",
+                match (c.repeater_status, c.registered) {
+                    (Some(RepeaterStatus::Managed), _) => "managed",
+                    (Some(RepeaterStatus::Supervised), _) => "supervised",
+                    (Some(RepeaterStatus::Known), _) | (None, true) => "known",
+                    (None, false) => "discovered",
+                },
+            ));
+            lines.push(field_line(
+                "  Last advert",
+                format_last_seen(c.last_advert_unix),
+            ));
+        }
+        None => lines.push(muted_line("no longer known to the daemon")),
+    }
+
+    lines.push(Line::from(""));
+    lines.push(section_title("Configuration"));
+    if let Some(c) = contact {
+        lines.push(field_line("  Coordinates", format_coords(c.lat, c.lon)));
+        lines.push(field_line(
+            "  Identity",
+            format!(
+                "{} [{}]",
+                strip_flag_emoji(&c.name),
+                c.public_key_prefix_hex
+            ),
+        ));
+        let interval = contact_advert_interval_secs(packets, c)
+            .map(|secs| format_uptime(secs.max(0) as u32))
+            .unwrap_or_else(|| "N/A".to_string());
+        lines.push(field_line("  Advert interval", interval));
+    }
+
+    let status_pending = category_pending(detail, detail.status.is_some(), "status");
+    lines.push(Line::from(""));
+    lines.push(pending_section_title("Status", status_pending));
+    match &detail.status {
+        Some(status) => {
+            lines.push(field_line(
+                "  Battery",
+                format!("{:.2} V", status.battery_mv as f64 / 1000.0),
+            ));
+            lines.push(field_line("  Uptime", format_uptime(status.uptime_secs)));
+            lines.push(field_line(
+                "  Noise/RSSI/SNR",
+                format!(
+                    "{} dBm / {} dBm / {:.1} dB",
+                    status.noise_floor, status.last_rssi, status.last_snr
+                ),
+            ));
+            lines.push(field_line(
+                "  Packets",
+                format!(
+                    "↓{} ↑{} (dup {})",
+                    status.packets_received, status.packets_sent, status.duplicate_packets
+                ),
+            ));
+            lines.push(field_line(
+                "  Airtime",
+                format!(
+                    "TX {}s / RX {}s",
+                    status.airtime_secs, status.rx_airtime_secs
+                ),
+            ));
+            lines.push(field_line(
+                "  Flood/Direct sent",
+                format!("{} / {}", status.flood_sent, status.direct_sent),
+            ));
+        }
+        None if status_pending => lines.push(muted_line("fetching…")),
+        None => lines.push(error_line_for(detail, "status")),
+    }
+
+    let telemetry_pending = category_pending(detail, detail.telemetry.is_some(), "telemetry");
+    lines.push(Line::from(""));
+    lines.push(pending_section_title("Telemetry", telemetry_pending));
+    match &detail.telemetry {
+        Some(telemetry) if telemetry.readings.is_empty() => {
+            lines.push(muted_line("no readings"));
+        }
+        Some(telemetry) => {
+            for reading in &telemetry.readings {
+                lines.push(field_line(
+                    &format!("  {}", reading.label),
+                    format!("{} {}", reading.value, reading.unit)
+                        .trim()
+                        .to_string(),
+                ));
+            }
+        }
+        None if telemetry_pending => lines.push(muted_line("fetching…")),
+        None => lines.push(error_line_for(detail, "telemetry")),
+    }
+
+    let regions_pending = category_pending(detail, detail.regions.is_some(), "regions");
+    lines.push(Line::from(""));
+    lines.push(pending_section_title("Regions", regions_pending));
+    match &detail.regions {
+        Some(regions) if regions.entries.is_empty() => {
+            lines.push(muted_line("no reply"));
+        }
+        Some(regions) => {
+            for entry in &regions.entries {
+                let indent = "  ".repeat(entry.depth as usize + 1);
+                let home = if entry.is_home { " 🏠" } else { "" };
+                let flood = if entry.flood_allowed {
+                    ""
+                } else {
+                    " (flood denied)"
+                };
+                lines.push(Line::from(format!("{indent}{}{home}{flood}", entry.name)));
+            }
+        }
+        None if regions_pending => lines.push(muted_line("fetching…")),
+        None => lines.push(error_line_for(detail, "regions")),
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[Esc] Close",
+        Style::default().fg(MUTED),
+    )));
+
+    let left = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(block(format!("📡 {}", strip_flag_emoji(&view.name))));
+    frame.render_widget(left, columns[0]);
+
+    // --- Right column: Neighbours, a scrollable list ---
+    let neighbours_pending = category_pending(detail, detail.neighbours.is_some(), "neighbours");
+    let neighbour_items: Vec<ListItem> = match &detail.neighbours {
+        Some(neighbours) if neighbours.neighbours.is_empty() => {
+            vec![ListItem::new(muted_line("none heard"))]
+        }
+        Some(neighbours) => neighbours
+            .neighbours
+            .iter()
+            .map(|n| {
+                ListItem::new(field_line(
+                    &format!(" {}", n.public_key_prefix_hex),
+                    format!("{}s ago, SNR {:.1}dB", n.secs_ago, n.snr),
+                ))
+            })
+            .collect(),
+        None if neighbours_pending => vec![ListItem::new(muted_line("fetching…"))],
+        None => vec![ListItem::new(error_line_for(detail, "neighbours"))],
+    };
+    let neighbours_title = pending_title(
+        format!(
+            "Neighbours{}",
+            detail
+                .neighbours
+                .as_ref()
+                .map(|n| format!(" ({})", n.total))
+                .unwrap_or_default()
+        ),
+        neighbours_pending,
+    );
+    let neighbours_list = List::new(neighbour_items)
+        .block(block(neighbours_title))
+        .highlight_style(Style::default().bg(Color::Rgb(0x2a, 0x3a, 0x4a)));
+    frame.render_stateful_widget(neighbours_list, columns[1], neighbours_list_state);
+}
+
+/// Whether `category` hasn't resolved yet: no data (`present == false`) and
+/// no recorded error either — see [`draw_repeater_detail_popup`], where
+/// each of the four categories now resolves independently as its own
+/// `ServerMessage::RepeaterDetailCategory` streams in, rather than all
+/// flipping from pending to resolved together.
+fn category_pending(detail: &RepeaterDetailDto, present: bool, category: &str) -> bool {
+    !present && !detail.errors.iter().any(|e| e.starts_with(category))
+}
+
+/// A section title, prefixed with ⏳ while its data is still being fetched
+/// — see [`draw_repeater_detail_popup`].
+fn pending_section_title(base: &str, pending: bool) -> Line<'static> {
+    section_title(pending_title(base.to_string(), pending))
+}
+
+fn pending_title(base: impl Into<String>, pending: bool) -> String {
+    let base = base.into();
+    if pending {
+        format!("⏳ {base}")
+    } else {
+        base
+    }
+}
+
+fn muted_line(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("  {text}"),
+        Style::default().fg(MUTED),
+    ))
+}
+
+/// The error message for `category` (e.g. `"status"`) from
+/// `detail.errors`, if any — matches the `"{category}: {err}"` format
+/// `daemon::mesh_task::request_repeater_detail` builds.
+fn error_line_for(detail: &RepeaterDetailDto, category: &str) -> Line<'static> {
+    let message = detail
+        .errors
+        .iter()
+        .find(|e| e.starts_with(category))
+        .cloned()
+        .unwrap_or_else(|| format!("{category}: failed"));
+    Line::from(Span::styled(
+        format!("  {message}"),
+        Style::default().fg(RED),
+    ))
+}
+
 /// Content of the F1 help popup: a short header describing the page, plus
 /// its keyboard shortcuts. Kept per-page since Dashboard and Packet log
 /// don't share the same controls.
@@ -1112,8 +1399,14 @@ fn help_content(
                 ("F3", "Packet log page"),
                 ("↑ / ↓", "Select a repeater"),
                 ("r", "Refresh snapshot"),
-                ("m", "Toggle managed repeater"),
+                ("m", "Toggle managed status"),
+                ("k", "Toggle known status"),
+                ("s", "Toggle supervised status"),
                 ("d", "Delete repeater (press twice to confirm)"),
+                (
+                    "Enter",
+                    "Show repeater detail (status/telemetry/neighbours/regions)",
+                ),
                 ("q / Esc", "Quit"),
             ],
         ),
@@ -1232,7 +1525,9 @@ mod render_tests {
             lon: 0.0,
             registered: true,
             managed,
+            repeater_status: managed.then_some(RepeaterStatus::Managed),
             contact_type: 2, // Repeater
+            last_telemetry: None,
         }
     }
 
@@ -1532,6 +1827,26 @@ mod render_tests {
         None
     }
 
+    /// The column where `text` starts in the rendered buffer (scanning
+    /// left-to-right, top-to-bottom), or `None` if it isn't found. Used to
+    /// assert on the relative horizontal ordering of two blocks (e.g. a
+    /// left/right popup split).
+    fn text_col(buffer: &ratatui::buffer::Buffer, text: &str) -> Option<u16> {
+        let chars: Vec<String> = text.chars().map(|c| c.to_string()).collect();
+        for y in 0..buffer.area.height {
+            for x in 0..=buffer.area.width.saturating_sub(chars.len() as u16) {
+                let matches = chars
+                    .iter()
+                    .enumerate()
+                    .all(|(i, ch)| buffer[(x + i as u16, y)].symbol() == ch);
+                if matches {
+                    return Some(x);
+                }
+            }
+        }
+        None
+    }
+
     // --- Event log -------------------------------------------------------
 
     #[test]
@@ -1566,6 +1881,24 @@ mod render_tests {
         assert!(!text
             .chars()
             .any(|c| ('\u{1F1E6}'..='\u{1F1FF}').contains(&c)));
+    }
+
+    #[test]
+    fn event_log_shows_telemetry_received_in_cyan() {
+        let mut app = App::new();
+        app.push_event(MeshEvent {
+            at_unix: 0,
+            kind: MeshEventKind::TelemetryReceived {
+                name: "Repeater A".to_string(),
+                summary: "Voltage: 3.71V".to_string(),
+            },
+        });
+
+        let buffer = render_buffer(&mut app, 140, 20);
+        let text = render(&mut app, 140, 20);
+
+        assert!(text.contains("Telemetry from Repeater A: Voltage: 3.71V"));
+        assert_eq!(fg_of_text(&buffer, "Telemetry from"), Some(CYAN));
     }
 
     // --- Dashboard layout ----------------------------------------------------
@@ -1824,6 +2157,39 @@ mod render_tests {
         let text = render(&mut app, 120, 30);
 
         assert!(text.contains("Repeaters (2)"));
+    }
+
+    #[test]
+    fn draw_repeaters_panel_shows_a_distinct_supervised_badge() {
+        let mut app = App::new();
+        app.snapshot.contacts = vec![ContactDto {
+            repeater_status: Some(RepeaterStatus::Supervised),
+            managed: true,
+            ..contact("aabbccddeeff", false)
+        }];
+
+        let buffer = render_buffer(&mut app, 140, 20);
+        let text = render(&mut app, 140, 20);
+
+        assert!(text.contains("Supervised"));
+        assert!(!text.contains("Managed"));
+        assert_eq!(fg_of_text(&buffer, "Supervised"), Some(MAGENTA));
+    }
+
+    #[test]
+    fn draw_repeaters_panel_shows_known_for_a_configured_known_repeater() {
+        let mut app = App::new();
+        app.snapshot.contacts = vec![ContactDto {
+            repeater_status: Some(RepeaterStatus::Known),
+            managed: false,
+            ..contact("aabbccddeeff", false)
+        }];
+
+        let text = render(&mut app, 140, 20);
+
+        assert!(text.contains("Known"));
+        assert!(!text.contains("Managed"));
+        assert!(!text.contains("Supervised"));
     }
 
     #[test]
@@ -2588,5 +2954,302 @@ mod render_tests {
         assert!(text.contains('·'));
         assert!(!text.contains("×1"));
         assert!(!text.contains("×2"));
+    }
+
+    // --- Repeater detail popup --------------------------------------------
+
+    #[test]
+    fn repeater_detail_popup_hidden_when_none_open() {
+        let mut app = App::new();
+        let text = render(&mut app, 140, 40);
+        assert!(!text.contains("Repeater detail"));
+    }
+
+    #[test]
+    fn repeater_detail_popup_shows_pending_state_immediately() {
+        let mut app = App::new();
+        app.snapshot.contacts = vec![contact("aabbccddeeff", false)];
+        app.open_repeater_detail_pending("aabbccddeeff".to_string(), "Repeater A".to_string());
+
+        let text = render(&mut app, 140, 40);
+
+        assert!(text.contains("Repeater A"));
+        // Contact/Configuration are local, shown immediately.
+        assert!(text.contains("aabbccddeeff"));
+        // Status/Telemetry/Neighbours/Regions are pending until their own
+        // category streams in, each flagged with an hourglass on its
+        // heading. (Two spaces after the hourglass: ratatui pads a wide
+        // emoji's second display cell with a blank, same as every other
+        // emoji heading in this UI.)
+        assert_eq!(text.matches("fetching…").count(), 4);
+        assert!(text.contains("⏳  Status"));
+        assert!(text.contains("⏳  Telemetry"));
+        assert!(text.contains("⏳  Neighbours"));
+        assert!(text.contains("⏳  Regions"));
+    }
+
+    #[test]
+    fn repeater_detail_popup_resolves_sections_independently_as_categories_arrive() {
+        use fez_mesh_controller_core::mesh::{RepeaterDetailCategory, TelemetryDto};
+
+        let mut app = App::new();
+        app.snapshot.contacts = vec![contact("aabbccddeeff", false)];
+        app.open_repeater_detail_pending("aabbccddeeff".to_string(), "Repeater A".to_string());
+
+        // Only Telemetry has arrived so far -- the other three categories
+        // must stay pending rather than waiting for all four together.
+        app.apply_repeater_detail_category(
+            "aabbccddeeff".to_string(),
+            RepeaterDetailCategory::Telemetry(Ok(TelemetryDto {
+                fetched_at_unix: 0,
+                readings: vec![fez_mesh_controller_core::telemetry::TelemetryReading {
+                    channel: 1,
+                    label: "Voltage".to_string(),
+                    value: 3.71,
+                    unit: "V".to_string(),
+                }],
+            })),
+        );
+
+        let text = render(&mut app, 140, 60);
+
+        assert!(text.contains("Voltage"));
+        assert!(text.contains("3.71 V"));
+        assert!(!text.contains("⏳  Telemetry"));
+        assert!(text.contains("⏳  Status"));
+        assert!(text.contains("⏳  Neighbours"));
+        assert!(text.contains("⏳  Regions"));
+        // Still 3 "fetching…" placeholders (status, neighbours, regions) --
+        // Telemetry resolved to real data, not another placeholder.
+        assert_eq!(text.matches("fetching…").count(), 3);
+    }
+
+    #[test]
+    fn repeater_detail_popup_splits_left_contact_info_from_right_neighbours() {
+        use fez_mesh_controller_core::mesh::RepeaterDetailCategory;
+
+        let mut app = App::new();
+        app.snapshot.contacts = vec![contact("aabbccddeeff", false)];
+        app.open_repeater_detail_pending("aabbccddeeff".to_string(), "Repeater A".to_string());
+        app.apply_repeater_detail_category(
+            "aabbccddeeff".to_string(),
+            RepeaterDetailCategory::Neighbours(Ok(fez_mesh_controller_core::mesh::NeighboursDto {
+                fetched_at_unix: 0,
+                total: 1,
+                neighbours: vec![fez_mesh_controller_core::mesh::NeighbourDto {
+                    public_key_prefix_hex: "112233445566".to_string(),
+                    secs_ago: 5,
+                    snr: 1.0,
+                }],
+            })),
+        );
+
+        let buffer = render_buffer(&mut app, 160, 40);
+
+        let contact_col = text_col(&buffer, "Contact").expect("Contact heading");
+        let neighbour_col =
+            text_col(&buffer, "112233445566").expect("neighbour prefix in the right column");
+        assert!(
+            neighbour_col > contact_col,
+            "neighbours list ({neighbour_col}) should be to the right of the contact info ({contact_col})"
+        );
+    }
+
+    #[test]
+    fn repeater_detail_popup_highlights_the_selected_neighbour() {
+        use fez_mesh_controller_core::mesh::RepeaterDetailCategory;
+
+        let mut app = App::new();
+        app.snapshot.contacts = vec![contact("aabbccddeeff", false)];
+        app.open_repeater_detail_pending("aabbccddeeff".to_string(), "Repeater A".to_string());
+        app.apply_repeater_detail_category(
+            "aabbccddeeff".to_string(),
+            RepeaterDetailCategory::Neighbours(Ok(fez_mesh_controller_core::mesh::NeighboursDto {
+                fetched_at_unix: 0,
+                total: 2,
+                neighbours: vec![
+                    fez_mesh_controller_core::mesh::NeighbourDto {
+                        public_key_prefix_hex: "112233445566".to_string(),
+                        secs_ago: 5,
+                        snr: 1.0,
+                    },
+                    fez_mesh_controller_core::mesh::NeighbourDto {
+                        public_key_prefix_hex: "778899aabbcc".to_string(),
+                        secs_ago: 10,
+                        snr: 2.0,
+                    },
+                ],
+            })),
+        );
+        // `apply_repeater_detail_category` selects the first neighbour once
+        // that category's data arrives.
+        app.select_next_neighbour();
+
+        let buffer = render_buffer(&mut app, 160, 40);
+        let (x, y) = {
+            let col = text_col(&buffer, "778899aabbcc").expect("second neighbour row");
+            let row = text_row(&buffer, "778899aabbcc").expect("second neighbour row");
+            (col, row)
+        };
+
+        assert_eq!(
+            buffer[(x, y)].bg,
+            Color::Rgb(0x2a, 0x3a, 0x4a),
+            "the selected (second) neighbour row should be highlighted"
+        );
+    }
+
+    #[test]
+    fn repeater_detail_popup_contact_status_shows_supervised() {
+        let mut app = App::new();
+        app.snapshot.contacts = vec![ContactDto {
+            repeater_status: Some(RepeaterStatus::Supervised),
+            managed: true,
+            ..contact("aabbccddeeff", false)
+        }];
+        app.open_repeater_detail_pending("aabbccddeeff".to_string(), "Repeater A".to_string());
+
+        let text = render(&mut app, 140, 40);
+
+        assert!(text.contains("supervised"));
+        assert!(!text.contains("managed"));
+    }
+
+    #[test]
+    fn repeater_detail_popup_shows_resolved_data_across_all_sections() {
+        use fez_mesh_controller_core::mesh::{
+            RegionHierarchyDto, RegionHierarchyEntryDto, RepeaterDetailCategory, TelemetryDto,
+        };
+
+        let mut app = App::new();
+        app.snapshot.contacts = vec![contact("aabbccddeeff", true)];
+        app.open_repeater_detail_pending("aabbccddeeff".to_string(), "Repeater A".to_string());
+        let prefix = "aabbccddeeff".to_string();
+        app.apply_repeater_detail_category(
+            prefix.clone(),
+            RepeaterDetailCategory::Status(Ok(fez_mesh_controller_core::mesh::StatusDto {
+                fetched_at_unix: 0,
+                battery_mv: 4012,
+                tx_queue_len: 0,
+                noise_floor: -110,
+                last_rssi: -80,
+                last_snr: 6.5,
+                packets_received: 100,
+                packets_sent: 50,
+                duplicate_packets: 1,
+                airtime_secs: 12,
+                rx_airtime_secs: 8,
+                uptime_secs: 3600,
+                flood_sent: 10,
+                direct_sent: 5,
+            })),
+        );
+        app.apply_repeater_detail_category(
+            prefix.clone(),
+            RepeaterDetailCategory::Telemetry(Ok(TelemetryDto {
+                fetched_at_unix: 0,
+                readings: vec![fez_mesh_controller_core::telemetry::TelemetryReading {
+                    channel: 1,
+                    label: "Voltage".to_string(),
+                    value: 3.71,
+                    unit: "V".to_string(),
+                }],
+            })),
+        );
+        app.apply_repeater_detail_category(
+            prefix.clone(),
+            RepeaterDetailCategory::Neighbours(Ok(fez_mesh_controller_core::mesh::NeighboursDto {
+                fetched_at_unix: 0,
+                total: 1,
+                neighbours: vec![fez_mesh_controller_core::mesh::NeighbourDto {
+                    public_key_prefix_hex: "112233445566".to_string(),
+                    secs_ago: 42,
+                    snr: 7.25,
+                }],
+            })),
+        );
+        app.apply_repeater_detail_category(
+            prefix,
+            RepeaterDetailCategory::Regions(Ok(RegionHierarchyDto {
+                fetched_at_unix: 0,
+                entries: vec![
+                    RegionHierarchyEntryDto {
+                        name: "World".to_string(),
+                        depth: 0,
+                        is_home: false,
+                        flood_allowed: true,
+                    },
+                    RegionHierarchyEntryDto {
+                        name: "France".to_string(),
+                        depth: 1,
+                        is_home: true,
+                        flood_allowed: false,
+                    },
+                ],
+                raw_text: "World F\n France^".to_string(),
+            })),
+        );
+
+        let text = render(&mut app, 140, 60);
+
+        assert!(text.contains("4.01 V")); // battery_mv -> V
+        assert!(text.contains("Voltage"));
+        assert!(text.contains("3.71 V"));
+        assert!(text.contains("112233445566"));
+        assert!(text.contains("World"));
+        assert!(text.contains("France"));
+        assert!(text.contains("🏠"));
+        assert!(text.contains("flood denied"));
+        assert!(!text.contains("fetching…"));
+    }
+
+    #[test]
+    fn repeater_detail_popup_shows_errors_for_failed_categories() {
+        use fez_mesh_controller_core::mesh::{RepeaterDetailCategory, TelemetryDto};
+
+        let mut app = App::new();
+        app.snapshot.contacts = vec![contact("aabbccddeeff", false)];
+        app.open_repeater_detail_pending("aabbccddeeff".to_string(), "Repeater A".to_string());
+        let prefix = "aabbccddeeff".to_string();
+        app.apply_repeater_detail_category(
+            prefix.clone(),
+            RepeaterDetailCategory::Status(Err("timed out".to_string())),
+        );
+        app.apply_repeater_detail_category(
+            prefix.clone(),
+            RepeaterDetailCategory::Telemetry(Ok(TelemetryDto {
+                fetched_at_unix: 0,
+                readings: vec![],
+            })),
+        );
+        app.apply_repeater_detail_category(
+            prefix.clone(),
+            RepeaterDetailCategory::Neighbours(Err("timed out".to_string())),
+        );
+        app.apply_repeater_detail_category(
+            prefix,
+            RepeaterDetailCategory::Regions(Err(
+                "no reply from aabbccddeeff (wrong login role, or genuinely no response)"
+                    .to_string(),
+            )),
+        );
+
+        let text = render(&mut app, 140, 60);
+
+        assert!(text.contains("status: timed out"));
+        assert!(text.contains("neighbours: timed out"));
+        assert!(text.contains("no reply from aabbccddeeff"));
+        assert!(text.contains("no readings"));
+    }
+
+    #[test]
+    fn repeater_detail_popup_only_shows_on_the_dashboard_page() {
+        let mut app = App::new();
+        app.page = Page::PacketLog;
+        app.open_repeater_detail_pending("aabbccddeeff".to_string(), "Repeater A".to_string());
+
+        let text = render(&mut app, 140, 40);
+
+        assert!(!text.contains("Repeater detail"));
     }
 }

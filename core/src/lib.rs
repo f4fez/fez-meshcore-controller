@@ -28,9 +28,10 @@ pub mod mesh;
 pub mod meshcore_crypto;
 pub mod mqtt_jwt;
 pub mod region;
+pub mod telemetry;
 
 pub use config::{
     Config, ConnectionConfig, DaemonConfig, ManagedRepeater, MqttAuthMethod, MqttBrokerConfig,
-    MqttTransportProtocol, RegionConfig,
+    MqttTransportProtocol, RegionConfig, RepeaterStatus,
 };
 pub use error::{Error, Result};

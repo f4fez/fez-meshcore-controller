@@ -64,17 +64,43 @@ packet_log_capacity = 500
 # defaults to <state dir>/fez-mesh-controller/repeaters.sqlite3 if omitted.
 db_path = "/home/user/.local/state/fez-mesh-controller/repeaters.sqlite3"
 
+# When true, the daemon actively locks this node down to an observer-only
+# state on every (re)connect: disables the node's own contact auto-add,
+# removes every channel (Public and private/hashtag), and prunes any
+# contact that isn't listed under managed_repeaters below. Prompted by the
+# setup wizard's Connection section. Optional, defaults to true if omitted.
+observer_node_managed_config = true
+
 # --- Managed repeaters -----------------------------------------------------
 #
-# Repeaters this application actively manages: shown as "🛰️ Managed" in the
-# TUI's contact list and automatically (re-)declared as companion contacts
-# on every (re)connect, using the full public key below. Add entries here,
-# or manage them interactively from the TUI's contact list (press `m` on a
-# selected contact).
+# Repeaters this application tracks, each with a configured tier -- both are
+# automatically (re-)declared as companion contacts on every (re)connect
+# (using the full public key below) and protected from observer-node
+# pruning; only the TUI badge/behavior differs:
+#
+#   "managed"    -- full current behavior, shown as "🛰️  Managed". Default
+#                   when the key is omitted.
+#   "known"      -- registered/protected like "managed", but shown as
+#                   "📟 Known" (the deliberate, config-driven version of a
+#                   companion contact that just isn't actively managed).
+#   "supervised" -- reserved for future telemetry-based health monitoring;
+#                   behaves exactly like "managed" today, shown as
+#                   "🛡️  Supervised" so it's visually distinguishable ahead
+#                   of that feature.
+#
+# Add entries here, or set them interactively from the TUI's contact list:
+# `m` (managed), `k` (known), `s` (supervised) toggle the selected repeater's
+# tier -- pressing the key matching its current tier removes it instead.
 
 # [[managed_repeaters]]
 # name = "F4FEZ Repeater"
 # public_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd"
+# managed = "managed"
+#
+# Admin or guest password for this repeater. Optional -- only needed for
+# requests the repeater requires a login for (e.g. fetching its telemetry);
+# stored in plaintext, like every other secret in this file.
+# password = "hunter2"
 
 # --- Region hierarchy (cluster) --------------------------------------------
 #
@@ -166,6 +192,7 @@ db_path = "/home/user/.local/state/fez-mesh-controller/repeaters.sqlite3"
 # port = 443
 # auth_method = "device"
 # jwt_ttl_secs = 3600       # refreshed 6 minutes before expiry
+# jwt_audience = "mqtt-us-v1.letsmesh.net" # "aud" claim; defaults to host above if omitted
 # transport_protocol = "websocket"
 # websocket_path = "/ws"
 # tls_enabled = true

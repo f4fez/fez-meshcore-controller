@@ -28,7 +28,7 @@ use crossterm::terminal::{
 use crossterm::{execute, ExecutableCommand};
 use fez_mesh_controller_core::ipc::{ClientMessage, ServerMessage};
 use fez_mesh_controller_core::mesh::MeshEventKind;
-use fez_mesh_controller_core::Config;
+use fez_mesh_controller_core::{Config, RepeaterStatus};
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -108,6 +108,9 @@ async fn run_loop(
                             KeyCode::Esc if app.packet_detail.is_some() => {
                                 app.close_packet_detail();
                             }
+                            KeyCode::Esc if app.repeater_detail.is_some() => {
+                                app.close_repeater_detail();
+                            }
                             KeyCode::Esc => app.should_quit = true,
                             _ if app.help_open => {}
                             _ => match app.page {
@@ -116,13 +119,39 @@ async fn run_loop(
                                         app.last_status = None;
                                         let _ = cmd_tx.send(ClientMessage::RequestSnapshot).await;
                                     }
+                                    // While the repeater detail popup is
+                                    // open, arrow keys scroll its
+                                    // neighbours list instead of the
+                                    // contact table underneath it.
+                                    KeyCode::Down if app.repeater_detail.is_some() => {
+                                        app.select_next_neighbour();
+                                    }
+                                    KeyCode::Up if app.repeater_detail.is_some() => {
+                                        app.select_prev_neighbour();
+                                    }
                                     KeyCode::Down => app.select_next_contact(),
                                     KeyCode::Up => app.select_prev_contact(),
                                     KeyCode::Char('m') => {
-                                        toggle_managed(app, cmd_tx).await;
+                                        set_repeater_status(app, cmd_tx, RepeaterStatus::Managed)
+                                            .await;
+                                    }
+                                    KeyCode::Char('k') => {
+                                        set_repeater_status(app, cmd_tx, RepeaterStatus::Known)
+                                            .await;
+                                    }
+                                    KeyCode::Char('s') => {
+                                        set_repeater_status(
+                                            app,
+                                            cmd_tx,
+                                            RepeaterStatus::Supervised,
+                                        )
+                                        .await;
                                     }
                                     KeyCode::Char('d') => {
                                         confirm_or_arm_delete(app, cmd_tx).await;
+                                    }
+                                    KeyCode::Enter => {
+                                        request_repeater_detail(app, cmd_tx).await;
                                     }
                                     _ => {}
                                 },
@@ -160,31 +189,49 @@ async fn run_loop(
     }
 }
 
-/// Handles an `m` key press: asks the daemon to add or remove the selected
-/// contact from the managed-repeater list. If it isn't already registered
-/// in the companion, the daemon registers it first — a managed repeater is
-/// always registered — using the full public key resolved from RF log
-/// data; this can fail if the repeater hasn't been heard yet.
-async fn toggle_managed(app: &mut App, cmd_tx: &mpsc::Sender<ClientMessage>) {
-    let Some((prefix, name, managed)) = app
-        .selected_contact()
-        .map(|c| (c.public_key_prefix_hex.clone(), c.name.clone(), !c.managed))
-    else {
+/// Handles an `m`/`k`/`s` key press: asks the daemon to set the selected
+/// contact's status to `target` (Managed/Known/Supervised respectively). If
+/// the contact is already at `target`, this clears it instead (removed from
+/// `managed_repeaters` entirely) -- so each key is its own independent
+/// toggle, and e.g. pressing `k` on a `Managed` repeater switches it to
+/// `Known` rather than doing nothing. If it isn't already registered in the
+/// companion, the daemon registers it first — every tier requires
+/// registration — using the full public key resolved from RF log data; this
+/// can fail if the repeater hasn't been heard yet.
+async fn set_repeater_status(
+    app: &mut App,
+    cmd_tx: &mpsc::Sender<ClientMessage>,
+    target: RepeaterStatus,
+) {
+    let Some((prefix, name, current)) = app.selected_contact().map(|c| {
+        (
+            c.public_key_prefix_hex.clone(),
+            c.name.clone(),
+            c.repeater_status,
+        )
+    }) else {
         app.last_status = Some("No repeater selected".to_string());
         return;
     };
 
-    app.last_status = Some(if managed {
-        format!("🛰️  Marking {name} as managed…")
+    let status = if current == Some(target) {
+        None
     } else {
-        format!("🛰️  Unmarking {name}…")
+        Some(target)
+    };
+
+    app.last_status = Some(match status {
+        Some(RepeaterStatus::Managed) => format!("🛰️  Marking {name} as managed…"),
+        Some(RepeaterStatus::Known) => format!("📟 Marking {name} as known…"),
+        Some(RepeaterStatus::Supervised) => format!("🛡️  Marking {name} as supervised…"),
+        None => format!("Unmarking {name}…"),
     });
 
     let _ = cmd_tx
-        .send(ClientMessage::SetManagedRepeater {
+        .send(ClientMessage::SetRepeaterStatus {
             public_key_prefix_hex: prefix,
             name,
-            managed,
+            status,
         })
         .await;
 }
@@ -215,6 +262,32 @@ async fn confirm_or_arm_delete(app: &mut App, cmd_tx: &mpsc::Sender<ClientMessag
     }
 }
 
+/// Handles an Enter key press: opens the repeater detail popup immediately
+/// (Contact/Configuration info is local, no fetch needed) and asks the
+/// daemon to fetch status+telemetry+neighbours+regions together. Four real
+/// mesh round trips, so this can take a while — each category's result (or
+/// failure) streams back independently as a
+/// `ServerMessage::RepeaterDetailCategory`/`Error`, handled in
+/// [`apply_ui_event`], letting the popup fill in progressively instead of
+/// all at once.
+async fn request_repeater_detail(app: &mut App, cmd_tx: &mpsc::Sender<ClientMessage>) {
+    let Some((prefix, name)) = app
+        .selected_contact()
+        .map(|c| (c.public_key_prefix_hex.clone(), c.name.clone()))
+    else {
+        app.last_status = Some("No repeater selected".to_string());
+        return;
+    };
+
+    app.last_status = None;
+    app.open_repeater_detail_pending(prefix.clone(), name);
+    let _ = cmd_tx
+        .send(ClientMessage::RequestRepeaterDetail {
+            public_key_prefix_hex: prefix,
+        })
+        .await;
+}
+
 async fn apply_ui_event(app: &mut App, event: UiEvent, cmd_tx: &mpsc::Sender<ClientMessage>) {
     match event {
         UiEvent::DaemonConnected => app.daemon_connected = true,
@@ -236,6 +309,8 @@ async fn apply_ui_event(app: &mut App, event: UiEvent, cmd_tx: &mpsc::Sender<Cli
                     MeshEventKind::Connected
                         | MeshEventKind::ContactRemoved { .. }
                         | MeshEventKind::NewContact { .. }
+                        | MeshEventKind::ConfigReloaded { .. }
+                        | MeshEventKind::TelemetryReceived { .. }
                 );
                 app.push_event(event);
                 if needs_fresh_snapshot {
@@ -245,6 +320,17 @@ async fn apply_ui_event(app: &mut App, event: UiEvent, cmd_tx: &mpsc::Sender<Cli
             ServerMessage::PacketLog(backlog) => app.set_packet_log(backlog),
             ServerMessage::PacketLogEntry(entry) => app.push_packet(*entry),
             ServerMessage::Error(message) => app.last_status = Some(message),
+            // The TUI never sends `RequestTelemetry` itself (only the
+            // CLI's separate `repeater telemetry` subcommand does, over
+            // its own one-off connection) — kept only because
+            // `ServerMessage` is matched exhaustively.
+            ServerMessage::TelemetryResult { .. } => {}
+            ServerMessage::RepeaterDetailCategory {
+                public_key_prefix_hex,
+                category,
+            } => {
+                app.apply_repeater_detail_category(public_key_prefix_hex, category);
+            }
             ServerMessage::Hello { .. } => {}
         },
     }

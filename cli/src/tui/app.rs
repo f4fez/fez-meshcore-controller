@@ -16,10 +16,25 @@ use std::collections::VecDeque;
 
 use fez_mesh_controller_core::channel;
 use fez_mesh_controller_core::ipc::{MeshEvent, Snapshot};
-use fez_mesh_controller_core::mesh::{is_repeater_or_room, ContactDto, PacketLogEntry};
+use fez_mesh_controller_core::mesh::{
+    is_repeater_or_room, ContactDto, PacketLogEntry, RepeaterDetailCategory, RepeaterDetailDto,
+};
 use fez_mesh_controller_core::region;
+use ratatui::widgets::ListState;
 
 use super::packet_group::{group_packets, PacketGroup};
+
+/// The repeater detail popup's content — see [`App::repeater_detail`].
+pub struct RepeaterDetailView {
+    pub public_key_prefix_hex: String,
+    pub name: String,
+    /// Starts as `RepeaterDetailDto::default()` (every category `None`,
+    /// pending) and is filled in progressively, one category at a time, by
+    /// [`App::apply_repeater_detail_category`] as each
+    /// `ServerMessage::RepeaterDetailCategory` arrives — rather than
+    /// waiting for all four before showing anything.
+    pub detail: RepeaterDetailDto,
+}
 
 pub const MAX_EVENTS: usize = 200;
 /// Client-side cap on the packet log buffer, kept generous compared to the
@@ -67,6 +82,17 @@ pub struct App {
     /// current page.
     pub help_open: bool,
 
+    /// The repeater detail popup's content: contact/configuration info is
+    /// always available locally, so the popup opens immediately on an Enter
+    /// key press (`detail` starting fully pending); each category then
+    /// fills in independently as its
+    /// `ServerMessage::RepeaterDetailCategory` arrives for the matching
+    /// prefix. `None` (the outer `Option`) when the popup is closed.
+    pub repeater_detail: Option<RepeaterDetailView>,
+    /// Scroll/selection state for the repeater detail popup's neighbours
+    /// list (the right-hand column) — reset whenever the popup is (re)opened.
+    pub neighbours_list_state: ListState,
+
     /// Each configured region's precomputed transport key (name, key),
     /// derived once whenever a fresh `Snapshot` arrives (see
     /// [`Self::apply_snapshot`]) rather than per packet — see
@@ -96,6 +122,8 @@ impl App {
             locked_view: None,
             packet_detail: None,
             help_open: false,
+            repeater_detail: None,
+            neighbours_list_state: ListState::default(),
             region_keys: Vec::new(),
             channel_keys: channel::precompute_channel_keys(&[]),
         }
@@ -257,5 +285,205 @@ impl App {
 
     pub fn close_packet_detail(&mut self) {
         self.packet_detail = None;
+    }
+
+    /// Opens the repeater detail popup for an Enter-key request,
+    /// immediately (before any category's fetch has resolved) so the popup
+    /// can show local Contact/Configuration info right away, with every
+    /// fetched section pending.
+    pub fn open_repeater_detail_pending(&mut self, public_key_prefix_hex: String, name: String) {
+        self.repeater_detail = Some(RepeaterDetailView {
+            public_key_prefix_hex,
+            name,
+            detail: RepeaterDetailDto::default(),
+        });
+        self.neighbours_list_state = ListState::default();
+    }
+
+    /// Folds one streamed category update into the popup's accumulated
+    /// data, but only if it's still showing the contact this update is for
+    /// — discards a stale update for a request the user has since replaced
+    /// (opened the popup on a different contact) or closed.
+    pub fn apply_repeater_detail_category(
+        &mut self,
+        public_key_prefix_hex: String,
+        category: RepeaterDetailCategory,
+    ) {
+        let Some(view) = &mut self.repeater_detail else {
+            return;
+        };
+        if view.public_key_prefix_hex != public_key_prefix_hex {
+            return;
+        }
+        view.detail.apply_category(category);
+        let has_neighbours = view
+            .detail
+            .neighbours
+            .as_ref()
+            .map(|n| !n.neighbours.is_empty())
+            .unwrap_or(false);
+        if has_neighbours {
+            self.neighbours_list_state.select(Some(0));
+        }
+    }
+
+    pub fn close_repeater_detail(&mut self) {
+        self.repeater_detail = None;
+    }
+
+    /// Number of neighbours currently shown in the repeater detail popup's
+    /// scrollable list, if the fetch has resolved with any.
+    fn neighbour_count(&self) -> usize {
+        self.repeater_detail
+            .as_ref()
+            .and_then(|v| v.detail.neighbours.as_ref())
+            .map(|n| n.neighbours.len())
+            .unwrap_or(0)
+    }
+
+    /// Scrolls the repeater detail popup's neighbours list down one row.
+    pub fn select_next_neighbour(&mut self) {
+        let len = self.neighbour_count();
+        if len == 0 {
+            return;
+        }
+        let next = match self.neighbours_list_state.selected() {
+            Some(i) if i + 1 < len => i + 1,
+            Some(_) => 0,
+            None => 0,
+        };
+        self.neighbours_list_state.select(Some(next));
+    }
+
+    /// Scrolls the repeater detail popup's neighbours list up one row.
+    pub fn select_prev_neighbour(&mut self) {
+        let len = self.neighbour_count();
+        if len == 0 {
+            return;
+        }
+        let prev = match self.neighbours_list_state.selected() {
+            Some(0) | None => len - 1,
+            Some(i) => i - 1,
+        };
+        self.neighbours_list_state.select(Some(prev));
+    }
+}
+
+/// Estimated interval (seconds) between this contact's two most recent
+/// advertisements, from `packets` (newest-first) — not a protocol field
+/// (no node reports its own advert interval), just the delta between the
+/// two most recent `Advertisement`-payload packets attributable to this
+/// contact. `None` if fewer than two are cached.
+pub fn contact_advert_interval_secs(
+    packets: &[PacketLogEntry],
+    contact: &ContactDto,
+) -> Option<i64> {
+    let prefix = contact.public_key_prefix_hex.to_ascii_lowercase();
+    let mut adverts = packets.iter().filter_map(|entry| {
+        let adv = entry.header.as_ref()?.advertisement.as_ref()?;
+        adv.public_key_hex
+            .to_ascii_lowercase()
+            .starts_with(&prefix)
+            .then_some(entry.at_unix)
+    });
+    let newest = adverts.next()?;
+    let second = adverts.next()?;
+    Some(newest - second)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fez_mesh_controller_core::mesh::{PacketAdvertInfo, PacketHeaderInfo};
+
+    fn contact(public_key_prefix_hex: &str) -> ContactDto {
+        ContactDto {
+            name: "Node".to_string(),
+            public_key_prefix_hex: public_key_prefix_hex.to_string(),
+            last_advert_unix: 0,
+            lat: 0.0,
+            lon: 0.0,
+            registered: true,
+            managed: false,
+            repeater_status: None,
+            contact_type: 2,
+            last_telemetry: None,
+        }
+    }
+
+    fn header() -> PacketHeaderInfo {
+        PacketHeaderInfo {
+            route_type: "TransportFlood".to_string(),
+            route_type_raw: 0,
+            payload_type: "TextMsg".to_string(),
+            payload_type_raw: 2,
+            payload_version: 0,
+            hops: 1,
+            path_hash_size: 1,
+            path_hex: String::new(),
+            transport_code_hex: None,
+            dest_hash_hex: None,
+            src_hash_hex: None,
+            channel_hash_hex: None,
+            anon_req_sender_public_key_hex: None,
+            control: None,
+            advertisement: None,
+        }
+    }
+
+    fn entry(id: u64, at_unix: i64, header: Option<PacketHeaderInfo>) -> PacketLogEntry {
+        PacketLogEntry {
+            id,
+            at_unix,
+            snr: 1.0,
+            rssi: -90,
+            header,
+            payload_hex: "deadbeef".to_string(),
+            payload_len: 4,
+        }
+    }
+
+    // --- contact_advert_interval_secs --------------------------------------
+
+    fn advert_entry(id: u64, at_unix: i64, public_key_hex: &str) -> PacketLogEntry {
+        let mut h = header();
+        h.payload_type = "Advert".to_string();
+        h.advertisement = Some(PacketAdvertInfo {
+            public_key_hex: public_key_hex.to_string(),
+            name: Some("Node".to_string()),
+            adv_type_name: "Repeater".to_string(),
+            lat: None,
+            lon: None,
+        });
+        entry(id, at_unix, Some(h))
+    }
+
+    #[test]
+    fn contact_advert_interval_secs_none_with_fewer_than_two_adverts() {
+        let c = contact("aabbccddeeff");
+        let packets = vec![advert_entry(1, 100, "aabbccddeeff")];
+        assert_eq!(contact_advert_interval_secs(&packets, &c), None);
+    }
+
+    #[test]
+    fn contact_advert_interval_secs_computes_delta_between_two_most_recent() {
+        let c = contact("aabbccddeeff");
+        // Newest-first, as stored by the app.
+        let packets = vec![
+            advert_entry(3, 300, "aabbccddeeff"),
+            advert_entry(2, 200, "aabbccddeeff"),
+            advert_entry(1, 100, "aabbccddeeff"),
+        ];
+        assert_eq!(contact_advert_interval_secs(&packets, &c), Some(100));
+    }
+
+    #[test]
+    fn contact_advert_interval_secs_ignores_other_contacts_adverts() {
+        let c = contact("aabbccddeeff");
+        let packets = vec![
+            advert_entry(2, 200, "ffeeddccbbaa"),
+            advert_entry(1, 100, "ffeeddccbbaa"),
+        ];
+        assert_eq!(contact_advert_interval_secs(&packets, &c), None);
     }
 }

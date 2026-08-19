@@ -20,7 +20,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use fez_mesh_controller_core::ipc::{MeshEvent, MqttBrokerStatus, Snapshot};
-use fez_mesh_controller_core::mesh::{DeviceInfoDto, DiscoveredNode, NodeStatsDto, PacketLogEntry};
+use fez_mesh_controller_core::mesh::{
+    DeviceInfoDto, DiscoveredNode, NodeStatsDto, PacketLogEntry, TelemetryDto,
+};
 use fez_mesh_controller_core::Config;
 use meshcore_rs::MeshCoreEvent;
 use tokio::sync::{broadcast, mpsc, RwLock};
@@ -67,6 +69,11 @@ pub struct AppState {
     /// updated by that broker's own worker task, read by
     /// [`crate::server::run`] to populate [`Snapshot::mqtt_brokers`].
     pub mqtt_broker_status: RwLock<HashMap<String, MqttBrokerStatus>>,
+    /// Running broker worker tasks (see `crate::mqtt::spawn`), keyed the
+    /// same way as [`Self::mqtt_broker_status`] — lets a config reload
+    /// (`crate::reload`) abort a removed/changed broker's task and spawn
+    /// its replacement.
+    pub mqtt_broker_tasks: tokio::sync::Mutex<HashMap<String, tokio::task::AbortHandle>>,
     /// The connected device's model/firmware info, queried once per
     /// connection (see `crate::mesh_task::run`) — consumed by
     /// `crate::mqtt`'s status message, not exposed over IPC.
@@ -76,6 +83,11 @@ pub struct AppState {
     /// by `crate::mqtt`'s status message and exposed over IPC via
     /// [`Snapshot::node_stats`].
     pub node_stats: RwLock<Option<NodeStatsDto>>,
+    /// Last telemetry fetched on demand from each contact (see
+    /// `DaemonCommand::RequestTelemetry`), keyed by public key prefix
+    /// (hex) — read back into `ContactDto::last_telemetry` by
+    /// `crate::mesh_task::build_snapshot_contacts`.
+    pub telemetry: RwLock<HashMap<String, TelemetryDto>>,
 }
 
 impl AppState {
@@ -109,8 +121,10 @@ impl AppState {
             next_packet_id: AtomicU64::new(1),
             raw_events_tx,
             mqtt_broker_status: RwLock::new(HashMap::new()),
+            mqtt_broker_tasks: tokio::sync::Mutex::new(HashMap::new()),
             device_info: RwLock::new(None),
             node_stats: RwLock::new(None),
+            telemetry: RwLock::new(HashMap::new()),
         })
     }
 
@@ -138,6 +152,15 @@ impl AppState {
             .write()
             .await
             .insert(name.to_string(), status);
+    }
+
+    /// Records a contact's last-fetched telemetry, read back into
+    /// `ContactDto::last_telemetry` by `crate::mesh_task::build_snapshot_contacts`.
+    pub async fn set_telemetry(&self, public_key_prefix_hex: &str, telemetry: TelemetryDto) {
+        self.telemetry
+            .write()
+            .await
+            .insert(public_key_prefix_hex.to_string(), telemetry);
     }
 
     /// Records the connected device's model/firmware info, read back by
@@ -414,6 +437,45 @@ mod tests {
         assert_eq!(
             state.mqtt_broker_status.read().await["Home Assistant"],
             MqttBrokerStatus::Connected
+        );
+    }
+
+    #[tokio::test]
+    async fn set_telemetry_updates_and_overwrites() {
+        let state = make_state(500).await;
+        let reading = |value: f64| fez_mesh_controller_core::telemetry::TelemetryReading {
+            channel: 1,
+            label: "Voltage".to_string(),
+            value,
+            unit: "V".to_string(),
+        };
+
+        state
+            .set_telemetry(
+                "aabbccddeeff",
+                TelemetryDto {
+                    fetched_at_unix: 1,
+                    readings: vec![reading(3.7)],
+                },
+            )
+            .await;
+        assert_eq!(
+            state.telemetry.read().await["aabbccddeeff"].readings[0].value,
+            3.7
+        );
+
+        state
+            .set_telemetry(
+                "aabbccddeeff",
+                TelemetryDto {
+                    fetched_at_unix: 2,
+                    readings: vec![reading(3.6)],
+                },
+            )
+            .await;
+        assert_eq!(
+            state.telemetry.read().await["aabbccddeeff"].readings[0].value,
+            3.6
         );
     }
 

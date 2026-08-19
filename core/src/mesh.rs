@@ -15,12 +15,15 @@
 //! High-level wrapper around `meshcore-rs` and serializable data transfer
 //! objects (DTOs) shared between the daemon and the CLI via the IPC protocol.
 
-use meshcore_rs::events::{Contact, SelfInfo};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use meshcore_rs::events::{Contact, Neighbour, NeighboursData, SelfInfo, StatusData};
 use meshcore_rs::parsing::hex_decode;
 use meshcore_rs::{EventPayload, EventType, MeshCore, MeshCoreEvent, PayloadType};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{ConnectionConfig, ManagedRepeater};
+use crate::config::{ConnectionConfig, ManagedRepeater, RepeaterStatus};
 use crate::error::{Error, Result};
 
 /// Encodes a byte slice as a lowercase hexadecimal string.
@@ -170,6 +173,212 @@ pub struct NodeStatsDto {
     pub packets: Option<PacketStatsDto>,
 }
 
+/// A telemetry read from a remote node — see [`MeshClient::request_telemetry`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TelemetryDto {
+    pub fetched_at_unix: i64,
+    pub readings: Vec<crate::telemetry::TelemetryReading>,
+}
+
+/// A remote node's live status (battery, radio, packet counters) fetched
+/// on demand over the mesh — see [`MeshClient::request_status`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StatusDto {
+    pub fetched_at_unix: i64,
+    pub battery_mv: u16,
+    pub tx_queue_len: u16,
+    pub noise_floor: i16,
+    pub last_rssi: i16,
+    pub last_snr: f32,
+    pub packets_received: u32,
+    pub packets_sent: u32,
+    pub duplicate_packets: u32,
+    pub airtime_secs: u32,
+    pub rx_airtime_secs: u32,
+    pub uptime_secs: u32,
+    pub flood_sent: u32,
+    pub direct_sent: u32,
+}
+
+/// A single mesh neighbour reported by a remote node — see
+/// [`NeighboursDto`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NeighbourDto {
+    pub public_key_prefix_hex: String,
+    pub secs_ago: i32,
+    pub snr: f32,
+}
+
+/// A remote node's list of mesh neighbours (nodes it has directly heard),
+/// fetched on demand over the mesh — see [`MeshClient::request_neighbours`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NeighboursDto {
+    pub fetched_at_unix: i64,
+    pub total: u16,
+    pub neighbours: Vec<NeighbourDto>,
+}
+
+/// A single entry in a remote node's configured region hierarchy — see
+/// [`RegionHierarchyDto`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegionHierarchyEntryDto {
+    pub name: String,
+    /// Nesting depth in the hierarchy (0 = top-level).
+    pub depth: u8,
+    /// Whether this is the node's configured "home" region.
+    pub is_home: bool,
+    pub flood_allowed: bool,
+}
+
+/// A remote node's own configured region hierarchy, fetched on demand —
+/// see [`MeshClient::request_region_hierarchy`]. Distinct from this
+/// project's own `regions` config (`Config::regions`): this is what's
+/// actually configured on the physical node's firmware.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegionHierarchyDto {
+    pub fetched_at_unix: i64,
+    pub entries: Vec<RegionHierarchyEntryDto>,
+    /// The raw reply text, kept alongside the parsed entries -- the
+    /// firmware's reply buffer is a fixed ~160 characters, so a large
+    /// hierarchy can truncate mid-line; surfacing the raw text makes that
+    /// visible instead of silently swallowed by parsing.
+    pub raw_text: String,
+}
+
+/// Result of fetching a repeater's status/telemetry/neighbours/region
+/// hierarchy together in one combined command (one login, then all four
+/// requests sequentially — see `daemon::mesh_task::request_repeater_detail`).
+/// Best-effort per category, like [`NodeStatsDto`]: `errors` explains any
+/// category that came back `None`, in the order attempted (status,
+/// telemetry, neighbours, regions). This is the CLI-side *accumulator* that
+/// [`RepeaterDetailCategory`] updates get folded into via
+/// [`RepeaterDetailDto::apply_category`] as they stream in — it's no
+/// longer sent over IPC as one complete value (see
+/// `ServerMessage::RepeaterDetailCategory`).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct RepeaterDetailDto {
+    pub status: Option<StatusDto>,
+    pub telemetry: Option<TelemetryDto>,
+    pub neighbours: Option<NeighboursDto>,
+    pub regions: Option<RegionHierarchyDto>,
+    pub errors: Vec<String>,
+}
+
+impl RepeaterDetailDto {
+    /// Folds one streamed [`RepeaterDetailCategory`] update into this
+    /// accumulator: a success fills in the matching field, a failure is
+    /// recorded as `"{category}: {err}"` in `errors` — the exact format
+    /// `error_line_for` (`cli/src/tui/ui.rs`) matches against by prefix, so
+    /// keep both in sync if this changes.
+    pub fn apply_category(&mut self, category: RepeaterDetailCategory) {
+        match category {
+            RepeaterDetailCategory::Status(Ok(status)) => self.status = Some(status),
+            RepeaterDetailCategory::Status(Err(err)) => self.errors.push(format!("status: {err}")),
+            RepeaterDetailCategory::Telemetry(Ok(telemetry)) => self.telemetry = Some(telemetry),
+            RepeaterDetailCategory::Telemetry(Err(err)) => {
+                self.errors.push(format!("telemetry: {err}"))
+            }
+            RepeaterDetailCategory::Neighbours(Ok(neighbours)) => {
+                self.neighbours = Some(neighbours)
+            }
+            RepeaterDetailCategory::Neighbours(Err(err)) => {
+                self.errors.push(format!("neighbours: {err}"))
+            }
+            RepeaterDetailCategory::Regions(Ok(regions)) => self.regions = Some(regions),
+            RepeaterDetailCategory::Regions(Err(err)) => {
+                self.errors.push(format!("regions: {err}"))
+            }
+        }
+    }
+}
+
+/// One category of a [`RepeaterDetailDto`] fetch's outcome, streamed to the
+/// IPC client as soon as it's available rather than batched into one final
+/// message — see `daemon::mesh_task::request_repeater_detail` and
+/// `ServerMessage::RepeaterDetailCategory`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RepeaterDetailCategory {
+    Status(std::result::Result<StatusDto, String>),
+    Telemetry(std::result::Result<TelemetryDto, String>),
+    Neighbours(std::result::Result<NeighboursDto, String>),
+    Regions(std::result::Result<RegionHierarchyDto, String>),
+}
+
+fn status_dto_from(status: StatusData, fetched_at_unix: i64) -> StatusDto {
+    StatusDto {
+        fetched_at_unix,
+        battery_mv: status.battery_mv,
+        tx_queue_len: status.tx_queue_len,
+        noise_floor: status.noise_floor,
+        last_rssi: status.last_rssi,
+        last_snr: status.snr,
+        packets_received: status.nb_recv,
+        packets_sent: status.nb_sent,
+        duplicate_packets: status.dup_count,
+        airtime_secs: status.airtime / 1000,
+        rx_airtime_secs: status.rx_airtime / 1000,
+        uptime_secs: status.uptime,
+        flood_sent: status.flood_sent,
+        direct_sent: status.direct_sent,
+    }
+}
+
+fn neighbours_dto_from(data: NeighboursData, fetched_at_unix: i64) -> NeighboursDto {
+    NeighboursDto {
+        fetched_at_unix,
+        total: data.total,
+        neighbours: data
+            .neighbours
+            .iter()
+            .map(|n: &Neighbour| NeighbourDto {
+                public_key_prefix_hex: hex_encode(&n.pubkey),
+                secs_ago: n.secs_ago,
+                snr: n.snr,
+            })
+            .collect(),
+    }
+}
+
+/// Parses the reply text of a repeater's `"region"` admin CLI command
+/// (`RegionMap::printChildRegions`/`exportTo`, firmware
+/// `src/helpers/RegionMap.cpp:287-308`) into structured entries.
+///
+/// Each line's leading-space count is the entry's depth; a trailing `" F"`
+/// marks flood as allowed (stripped first, matching the firmware's
+/// `"%s%s F\n"` format — the space is part of the marker, not padding);
+/// a further trailing `"^"` marks the node's home region. Best-effort: an
+/// empty or entirely blank line is skipped rather than erroring, since the
+/// firmware's fixed ~160-byte reply buffer can truncate a large hierarchy
+/// mid-line.
+fn parse_region_hierarchy(raw_text: &str, fetched_at_unix: i64) -> RegionHierarchyDto {
+    let entries = raw_text
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start_matches(' ');
+            let depth = (line.len() - trimmed.len()) as u8;
+            let trimmed = trimmed.trim_end_matches('\r');
+            if trimmed.is_empty() {
+                return None;
+            }
+            let flood_allowed = trimmed.ends_with(" F");
+            let without_flood = trimmed.strip_suffix(" F").unwrap_or(trimmed);
+            let is_home = without_flood.ends_with('^');
+            let name = without_flood.strip_suffix('^').unwrap_or(without_flood);
+            Some(RegionHierarchyEntryDto {
+                name: name.to_string(),
+                depth,
+                is_home,
+                flood_allowed,
+            })
+        })
+        .collect();
+    RegionHierarchyDto {
+        fetched_at_unix,
+        entries,
+        raw_text: raw_text.to_string(),
+    }
+}
+
 /// A contact (remote node) known to the mesh network, ready to display.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContactDto {
@@ -182,11 +391,26 @@ pub struct ContactDto {
     /// list, or merely a node whose advertisement has been overheard (see
     /// [`DiscoveredNode`]) but never added.
     pub registered: bool,
-    /// Whether this node is in the config's `managed_repeaters` list.
+    /// Whether this node is in the config's `managed_repeaters` list with
+    /// status `Managed` or `Supervised` (both get the same automation/
+    /// highlighting treatment today — see [`RepeaterStatus`]).
     pub managed: bool,
+    /// This repeater's configured management tier, if it matches a
+    /// `managed_repeaters` entry — `None` for a contact that's registered/
+    /// discovered but not configured at all. Needed (not just `managed`)
+    /// so the TUI can tell "Known" apart from "not configured" and can
+    /// toggle each tier independently — see
+    /// `cli::tui::mod::set_repeater_status`.
+    #[serde(default)]
+    pub repeater_status: Option<RepeaterStatus>,
     /// Advertiser type byte (see [`adv_type_name`]/`CONTACT_TYPENAMES`:
     /// 1=Chat, 2=Repeater, 3=Room, 4=Sensor).
     pub contact_type: u8,
+    /// Last telemetry fetched on demand from this node (see
+    /// `DaemonCommand::RequestTelemetry`), if any — populated from the
+    /// daemon's cache, not re-fetched from the node on every snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_telemetry: Option<TelemetryDto>,
 }
 
 impl From<&Contact> for ContactDto {
@@ -199,7 +423,9 @@ impl From<&Contact> for ContactDto {
             lon: c.adv_lon as f64 / 1_000_000.0,
             registered: true,
             managed: false,
+            repeater_status: None,
             contact_type: c.contact_type,
+            last_telemetry: None,
         }
     }
 }
@@ -214,6 +440,11 @@ pub fn is_repeater_or_room(contact_type: u8) -> bool {
 
 /// Contacts that aren't in `managed_repeaters` and should be pruned when
 /// `observer_node_managed_config` is enforced.
+///
+/// Deliberately status-agnostic: a contact matching *any* `managed_repeaters`
+/// entry is protected, regardless of that entry's [`RepeaterStatus`] --
+/// `Known`/`Supervised` repeaters must survive observer-node pruning
+/// exactly like `Managed` ones, not just fully-managed contacts.
 pub fn contacts_to_prune<'a>(
     contacts: &'a [ContactDto],
     managed_repeaters: &[ManagedRepeater],
@@ -226,6 +457,32 @@ pub fn contacts_to_prune<'a>(
                 .any(|r| r.matches(&c.public_key_prefix_hex))
         })
         .collect()
+}
+
+/// The `managed_repeaters` entry's status matching this prefix, if any —
+/// used to populate [`ContactDto::repeater_status`] (and, derived from it,
+/// [`ContactDto::managed`]) in `daemon::mesh_task::build_snapshot_contacts`.
+pub fn matching_repeater_status(
+    managed_repeaters: &[ManagedRepeater],
+    public_key_prefix_hex: &str,
+) -> Option<RepeaterStatus> {
+    managed_repeaters
+        .iter()
+        .find(|r| r.matches(public_key_prefix_hex))
+        .map(|r| r.status)
+}
+
+/// Whether `public_key_prefix_hex` matches one of `contacts` — used before
+/// attempting a login/request against a contact that might only be
+/// "discovered" (overheard on the mesh) but never actually declared to the
+/// companion, which would otherwise fail deep inside `MeshClient` with a
+/// confusing low-level "no contact matches prefix" error repeated across
+/// every category. See `daemon::mesh_task::request_repeater_detail`.
+pub fn is_registered_contact(contacts: &[ContactDto], public_key_prefix_hex: &str) -> bool {
+    contacts.iter().any(|c| {
+        c.public_key_prefix_hex
+            .eq_ignore_ascii_case(public_key_prefix_hex)
+    })
 }
 
 /// A node's full identity, resolved from an overheard advertisement via RF
@@ -409,7 +666,7 @@ pub struct PacketAdvertInfo {
     pub lon: Option<f64>,
 }
 
-fn adv_type_name(adv_type: u8) -> String {
+pub fn adv_type_name(adv_type: u8) -> String {
     match adv_type {
         1 => "Chat".to_string(),
         2 => "Repeater".to_string(),
@@ -725,6 +982,17 @@ pub enum MeshEventKind {
         name: String,
         prefix_hex: String,
     },
+    /// The daemon reloaded `config.toml` in response to `SIGHUP`. Synthesized
+    /// by the daemon itself, not derived from a node/firmware event.
+    ConfigReloaded {
+        summary: String,
+    },
+    /// Telemetry was fetched on demand from a remote node (see
+    /// `DaemonCommand::RequestTelemetry`).
+    TelemetryReceived {
+        name: String,
+        summary: String,
+    },
     /// Fallback for less critical event types (low-level protocol,
     /// statistics...) that we still want to trace.
     Other {
@@ -781,6 +1049,17 @@ pub fn map_event(event: &MeshCoreEvent) -> Option<MeshEventKind> {
         },
     })
 }
+
+/// Timeout for a single mesh-routed request (status/telemetry/neighbours)
+/// to a remote node -- meshcore-rs's own default (`DEFAULT_TIMEOUT`, 5s)
+/// is sized for companion-local RPCs, a bit tight for a real multi-hop
+/// mesh round trip in practice. Kept modest (rather than e.g. 20s) because
+/// `daemon::mesh_task::request_repeater_detail` runs status/telemetry/
+/// neighbours *sequentially*, not concurrently -- meshcore-rs's
+/// `commands()` mutex is held for a request's entire round trip (send +
+/// wait), so three concurrent calls would serialize behind it anyway
+/// (confirmed while implementing this) without actually overlapping.
+const MESH_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Connected MeshCore client, providing simplified, serializable access to
 /// the local node's state and its contacts.
@@ -934,6 +1213,180 @@ impl MeshClient {
             .remove_contact(&contact)
             .await?;
         Ok(())
+    }
+
+    /// Resolves a public key prefix against the companion's cached contact
+    /// list, for commands that need the contact's full 32-byte public key
+    /// (a mere prefix isn't enough to build a mesh-routed request).
+    async fn resolve_contact(&self, public_key_prefix_hex: &str) -> Result<Contact> {
+        let prefix = hex_decode(public_key_prefix_hex)?;
+        self.inner
+            .get_contact_by_prefix(&prefix)
+            .await
+            .ok_or_else(|| {
+                Error::Other(format!("no contact matches prefix {public_key_prefix_hex}"))
+            })
+    }
+
+    /// Logs into a remote node (typically a repeater) using its admin or
+    /// guest password, required before it will answer authenticated
+    /// requests such as telemetry (`CMD_SEND_LOGIN`). Unlike a plain send,
+    /// this waits for the node's own login confirmation
+    /// (`LoginSuccess`/`LoginFailed`) rather than just the companion's
+    /// local send-ack, since [`Self::request_telemetry`] sent immediately
+    /// after would otherwise race the repeater's ACL registration.
+    pub async fn login(&self, public_key_prefix_hex: &str, password: &str) -> Result<()> {
+        const LOGIN_TIMEOUT: Duration = Duration::from_secs(20);
+
+        let contact = self.resolve_contact(public_key_prefix_hex).await?;
+        let commands = self.inner.commands();
+        commands.lock().await.send_login(&contact, password).await?;
+
+        let event = commands
+            .lock()
+            .await
+            .wait_for_any_event(
+                &[EventType::LoginSuccess, EventType::LoginFailed],
+                LOGIN_TIMEOUT,
+            )
+            .await?;
+
+        match event.event_type {
+            EventType::LoginSuccess => Ok(()),
+            _ => Err(Error::Other(format!(
+                "login to {public_key_prefix_hex} was rejected (wrong password?)"
+            ))),
+        }
+    }
+
+    /// Logs out of a remote node previously logged into via [`Self::login`].
+    /// Best-effort by design (fire-and-forget on the wire, matching
+    /// `meshcore-rs`'s own `send_logout`) — considerate towards a
+    /// repeater's limited ACL table size, not required for correctness.
+    pub async fn logout(&self, public_key_prefix_hex: &str) -> Result<()> {
+        let contact = self.resolve_contact(public_key_prefix_hex).await?;
+        self.inner
+            .commands()
+            .lock()
+            .await
+            .send_logout(&contact)
+            .await?;
+        Ok(())
+    }
+
+    /// Requests and decodes CayenneLPP telemetry (battery voltage,
+    /// temperature, ...) from a remote node over the mesh. Most repeaters
+    /// require [`Self::login`] first — see `ManagedRepeater::password`.
+    pub async fn request_telemetry(
+        &self,
+        public_key_prefix_hex: &str,
+    ) -> Result<Vec<crate::telemetry::TelemetryReading>> {
+        let contact = self.resolve_contact(public_key_prefix_hex).await?;
+        let raw = self
+            .inner
+            .commands()
+            .lock()
+            .await
+            .request_telemetry_with_timeout(&contact, MESH_REQUEST_TIMEOUT)
+            .await?;
+        Ok(crate::telemetry::decode(&raw))
+    }
+
+    /// Requests a remote node's live status (battery, uptime, radio/packet
+    /// counters) over the mesh. Most repeaters require [`Self::login`]
+    /// first — see `ManagedRepeater::password`.
+    pub async fn request_status(&self, public_key_prefix_hex: &str) -> Result<StatusDto> {
+        let contact = self.resolve_contact(public_key_prefix_hex).await?;
+        let status: StatusData = self
+            .inner
+            .commands()
+            .lock()
+            .await
+            .request_status_with_timeout(&contact, MESH_REQUEST_TIMEOUT)
+            .await?;
+        Ok(status_dto_from(status, chrono::Utc::now().timestamp()))
+    }
+
+    /// Requests a remote node's list of mesh neighbours (nodes it has
+    /// directly heard) over the mesh. Most repeaters require
+    /// [`Self::login`] first — see `ManagedRepeater::password`.
+    pub async fn request_neighbours(&self, public_key_prefix_hex: &str) -> Result<NeighboursDto> {
+        let contact = self.resolve_contact(public_key_prefix_hex).await?;
+        let neighbours: NeighboursData = self
+            .inner
+            .commands()
+            .lock()
+            .await
+            .request_neighbours_with_timeout(
+                &contact,
+                32, // count
+                0,  // offset
+                0,  // order_by
+                6,  // pubkey_prefix_length -- this codebase's usual 6-byte/12-hex-char prefix
+                MESH_REQUEST_TIMEOUT,
+            )
+            .await?;
+        Ok(neighbours_dto_from(
+            neighbours,
+            chrono::Utc::now().timestamp(),
+        ))
+    }
+
+    /// Requests a remote node's configured region hierarchy over the mesh
+    /// — its own firmware `RegionMap`, not this project's local `regions`
+    /// config. Unlike [`Self::request_status`]/[`Self::request_telemetry`]/
+    /// [`Self::request_neighbours`] (a binary request with a tag-correlated
+    /// response), this sends a plain admin CLI text command
+    /// (`"region"`) and waits for the next incoming text reply from this
+    /// same contact — there's no request/response correlation at the
+    /// protocol level for this path. **Requires an admin login**
+    /// specifically (see [`Self::login`]) — a guest login means the
+    /// firmware never replies at all, indistinguishable client-side from
+    /// "no response arrived in time".
+    pub async fn request_region_hierarchy(
+        &self,
+        public_key_prefix_hex: &str,
+    ) -> Result<RegionHierarchyDto> {
+        const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
+
+        let contact = self.resolve_contact(public_key_prefix_hex).await?;
+        self.inner
+            .commands()
+            .lock()
+            .await
+            .send_msg(&contact, "region", None)
+            .await?;
+
+        let deadline = Instant::now() + REPLY_TIMEOUT;
+        let no_reply = || {
+            Error::Other(format!(
+                "no reply from {public_key_prefix_hex} to the \"region\" command \
+                 (wrong login role, or genuinely no response)"
+            ))
+        };
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(no_reply());
+            }
+            let event = self
+                .inner
+                .dispatcher()
+                .wait_for_event(Some(EventType::ContactMsgRecv), HashMap::new(), remaining)
+                .await
+                .ok_or_else(no_reply)?;
+            if let EventPayload::ContactMessage(msg) = &event.payload {
+                if msg.sender_prefix == contact.prefix() {
+                    return Ok(parse_region_hierarchy(
+                        &msg.text,
+                        chrono::Utc::now().timestamp(),
+                    ));
+                }
+            }
+            // Not the reply we're waiting for (e.g. an unrelated incoming
+            // chat message from someone else) -- keep waiting against the
+            // same deadline.
+        }
     }
 
     /// Declares a managed repeater to the node, so it's recognized even
@@ -1974,6 +2427,199 @@ mod tests {
     }
 
     #[test]
+    fn status_dto_from_converts_airtime_from_milliseconds_and_keeps_fetched_at() {
+        let status = StatusData {
+            battery_mv: 4012,
+            tx_queue_len: 2,
+            noise_floor: -110,
+            last_rssi: -80,
+            nb_recv: 100,
+            nb_sent: 50,
+            airtime: 12_500,
+            uptime: 3600,
+            flood_sent: 10,
+            direct_sent: 5,
+            snr: 6.5,
+            dup_count: 3,
+            rx_airtime: 8_000,
+            sender_prefix: [0xaa; 6],
+        };
+        let dto = status_dto_from(status, 1_000);
+
+        assert_eq!(dto.fetched_at_unix, 1_000);
+        assert_eq!(dto.battery_mv, 4012);
+        assert_eq!(dto.tx_queue_len, 2);
+        assert_eq!(dto.noise_floor, -110);
+        assert_eq!(dto.last_rssi, -80);
+        assert_eq!(dto.last_snr, 6.5);
+        assert_eq!(dto.packets_received, 100);
+        assert_eq!(dto.packets_sent, 50);
+        assert_eq!(dto.duplicate_packets, 3);
+        assert_eq!(dto.airtime_secs, 12); // 12_500ms -> 12s (truncated)
+        assert_eq!(dto.rx_airtime_secs, 8);
+        assert_eq!(dto.uptime_secs, 3600);
+        assert_eq!(dto.flood_sent, 10);
+        assert_eq!(dto.direct_sent, 5);
+    }
+
+    #[test]
+    fn neighbours_dto_from_hex_encodes_each_pubkey_prefix() {
+        let data = NeighboursData {
+            total: 5,
+            neighbours: vec![
+                Neighbour {
+                    pubkey: vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+                    secs_ago: 42,
+                    snr: 7.25,
+                },
+                Neighbour {
+                    pubkey: vec![0x11, 0x22, 0x33],
+                    secs_ago: 100,
+                    snr: -2.0,
+                },
+            ],
+        };
+        let dto = neighbours_dto_from(data, 2_000);
+
+        assert_eq!(dto.fetched_at_unix, 2_000);
+        assert_eq!(dto.total, 5);
+        assert_eq!(dto.neighbours.len(), 2);
+        assert_eq!(dto.neighbours[0].public_key_prefix_hex, "aabbccddeeff");
+        assert_eq!(dto.neighbours[0].secs_ago, 42);
+        assert_eq!(dto.neighbours[0].snr, 7.25);
+        assert_eq!(dto.neighbours[1].public_key_prefix_hex, "112233");
+    }
+
+    // --- parse_region_hierarchy ---------------------------------------------
+
+    /// The exact example from `RegionMap::printChildRegions`'s format
+    /// (firmware `src/helpers/RegionMap.cpp:287-308`): nested by leading
+    /// spaces, home region marked `^`, flood-allowed marked trailing ` F`.
+    #[test]
+    fn parse_region_hierarchy_nested_home_and_flood_markers() {
+        let raw = "World F\n Europe F\n  France^ F\n";
+        let dto = parse_region_hierarchy(raw, 1_000);
+
+        assert_eq!(dto.fetched_at_unix, 1_000);
+        assert_eq!(dto.raw_text, raw);
+        assert_eq!(dto.entries.len(), 3);
+
+        assert_eq!(dto.entries[0].name, "World");
+        assert_eq!(dto.entries[0].depth, 0);
+        assert!(!dto.entries[0].is_home);
+        assert!(dto.entries[0].flood_allowed);
+
+        assert_eq!(dto.entries[1].name, "Europe");
+        assert_eq!(dto.entries[1].depth, 1);
+        assert!(!dto.entries[1].is_home);
+        assert!(dto.entries[1].flood_allowed);
+
+        assert_eq!(dto.entries[2].name, "France");
+        assert_eq!(dto.entries[2].depth, 2);
+        assert!(dto.entries[2].is_home);
+        assert!(dto.entries[2].flood_allowed);
+    }
+
+    #[test]
+    fn parse_region_hierarchy_flood_denied_region_has_no_trailing_marker() {
+        // `printChildRegions` omits the " F" suffix entirely when flood is
+        // denied for that region (`RegionMap.cpp:292-293`).
+        let dto = parse_region_hierarchy("World\n Europe F\n", 0);
+
+        assert_eq!(dto.entries[0].name, "World");
+        assert!(!dto.entries[0].flood_allowed);
+        assert_eq!(dto.entries[1].name, "Europe");
+        assert!(dto.entries[1].flood_allowed);
+    }
+
+    #[test]
+    fn parse_region_hierarchy_skips_blank_lines() {
+        let dto = parse_region_hierarchy("World F\n\n Europe F\n", 0);
+        assert_eq!(dto.entries.len(), 2);
+    }
+
+    #[test]
+    fn parse_region_hierarchy_empty_reply_is_empty() {
+        let dto = parse_region_hierarchy("", 0);
+        assert!(dto.entries.is_empty());
+        assert_eq!(dto.raw_text, "");
+    }
+
+    /// The firmware's reply buffer is a fixed ~160 characters -- a
+    /// truncated line (cut off mid-name, no markers) should still parse
+    /// as a best-effort entry rather than erroring the whole reply.
+    #[test]
+    fn parse_region_hierarchy_truncated_trailing_line_is_best_effort() {
+        let dto = parse_region_hierarchy("World F\n  Fran", 0);
+        assert_eq!(dto.entries.len(), 2);
+        assert_eq!(dto.entries[1].name, "Fran");
+        assert_eq!(dto.entries[1].depth, 2);
+        assert!(!dto.entries[1].flood_allowed);
+    }
+
+    // --- RepeaterDetailDto::apply_category ----------------------------------
+
+    #[test]
+    fn apply_category_status_ok_fills_in_the_field() {
+        let mut detail = RepeaterDetailDto::default();
+        detail.apply_category(RepeaterDetailCategory::Status(Ok(StatusDto {
+            fetched_at_unix: 1,
+            battery_mv: 4012,
+            tx_queue_len: 0,
+            noise_floor: -110,
+            last_rssi: -80,
+            last_snr: 6.5,
+            packets_received: 1,
+            packets_sent: 1,
+            duplicate_packets: 0,
+            airtime_secs: 1,
+            rx_airtime_secs: 1,
+            uptime_secs: 1,
+            flood_sent: 0,
+            direct_sent: 0,
+        })));
+
+        assert!(detail.status.is_some());
+        assert!(detail.errors.is_empty());
+    }
+
+    #[test]
+    fn apply_category_err_records_a_prefixed_error_and_leaves_the_field_none() {
+        let mut detail = RepeaterDetailDto::default();
+        detail.apply_category(RepeaterDetailCategory::Neighbours(Err(
+            "timed out".to_string()
+        )));
+
+        assert!(detail.neighbours.is_none());
+        assert_eq!(detail.errors, vec!["neighbours: timed out".to_string()]);
+    }
+
+    #[test]
+    fn apply_category_folds_updates_from_every_category_independently() {
+        let mut detail = RepeaterDetailDto::default();
+        detail.apply_category(RepeaterDetailCategory::Status(Err("a".to_string())));
+        detail.apply_category(RepeaterDetailCategory::Telemetry(Ok(TelemetryDto {
+            fetched_at_unix: 0,
+            readings: vec![],
+        })));
+        detail.apply_category(RepeaterDetailCategory::Neighbours(Err("b".to_string())));
+        detail.apply_category(RepeaterDetailCategory::Regions(Ok(RegionHierarchyDto {
+            fetched_at_unix: 0,
+            entries: vec![],
+            raw_text: String::new(),
+        })));
+
+        assert!(detail.status.is_none());
+        assert!(detail.telemetry.is_some());
+        assert!(detail.neighbours.is_none());
+        assert!(detail.regions.is_some());
+        assert_eq!(
+            detail.errors,
+            vec!["status: a".to_string(), "neighbours: b".to_string()]
+        );
+    }
+
+    #[test]
     fn node_stats_dto_serializes_flat_when_all_categories_present() {
         let dto = NodeStatsDto {
             core: Some(CoreStatsDto {
@@ -2120,7 +2766,9 @@ mod tests {
             lon: 0.0,
             registered: true,
             managed: false,
+            repeater_status: None,
             contact_type: 2,
+            last_telemetry: None,
         }
     }
 
@@ -2130,6 +2778,8 @@ mod tests {
         let managed = vec![ManagedRepeater {
             name: "Repeater A".to_string(),
             public_key_hex: "aabbcc".repeat(10) + "aaaa",
+            password: None,
+            status: RepeaterStatus::Managed,
         }];
 
         assert!(contacts_to_prune(&contacts, &managed).is_empty());
@@ -2141,6 +2791,8 @@ mod tests {
         let managed = vec![ManagedRepeater {
             name: "Repeater A".to_string(),
             public_key_hex: "aabbcc".repeat(10) + "aaaa",
+            password: None,
+            status: RepeaterStatus::Managed,
         }];
 
         let pruned = contacts_to_prune(&contacts, &managed);
@@ -2152,6 +2804,59 @@ mod tests {
     fn contacts_to_prune_prunes_everything_when_nothing_is_managed() {
         let contacts = vec![sample_contact("aabbcc"), sample_contact("ddeeff")];
         assert_eq!(contacts_to_prune(&contacts, &[]).len(), 2);
+    }
+
+    // --- is_registered_contact -----------------------------------------------
+
+    #[test]
+    fn is_registered_contact_true_when_prefix_matches_case_insensitively() {
+        let contacts = vec![sample_contact("aabbcc")];
+        assert!(is_registered_contact(&contacts, "AABBCC"));
+    }
+
+    #[test]
+    fn is_registered_contact_false_when_no_contact_matches() {
+        let contacts = vec![sample_contact("aabbcc")];
+        assert!(!is_registered_contact(&contacts, "ddeeff"));
+    }
+
+    #[test]
+    fn is_registered_contact_false_for_an_empty_contact_list() {
+        assert!(!is_registered_contact(&[], "aabbcc"));
+    }
+
+    // --- matching_repeater_status --------------------------------------------
+
+    fn managed_repeater(prefix_hex: &str, status: RepeaterStatus) -> ManagedRepeater {
+        ManagedRepeater {
+            name: format!("Repeater {prefix_hex}"),
+            public_key_hex: prefix_hex.repeat(10) + "aaaa",
+            password: None,
+            status,
+        }
+    }
+
+    #[test]
+    fn matching_repeater_status_finds_each_status() {
+        for status in [
+            RepeaterStatus::Managed,
+            RepeaterStatus::Known,
+            RepeaterStatus::Supervised,
+        ] {
+            let repeaters = vec![managed_repeater("aabbcc", status)];
+            assert_eq!(matching_repeater_status(&repeaters, "aabbcc"), Some(status));
+        }
+    }
+
+    #[test]
+    fn matching_repeater_status_none_when_no_match() {
+        let repeaters = vec![managed_repeater("aabbcc", RepeaterStatus::Managed)];
+        assert_eq!(matching_repeater_status(&repeaters, "ddeeff"), None);
+    }
+
+    #[test]
+    fn matching_repeater_status_none_for_an_empty_list() {
+        assert_eq!(matching_repeater_status(&[], "aabbcc"), None);
     }
 
     // --- reconstruct_raw_packet_hex ----------------------------------------

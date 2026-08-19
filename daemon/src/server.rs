@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use fez_mesh_controller_core::ipc::{ClientMessage, ServerMessage, PROTOCOL_VERSION};
 use futures::{SinkExt, StreamExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 use tracing::{debug, info, warn};
 
@@ -30,6 +30,21 @@ use crate::state::AppState;
 /// How long an IPC client waits for a command's outcome before giving up
 /// (e.g. the mesh connection task is stuck reconnecting).
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+/// A telemetry request involves a login plus a real multi-hop mesh round
+/// trip -- far slower than the companion-local commands `COMMAND_TIMEOUT`
+/// was sized for.
+const TELEMETRY_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+/// A repeater-detail request is a login plus four *sequential* mesh round
+/// trips (status, telemetry, neighbours, regions -- see
+/// `mesh_task::request_repeater_detail`): three with a 10s budget each
+/// (`core::mesh::MESH_REQUEST_TIMEOUT`) plus the region-hierarchy fetch's
+/// own 15s reply wait (no tag correlation, see
+/// `MeshClient::request_region_hierarchy`); 90s covers that worst case
+/// (login ~20s + 3*10s + 15s + logout) with margin. Categories stream back
+/// progressively (see [`dispatch_repeater_detail`]), so in practice this is
+/// only ever hit as a safety net if the mesh task goes silent mid-fetch —
+/// it isn't how long the user actually waits for the first result.
+const REPEATER_DETAIL_COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Starts the IPC server: listens on the Unix socket and serves one client
 /// per accepted connection until the daemon shuts down.
@@ -116,23 +131,38 @@ async fn handle_client(stream: UnixStream, state: Arc<AppState>) -> Result<()> {
                         Ok(ClientMessage::RemoveContact { public_key_prefix_hex }) => {
                             let (reply, reply_rx) = oneshot::channel();
                             let cmd = DaemonCommand::RemoveContact { public_key_prefix_hex, reply };
-                            if let Err(reason) = dispatch_command(&state, cmd, reply_rx).await {
+                            if let Err(reason) = dispatch_command(&state, cmd, reply_rx, COMMAND_TIMEOUT).await {
                                 send(&mut writer, &ServerMessage::Error(reason)).await?;
                             }
                         }
-                        Ok(ClientMessage::SetManagedRepeater { public_key_prefix_hex, name, managed }) => {
+                        Ok(ClientMessage::SetRepeaterStatus { public_key_prefix_hex, name, status }) => {
                             let (reply, reply_rx) = oneshot::channel();
-                            let cmd = DaemonCommand::SetManagedRepeater { public_key_prefix_hex, name, managed, reply };
-                            if let Err(reason) = dispatch_command(&state, cmd, reply_rx).await {
+                            let cmd = DaemonCommand::SetRepeaterStatus { public_key_prefix_hex, name, status, reply };
+                            if let Err(reason) = dispatch_command(&state, cmd, reply_rx, COMMAND_TIMEOUT).await {
                                 send(&mut writer, &ServerMessage::Error(reason)).await?;
                             }
                         }
                         Ok(ClientMessage::AddRepeater { public_key_hex, name, managed }) => {
                             let (reply, reply_rx) = oneshot::channel();
                             let cmd = DaemonCommand::AddRepeater { public_key_hex, name, managed, reply };
-                            if let Err(reason) = dispatch_command(&state, cmd, reply_rx).await {
+                            if let Err(reason) = dispatch_command(&state, cmd, reply_rx, COMMAND_TIMEOUT).await {
                                 send(&mut writer, &ServerMessage::Error(reason)).await?;
                             }
+                        }
+                        Ok(ClientMessage::RequestTelemetry { public_key_prefix_hex }) => {
+                            let (reply, reply_rx) = oneshot::channel();
+                            let cmd = DaemonCommand::RequestTelemetry { public_key_prefix_hex: public_key_prefix_hex.clone(), reply };
+                            match dispatch_command(&state, cmd, reply_rx, TELEMETRY_COMMAND_TIMEOUT).await {
+                                Ok(telemetry) => {
+                                    send(&mut writer, &ServerMessage::TelemetryResult { public_key_prefix_hex, telemetry }).await?;
+                                }
+                                Err(reason) => {
+                                    send(&mut writer, &ServerMessage::Error(reason)).await?;
+                                }
+                            }
+                        }
+                        Ok(ClientMessage::RequestRepeaterDetail { public_key_prefix_hex }) => {
+                            dispatch_repeater_detail(&state, public_key_prefix_hex, &mut writer).await?;
                         }
                         Err(err) => {
                             debug!(error = %err, "invalid IPC client message");
@@ -152,23 +182,87 @@ async fn handle_client(stream: UnixStream, state: Arc<AppState>) -> Result<()> {
 }
 
 /// Forwards a command to the mesh connection task (the only one holding
-/// the live MeshCore connection) and waits for its outcome.
-async fn dispatch_command(
+/// the live MeshCore connection) and waits for its outcome. Generic over
+/// the reply's `Ok` payload — most commands only report success/failure
+/// (`T = ()`), but e.g. `RequestTelemetry` carries a real result.
+async fn dispatch_command<T>(
     state: &Arc<AppState>,
     cmd: DaemonCommand,
-    reply_rx: oneshot::Receiver<std::result::Result<(), String>>,
-) -> std::result::Result<(), String> {
+    reply_rx: oneshot::Receiver<std::result::Result<T, String>>,
+    timeout: Duration,
+) -> std::result::Result<T, String> {
     state
         .command_tx
         .send(cmd)
         .await
         .map_err(|_| "mesh connection task is not running".to_string())?;
 
-    match tokio::time::timeout(COMMAND_TIMEOUT, reply_rx).await {
+    match tokio::time::timeout(timeout, reply_rx).await {
         Ok(Ok(result)) => result,
         Ok(Err(_)) => Err("mesh connection task dropped the reply".to_string()),
         Err(_) => Err("timed out waiting for the mesh node (offline?)".to_string()),
     }
+}
+
+/// Forwards a `RequestRepeaterDetail` command and streams each category's
+/// outcome to the client as soon as it's available, rather than batching
+/// into one final reply — see `DaemonCommand::RequestRepeaterDetail`. A
+/// transport-level failure (mesh task not running, or it goes silent for
+/// longer than `REPEATER_DETAIL_COMMAND_TIMEOUT` with categories still
+/// outstanding) is reported as a single `ServerMessage::Error`;
+/// category-level failures are carried inside each
+/// `ServerMessage::RepeaterDetailCategory` and never raise one here.
+async fn dispatch_repeater_detail<W>(
+    state: &Arc<AppState>,
+    public_key_prefix_hex: String,
+    writer: &mut FramedWrite<W, LinesCodec>,
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let (updates_tx, mut updates_rx) = mpsc::channel(4);
+    let cmd = DaemonCommand::RequestRepeaterDetail {
+        public_key_prefix_hex: public_key_prefix_hex.clone(),
+        updates: updates_tx,
+    };
+    if state.command_tx.send(cmd).await.is_err() {
+        send(
+            writer,
+            &ServerMessage::Error("mesh connection task is not running".to_string()),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let deadline = tokio::time::Instant::now() + REPEATER_DETAIL_COMMAND_TIMEOUT;
+    loop {
+        match tokio::time::timeout_at(deadline, updates_rx.recv()).await {
+            Ok(Some(category)) => {
+                send(
+                    writer,
+                    &ServerMessage::RepeaterDetailCategory {
+                        public_key_prefix_hex: public_key_prefix_hex.clone(),
+                        category,
+                    },
+                )
+                .await?;
+            }
+            // The mesh task finished (every `updates` sender dropped) --
+            // not an error, just the natural end of the stream.
+            Ok(None) => break,
+            Err(_) => {
+                send(
+                    writer,
+                    &ServerMessage::Error(
+                        "timed out waiting for the mesh node (offline?)".to_string(),
+                    ),
+                )
+                .await?;
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn current_snapshot(state: &Arc<AppState>) -> fez_mesh_controller_core::ipc::Snapshot {
@@ -583,6 +677,167 @@ mod tests {
         send_client_message(
             &mut writer,
             &ClientMessage::RemoveContact {
+                public_key_prefix_hex: "aabbccddeeff".to_string(),
+            },
+        )
+        .await;
+
+        match recv(&mut reader).await {
+            ServerMessage::Error(reason) => {
+                assert_eq!(reason, "mesh connection task is not running")
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_telemetry_success_sends_telemetry_result() {
+        use fez_mesh_controller_core::mesh::TelemetryDto;
+        use fez_mesh_controller_core::telemetry::TelemetryReading;
+
+        let (state, mut command_rx) = make_state().await;
+        let (mut reader, mut writer) = spawn_client(state);
+        drain_handshake(&mut reader).await;
+
+        tokio::spawn(async move {
+            if let Some(DaemonCommand::RequestTelemetry { reply, .. }) = command_rx.recv().await {
+                let _ = reply.send(Ok(TelemetryDto {
+                    fetched_at_unix: 1,
+                    readings: vec![TelemetryReading {
+                        channel: 1,
+                        label: "Voltage".to_string(),
+                        value: 3.71,
+                        unit: "V".to_string(),
+                    }],
+                }));
+            }
+        });
+
+        send_client_message(
+            &mut writer,
+            &ClientMessage::RequestTelemetry {
+                public_key_prefix_hex: "aabbccddeeff".to_string(),
+            },
+        )
+        .await;
+
+        match recv(&mut reader).await {
+            ServerMessage::TelemetryResult {
+                public_key_prefix_hex,
+                telemetry,
+            } => {
+                assert_eq!(public_key_prefix_hex, "aabbccddeeff");
+                assert_eq!(telemetry.readings.len(), 1);
+                assert_eq!(telemetry.readings[0].value, 3.71);
+            }
+            other => panic!("expected TelemetryResult, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_telemetry_failure_sends_an_error() {
+        let (state, mut command_rx) = make_state().await;
+        let (mut reader, mut writer) = spawn_client(state);
+        drain_handshake(&mut reader).await;
+
+        tokio::spawn(async move {
+            if let Some(DaemonCommand::RequestTelemetry { reply, .. }) = command_rx.recv().await {
+                let _ = reply.send(Err("login to aabbccddeeff was rejected".to_string()));
+            }
+        });
+
+        send_client_message(
+            &mut writer,
+            &ClientMessage::RequestTelemetry {
+                public_key_prefix_hex: "aabbccddeeff".to_string(),
+            },
+        )
+        .await;
+
+        match recv(&mut reader).await {
+            ServerMessage::Error(reason) => {
+                assert_eq!(reason, "login to aabbccddeeff was rejected")
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_repeater_detail_streams_each_category_as_it_arrives() {
+        use fez_mesh_controller_core::mesh::{RepeaterDetailCategory, TelemetryDto};
+        use fez_mesh_controller_core::telemetry::TelemetryReading;
+
+        let (state, mut command_rx) = make_state().await;
+        let (mut reader, mut writer) = spawn_client(state);
+        drain_handshake(&mut reader).await;
+
+        tokio::spawn(async move {
+            if let Some(DaemonCommand::RequestRepeaterDetail { updates, .. }) =
+                command_rx.recv().await
+            {
+                // Sent out of the "usual" status/telemetry/neighbours/regions
+                // order on purpose: the server must forward whatever arrives,
+                // in arrival order, not assume or reorder.
+                let _ = updates
+                    .send(RepeaterDetailCategory::Telemetry(Ok(TelemetryDto {
+                        fetched_at_unix: 1,
+                        readings: vec![TelemetryReading {
+                            channel: 1,
+                            label: "Voltage".to_string(),
+                            value: 3.71,
+                            unit: "V".to_string(),
+                        }],
+                    })))
+                    .await;
+                let _ = updates
+                    .send(RepeaterDetailCategory::Status(Err("timed out".to_string())))
+                    .await;
+                // Dropping `updates` here (end of scope) closes the channel,
+                // signalling completion even though only two of four
+                // categories were ever sent -- mirrors a real category
+                // genuinely never resolving.
+            }
+        });
+
+        send_client_message(
+            &mut writer,
+            &ClientMessage::RequestRepeaterDetail {
+                public_key_prefix_hex: "aabbccddeeff".to_string(),
+            },
+        )
+        .await;
+
+        match recv(&mut reader).await {
+            ServerMessage::RepeaterDetailCategory {
+                public_key_prefix_hex,
+                category: RepeaterDetailCategory::Telemetry(Ok(telemetry)),
+            } => {
+                assert_eq!(public_key_prefix_hex, "aabbccddeeff");
+                assert_eq!(telemetry.readings.len(), 1);
+            }
+            other => panic!("expected a Telemetry RepeaterDetailCategory, got {other:?}"),
+        }
+        match recv(&mut reader).await {
+            ServerMessage::RepeaterDetailCategory {
+                category: RepeaterDetailCategory::Status(Err(reason)),
+                ..
+            } => {
+                assert_eq!(reason, "timed out");
+            }
+            other => panic!("expected a Status RepeaterDetailCategory, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_repeater_detail_transport_failure_sends_an_error() {
+        let (state, command_rx) = make_state().await;
+        drop(command_rx); // nobody will ever receive the command
+        let (mut reader, mut writer) = spawn_client(state);
+        drain_handshake(&mut reader).await;
+
+        send_client_message(
+            &mut writer,
+            &ClientMessage::RequestRepeaterDetail {
                 public_key_prefix_hex: "aabbccddeeff".to_string(),
             },
         )

@@ -177,7 +177,9 @@ mod tests {
             lon: 0.0,
             registered: true,
             managed,
+            repeater_status: None,
             contact_type: 2, // Repeater
+            last_telemetry: None,
         }
     }
 

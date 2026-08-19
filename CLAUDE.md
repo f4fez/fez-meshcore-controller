@@ -33,6 +33,7 @@ Cargo workspace, 3 crates.
 - `state.rs` — `AppState`: shared `Snapshot`, `Config`, packet log cache.
 - `mesh_task.rs` — owns the connection to the physical node (serial/TCP/BLE via `meshcore-rs`), reconnect loop, refreshes `AppState` on connect/events.
 - `server.rs` — IPC server: accepts CLI connections, handshakes (`Hello` → `Snapshot` → `PacketLog` backlog), handles `ClientMessage`s, broadcasts events/packets.
+- `reload.rs` — `SIGHUP` config hot-reload: `diff_config` (pure diff) + `reload_once` (applies `managed_repeaters`/`regions`/`hashtag_channels`/`mqtt_brokers` live, logs the rest as restart-required) + `watch` (the signal loop). See "Working conventions" below — every new config field needs a deliberate decision here.
 - `lock.rs` — single-instance enforcement via a lock file.
 
 ### `cli` (`fez-mesh-controller`) — everything here talks to the daemon over IPC, never directly to the node
@@ -115,6 +116,15 @@ path of hop hashes (`path_hash_size` bytes each, 1-4, varies per network — `Pa
 - Add/update unit tests for every change in `core`/`daemon`, not just on request.
 - Always confirm with the user before `git push`, even if a request's wording seems to imply it.
 - Never add wizard/config parameters unprompted — ask first.
+- When adding a new `Config`/`DaemonConfig` field, deliberately decide its `SIGHUP` reload
+  behavior (`daemon/src/reload.rs`) — either live-apply it (if it's already read live from
+  `AppState::config`, or by adding explicit handling like `reload.rs` does for `mqtt_brokers`),
+  or add it to `diff_config`'s `restart_required` list so a reload at least logs that it wasn't
+  applied. Don't leave a new field unconsidered by `reload.rs`.
+- Whenever `Config`/`ConnectionConfig`/`DaemonConfig`/`ManagedRepeater`/`RegionConfig`/
+  `MqttBrokerConfig` (`core/src/config.rs`) gains, removes, renames, or changes the default of a
+  field, update `config.example.toml` to match in the same change — it drifted out of sync once
+  already (`observer_node_managed_config` shipped in `7536e5d` without a matching update there).
 - Before considering a task done: full `cargo build --workspace`, `cargo test --workspace`,
   `cargo clippy --workspace --all-targets`, `cargo fmt --check`.
 - README.md WIP markers: when a change implements something flagged `(WIP)` there, tell the user

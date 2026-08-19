@@ -20,8 +20,8 @@
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::Confirm;
 use fez_mesh_controller_core::ipc::{ClientMessage, ServerMessage, Snapshot};
-use fez_mesh_controller_core::mesh::ContactDto;
-use fez_mesh_controller_core::Config;
+use fez_mesh_controller_core::mesh::{ContactDto, TelemetryDto};
+use fez_mesh_controller_core::{Config, RepeaterStatus};
 
 use crate::format::{format_coords, format_last_seen};
 use crate::ipc_client::{connect_and_await_snapshot, IpcConnection};
@@ -101,10 +101,10 @@ pub async fn manage(config: &Config, prefix: &str, name: Option<String>) -> anyh
     }
 
     theme::info_line(&format!("marking \"{display_name}\" as managed…"));
-    conn.send(&ClientMessage::SetManagedRepeater {
+    conn.send(&ClientMessage::SetRepeaterStatus {
         public_key_prefix_hex: contact.public_key_prefix_hex.clone(),
         name: display_name,
-        managed: true,
+        status: Some(RepeaterStatus::Managed),
     })
     .await?;
 
@@ -131,10 +131,10 @@ pub async fn unmanage(config: &Config, prefix: &str) -> anyhow::Result<()> {
     }
 
     theme::info_line(&format!("unmarking \"{}\" as managed…", contact.name));
-    conn.send(&ClientMessage::SetManagedRepeater {
+    conn.send(&ClientMessage::SetRepeaterStatus {
         public_key_prefix_hex: contact.public_key_prefix_hex.clone(),
         name: contact.name.clone(),
-        managed: false,
+        status: None,
     })
     .await?;
 
@@ -186,6 +186,65 @@ pub async fn remove(config: &Config, prefix: &str, yes: bool) -> anyhow::Result<
         _ => theme::success_line(&format!("\"{}\" removed from the node", contact.name)),
     }
     Ok(())
+}
+
+/// Fetches and prints fresh telemetry (battery voltage, temperature, ...)
+/// from a repeater over the mesh — logs in first if it has a `password`
+/// configured (see `ManagedRepeater::password`); most repeaters require
+/// this. Same on-demand action as the TUI's `t` key. Can take a while (a
+/// real multi-hop mesh round trip), unlike every other `repeater` command.
+pub async fn telemetry(config: &Config, prefix: &str) -> anyhow::Result<()> {
+    theme::section("Repeater telemetry", "📡");
+    let (mut conn, snapshot) = connect_and_await_snapshot(&config.daemon.socket_path).await?;
+    let contact = find_contact(&snapshot, prefix)?;
+
+    theme::info_line(&format!(
+        "requesting telemetry from \"{}\"… (this can take a while)",
+        contact.name
+    ));
+    conn.send(&ClientMessage::RequestTelemetry {
+        public_key_prefix_hex: contact.public_key_prefix_hex.clone(),
+    })
+    .await?;
+
+    loop {
+        match conn.recv().await? {
+            Some(ServerMessage::Error(reason)) => {
+                theme::error_line(&reason);
+                std::process::exit(1);
+            }
+            Some(ServerMessage::TelemetryResult { telemetry, .. }) => {
+                print_telemetry(&contact.name, &telemetry);
+                return Ok(());
+            }
+            Some(_) => continue,
+            None => anyhow::bail!("daemon closed the connection"),
+        }
+    }
+}
+
+fn print_telemetry(name: &str, telemetry: &TelemetryDto) {
+    println!();
+    println!(
+        "{} {} {}",
+        console::style("📡").bold(),
+        theme::primary().apply_to(name),
+        muted().apply_to(format!(
+            "(fetched {})",
+            format_last_seen(telemetry.fetched_at_unix.max(0) as u32)
+        ))
+    );
+    if telemetry.readings.is_empty() {
+        println!("   {}", muted().apply_to("no readings"));
+    }
+    for reading in &telemetry.readings {
+        println!(
+            "   • {:<22} {}",
+            accent().apply_to(&reading.label),
+            format!("{} {}", reading.value, reading.unit).trim(),
+        );
+    }
+    println!();
 }
 
 fn managed_state_mismatch(name: &str) {
@@ -267,10 +326,11 @@ fn print_repeaters(snap: &Snapshot) {
     contacts.sort_by_key(|c| std::cmp::Reverse(c.last_advert_unix));
 
     for c in contacts {
-        let (status_text, status_style) = match (c.registered, c.managed) {
-            (_, true) => ("🛰️  managed", theme::success()),
-            (true, false) => ("✅ known", muted()),
-            (false, false) => ("🔍 discovered", theme::warning()),
+        let (status_text, status_style) = match (c.repeater_status, c.registered) {
+            (Some(RepeaterStatus::Managed), _) => ("🛰️  managed", theme::success()),
+            (Some(RepeaterStatus::Supervised), _) => ("🛡️  supervised", accent()),
+            (Some(RepeaterStatus::Known), _) | (None, true) => ("✅ known", muted()),
+            (None, false) => ("🔍 discovered", theme::warning()),
         };
         println!(
             "   • {:<20} {:<14} {} {} {}",
@@ -297,7 +357,9 @@ mod tests {
             lon: 0.0,
             registered: true,
             managed: false,
+            repeater_status: None,
             contact_type: 2, // Repeater
+            last_telemetry: None,
         }
     }
 
