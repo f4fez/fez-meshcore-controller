@@ -1,0 +1,16 @@
+#!/bin/sh
+# Creates the dedicated system user the daemon's systemd unit runs as
+# (fez-mesh-controller-daemon.service: User=/Group=fez-mesh-controller).
+# Idempotent -- a no-op on upgrade once the user already exists. The user
+# is deliberately never removed on purge (standard Debian practice for
+# system users, avoids orphaning files it owns under its home directory).
+set -e
+
+if ! getent passwd fez-mesh-controller >/dev/null; then
+    adduser --system --group --home /var/lib/fez-mesh-controller \
+        --gecos "fez-mesh-controller daemon" fez-mesh-controller
+fi
+
+#DEBHELPER#
+
+exit 0

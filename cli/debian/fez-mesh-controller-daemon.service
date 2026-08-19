@@ -1,0 +1,20 @@
+[Unit]
+Description=fez-mesh-controller daemon (MeshCore node connection + IPC server)
+Documentation=https://github.com/florianmazen/fez-mesh-controller
+After=network.target bluetooth.target
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+User=fez-mesh-controller
+Group=fez-mesh-controller
+SupplementaryGroups=dialout
+Environment=HOME=/var/lib/fez-mesh-controller
+Environment=XDG_RUNTIME_DIR=/run/fez-mesh-controller
+RuntimeDirectory=fez-mesh-controller
+ExecStart=/usr/bin/fez-mesh-controller-daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -50,6 +50,18 @@ cd fez-mesh-controller
 cargo build --release
 ```
 
+### Debian package
+
+```sh
+cargo install cargo-deb
+cargo deb -p fez-mesh-controller-cli
+sudo dpkg -i target/debian/fez-mesh-controller_*.deb
+```
+
+Installs both binaries plus a systemd unit for the daemon, running as a dedicated
+`fez-mesh-controller` system user. The daemon isn't started automatically — see
+[`cli/debian/README.Debian`](cli/debian/README.Debian) for the (short) setup step required first.
+
 ## Getting started
 
 ```sh

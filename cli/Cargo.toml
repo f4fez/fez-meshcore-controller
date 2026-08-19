@@ -33,3 +33,31 @@ names = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
+
+# Debian packaging (`cargo install cargo-deb && cargo deb -p fez-mesh-controller-cli`
+# from the workspace root). Bundles both binaries (this one plus the daemon's,
+# built into the same shared `target/release/` regardless of source crate) into
+# one `fez-mesh-controller` package, with a systemd unit for the daemon. See
+# `cli/debian/README.Debian` for required post-install steps and CLAUDE.md's
+# "Build requirement" note (the `../meshcore-rs` sibling checkout is still
+# needed to build, same as any other build of this workspace).
+[package.metadata.deb]
+name = "fez-mesh-controller"
+maintainer = "Florian MAZEN (F4FEZ) <76635263+f4fez@users.noreply.github.com>"
+copyright = "2026, Florian MAZEN (F4FEZ)"
+license-file = ["../LICENSE", "0"]
+extended-description = """\
+Independent management and monitoring of MeshCore repeaters within configured regions -- \
+no public/cloud infrastructure, off-grid by design. Includes the daemon (node connection + \
+IPC server) and the CLI/TUI dashboard."""
+section = "net"
+priority = "optional"
+depends = "$auto"
+maintainer-scripts = "debian"
+systemd-units = { unit-name = "fez-mesh-controller-daemon", enable = true, start = false }
+assets = [
+    ["target/release/fez-mesh-controller", "usr/bin/", "755"],
+    ["target/release/fez-mesh-controller-daemon", "usr/bin/", "755"],
+    ["../config.example.toml", "usr/share/doc/fez-mesh-controller/", "644"],
+    ["debian/README.Debian", "usr/share/doc/fez-mesh-controller/", "644"],
+]

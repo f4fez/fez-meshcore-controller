@@ -1,0 +1,37 @@
+fez-mesh-controller for Debian
+===============================
+
+Installing this package creates a dedicated system user
+(`fez-mesh-controller`) and a `fez-mesh-controller-daemon.service` systemd
+unit, but does **not** start the daemon: it has no `config.toml` yet, and
+starting it before one exists would just fail. Finish the setup manually:
+
+1. Create the daemon's configuration, as the service user:
+
+       sudo -u fez-mesh-controller fez-mesh-controller setup
+
+   This writes `/var/lib/fez-mesh-controller/.config/fez-mesh-controller/config.toml`.
+
+2. The packaged daemon listens on a fixed socket path, `RuntimeDirectory=`
+   in the systemd unit, rather than the per-user default the CLI normally
+   assumes (`$XDG_RUNTIME_DIR`, which an interactive admin session and a
+   system service resolve completely differently):
+
+       /run/fez-mesh-controller/fez-mesh-controller.sock
+
+   When running the setup wizard above, or editing config.toml by hand,
+   set `daemon.socket_path` to that path. Anyone using the CLI as
+   themselves (not as the `fez-mesh-controller` user) needs their own
+   config -- or the `--config` flag -- pointing at the same socket path to
+   reach the packaged daemon.
+
+3. Start the service:
+
+       sudo systemctl start fez-mesh-controller-daemon
+       journalctl -u fez-mesh-controller-daemon -f
+
+It's already enabled (`systemctl enable`, done by this package's postinst),
+so it starts automatically on every subsequent boot once step 1-2 are done.
+
+A reference copy of every configuration parameter, with comments, is
+installed alongside this file as config.example.toml.

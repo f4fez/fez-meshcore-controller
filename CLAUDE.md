@@ -58,6 +58,20 @@ needs a **sibling checkout** of `meshcore-rs` (not just the published crate), fo
 decoding features not yet merged/released upstream. Without `../meshcore-rs` present next to
 this repo, `cargo build` fails. Temporary (per the `Cargo.toml` comment) — drop the patch once
 merged/published. Deliberately not documented in README.md (kept as an internal/dev detail).
+Applies to `cargo deb` too (see "Debian packaging" below) — it runs `cargo build` internally, so
+it needs the same sibling checkout.
+
+## Debian packaging
+
+`cli/Cargo.toml`'s `[package.metadata.deb]` (via [`cargo-deb`](https://github.com/kornelski/cargo-deb),
+external tool, `cargo install cargo-deb`) bundles both binaries — the CLI's own plus the
+daemon's, referenced from `target/release/` regardless of which crate produced them — into one
+`fez-mesh-controller` package, with a systemd unit for the daemon
+(`cli/debian/fez-mesh-controller-daemon.service`) running as a dedicated system user
+(`cli/debian/postinst` creates it). See `cli/debian/README.Debian` (also installed into the
+package itself) for the required post-install setup steps and why the unit doesn't autostart on
+install. Not wired into CI — `cargo deb -p fez-mesh-controller-cli` is a local/manual build for
+now.
 
 ## MeshCore protocol knowledge (verified against firmware source, not assumed)
 

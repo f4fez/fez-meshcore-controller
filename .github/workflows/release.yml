@@ -1,0 +1,81 @@
+name: Release packaging
+
+# Builds the Debian package (see cli/Cargo.toml's [package.metadata.deb] and
+# CLAUDE.md's "Debian packaging" section) for each supported architecture and
+# attaches it to the GitHub Release that triggered the run. Bump the
+# workspace version in Cargo.toml before tagging a release -- this workflow
+# packages whatever version is already there, it doesn't rewrite it.
+on:
+  release:
+    types: [published]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  deb:
+    name: Build & publish .deb (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: fez-meshcore-controller
+    strategy:
+      fail-fast: false
+      matrix:
+        # Native runners per architecture: no cross-compilation -- same
+        # matrix as ci.yml's test job.
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout fez-mesh-controller
+        uses: actions/checkout@v7
+        with:
+          path: fez-meshcore-controller
+
+      # Temporary: meshcore-rs is patched in locally via
+      # [patch.crates-io] in Cargo.toml (see the comment there) until PR #59
+      # is merged upstream and released. Checked out as a sibling directory
+      # so the relative `../meshcore-rs` path resolves the same way it does
+      # in local development -- cargo deb runs `cargo build` internally, so
+      # it needs this too (see CLAUDE.md's "Build requirement" section).
+      - name: Checkout meshcore-rs (temporary local patch)
+        uses: actions/checkout@v7
+        with:
+          repository: f4fez/meshcore-rs
+          ref: feature/raw-data-packet-handling
+          path: meshcore-rs
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev libdbus-1-dev
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fez-meshcore-controller
+          key: deb-${{ matrix.arch }}
+
+      # A release should only ever be cut from a commit that already passed
+      # ci.yml, but this is cheap insurance against packaging a broken build
+      # regardless of what commit the tag actually points at.
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build .deb package
+        run: cargo deb -p fez-mesh-controller-cli
+
+      - name: Upload .deb to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.event.release.tag_name }}" target/debian/*.deb --clobber
