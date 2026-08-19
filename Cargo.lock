@@ -711,16 +711,20 @@ dependencies = [
  "console",
  "crossterm",
  "dialoguer",
+ "dirs",
  "fez-mesh-controller-core",
  "futures",
  "indicatif",
  "meshcore-rs",
  "names",
  "ratatui",
+ "serde",
  "serde_json",
  "serialport",
+ "tempfile",
  "tokio",
  "tokio-util",
+ "toml",
 ]
 
 [[package]]

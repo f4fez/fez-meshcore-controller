@@ -26,6 +26,7 @@ use fez_mesh_controller_core::{Config, RepeaterStatus};
 use crate::format::{format_coords, format_last_seen};
 use crate::ipc_client::{connect_and_await_snapshot, IpcConnection};
 use crate::theme::{self, accent, muted};
+use crate::tui::repeater_filter::{repeater_group, RepeaterGroup};
 
 /// Prints every contact known to the daemon (registered or merely
 /// discovered) with the same status shown in the TUI's contact list.
@@ -326,11 +327,11 @@ fn print_repeaters(snap: &Snapshot) {
     contacts.sort_by_key(|c| std::cmp::Reverse(c.last_advert_unix));
 
     for c in contacts {
-        let (status_text, status_style) = match (c.repeater_status, c.registered) {
-            (Some(RepeaterStatus::Managed), _) => ("🛰️  managed", theme::success()),
-            (Some(RepeaterStatus::Supervised), _) => ("🛡️  supervised", accent()),
-            (Some(RepeaterStatus::Known), _) | (None, true) => ("✅ known", muted()),
-            (None, false) => ("🔍 discovered", theme::warning()),
+        let (status_text, status_style) = match repeater_group(c) {
+            RepeaterGroup::Managed => ("🛰️  managed", theme::success()),
+            RepeaterGroup::Supervised => ("🛡️  supervised", accent()),
+            RepeaterGroup::Known => ("✅ known", muted()),
+            RepeaterGroup::Discovered => ("🔍 discovered", theme::warning()),
         };
         println!(
             "   • {:<20} {:<14} {} {} {}",

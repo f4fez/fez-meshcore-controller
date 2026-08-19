@@ -32,6 +32,7 @@ use ratatui::Frame;
 use crate::format::{format_coords, format_last_seen, format_uptime, strip_flag_emoji};
 use crate::tui::app::{contact_advert_interval_secs, App, Page, RepeaterDetailView};
 use crate::tui::packet_group::{path_hop_hashes, PacketGroup};
+use crate::tui::repeater_filter::{repeater_group, RepeaterFilter, RepeaterGroup, RepeaterSort};
 
 const CYAN: Color = Color::Rgb(0x4d, 0xd0, 0xe1);
 const MAGENTA: Color = Color::Rgb(0xe0, 0x67, 0xf2);
@@ -90,6 +91,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 &app.packets,
                 &mut app.neighbours_list_state,
             );
+        }
+        if app.repeater_filter_open {
+            draw_repeater_filter_popup(frame, &app.repeater_filter, app.repeater_filter_cursor);
         }
     }
 
@@ -307,15 +311,37 @@ fn field_line(label: &str, value: impl Into<String>) -> Line<'static> {
     ])
 }
 
+/// A Repeaters table column header, marked with a "▾" when it's the
+/// column driving `App::repeater_filter`'s active sort (see
+/// [`draw_repeater_filter_popup`] for the popup that sets it) — distinct
+/// from the panel title's own "🔽 filtered" indicator, which signals a
+/// different thing (a type is hidden).
+fn column_header(label: &str, active: bool) -> String {
+    if active {
+        format!("{label} ▾")
+    } else {
+        label.to_string()
+    }
+}
+
 fn draw_repeaters(frame: &mut Frame, app: &mut App, area: Rect) {
     let contacts = app.sorted_contacts();
 
     let header = Row::new(vec![
-        Cell::from("Name"),
+        Cell::from(column_header(
+            "Name",
+            app.repeater_filter.sort == RepeaterSort::Name,
+        )),
         Cell::from("Status"),
         Cell::from("Prefix"),
-        Cell::from("Seen"),
-        Cell::from("Position"),
+        Cell::from(column_header(
+            "Seen",
+            app.repeater_filter.sort == RepeaterSort::LastHeard,
+        )),
+        Cell::from(column_header(
+            "Position",
+            app.repeater_filter.sort == RepeaterSort::Distance,
+        )),
     ])
     .style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD));
 
@@ -323,29 +349,29 @@ fn draw_repeaters(frame: &mut Frame, app: &mut App, area: Rect) {
         let prefix: String = c.public_key_prefix_hex.chars().take(8).collect();
         let name = strip_flag_emoji(&c.name);
 
-        let name_cell = match c.repeater_status {
-            Some(RepeaterStatus::Managed) => Cell::from(Line::from(vec![
+        let name_cell = match repeater_group(c) {
+            RepeaterGroup::Managed => Cell::from(Line::from(vec![
                 Span::raw("🛰️ "),
                 Span::styled(
                     name,
                     Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
                 ),
             ])),
-            Some(RepeaterStatus::Supervised) => Cell::from(Line::from(vec![
+            RepeaterGroup::Supervised => Cell::from(Line::from(vec![
                 Span::raw("🛡️ "),
                 Span::styled(
                     name,
                     Style::default().fg(MAGENTA).add_modifier(Modifier::BOLD),
                 ),
             ])),
-            _ => Cell::from(name),
+            RepeaterGroup::Known | RepeaterGroup::Discovered => Cell::from(name),
         };
 
-        let (status_text, status_color) = match (c.repeater_status, c.registered) {
-            (Some(RepeaterStatus::Managed), _) => ("🛰️ Managed", GREEN),
-            (Some(RepeaterStatus::Supervised), _) => ("🛡️ Supervised", MAGENTA),
-            (Some(RepeaterStatus::Known), _) | (None, true) => ("📟 Known", MUTED),
-            (None, false) => ("🔍 Discovered", YELLOW),
+        let (status_text, status_color) = match repeater_group(c) {
+            RepeaterGroup::Managed => ("🛰️ Managed", GREEN),
+            RepeaterGroup::Supervised => ("🛡️ Supervised", MAGENTA),
+            RepeaterGroup::Known => ("📟 Known", MUTED),
+            RepeaterGroup::Discovered => ("🔍 Discovered", YELLOW),
         };
         let status_cell = Cell::from(Span::styled(status_text, Style::default().fg(status_color)));
 
@@ -375,7 +401,15 @@ fn draw_repeaters(frame: &mut Frame, app: &mut App, area: Rect) {
             .add_modifier(Modifier::BOLD),
     )
     .highlight_symbol("➤ ")
-    .block(block(format!("👥 Repeaters ({})", contacts.len())));
+    .block(block(format!(
+        "👥 Repeaters ({}){}",
+        contacts.len(),
+        if app.repeater_filter.is_filtering() {
+            " 🔽 filtered"
+        } else {
+            ""
+        }
+    )));
 
     frame.render_stateful_widget(table, area, &mut app.contacts_state);
 }
@@ -1184,11 +1218,11 @@ fn draw_repeater_detail_popup(
             lines.push(field_line("  Type", adv_type_name(c.contact_type)));
             lines.push(field_line(
                 "  Status",
-                match (c.repeater_status, c.registered) {
-                    (Some(RepeaterStatus::Managed), _) => "managed",
-                    (Some(RepeaterStatus::Supervised), _) => "supervised",
-                    (Some(RepeaterStatus::Known), _) | (None, true) => "known",
-                    (None, false) => "discovered",
+                match repeater_group(c) {
+                    RepeaterGroup::Managed => "managed",
+                    RepeaterGroup::Supervised => "supervised",
+                    RepeaterGroup::Known => "known",
+                    RepeaterGroup::Discovered => "discovered",
                 },
             ));
             lines.push(field_line(
@@ -1419,6 +1453,7 @@ fn help_content(
                 ("k", "Toggle known status"),
                 ("s", "Toggle supervised status"),
                 ("d", "Delete repeater (press twice to confirm)"),
+                ("f", "Filter/sort repeaters"),
                 (
                     "Enter",
                     "Show repeater detail (status/telemetry/neighbours/regions)",
@@ -1470,6 +1505,117 @@ fn draw_help_popup(frame: &mut Frame, page: Page) {
     let popup = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .block(block(format!("❓ Help — {page_name}")));
+    frame.render_widget(popup, area);
+}
+
+/// A focusable row in [`draw_repeater_filter_popup`]: `[x]`/`( )`-style
+/// prefix, highlighted background when `cursor` points at `index`.
+fn filter_row(index: usize, cursor: usize, marker: &str, label: &str) -> Line<'static> {
+    let style = if index == cursor {
+        Style::default()
+            .bg(Color::Rgb(0x2a, 0x3a, 0x4a))
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    Line::from(Span::styled(format!("  {marker} {label}"), style))
+}
+
+fn checkbox(checked: bool) -> &'static str {
+    if checked {
+        "[x]"
+    } else {
+        "[ ]"
+    }
+}
+
+fn radio(selected: bool) -> &'static str {
+    if selected {
+        "(•)"
+    } else {
+        "( )"
+    }
+}
+
+/// The `f`-key popup for the Repeaters panel's filter/sort configuration
+/// (`App::repeater_filter`). Three sections: which
+/// Managed/Supervised/Known/Discovered categories to show (rows 0-3), the
+/// sort order (rows 4-6), and whether to group by category before sorting
+/// (row 7) — `cursor` (`App::repeater_filter_cursor`) highlights the
+/// currently focused row. A `Paragraph` of manually built lines, like
+/// [`draw_help_popup`]/the repeater-detail popup's left column, rather than
+/// a `List` widget, since the section headers aren't focusable rows and a
+/// plain cursor index is simpler than coordinating a `ListState` around them.
+fn draw_repeater_filter_popup(frame: &mut Frame, filter: &RepeaterFilter, cursor: usize) {
+    let area = centered_rect(50, 55, frame.area());
+    frame.render_widget(Clear, area);
+
+    let mut lines = vec![section_title("Filter by type")];
+    lines.push(filter_row(
+        0,
+        cursor,
+        checkbox(filter.show_managed),
+        "🛰️  Managed",
+    ));
+    lines.push(filter_row(
+        1,
+        cursor,
+        checkbox(filter.show_supervised),
+        "🛡️  Supervised",
+    ));
+    lines.push(filter_row(
+        2,
+        cursor,
+        checkbox(filter.show_known),
+        "📟 Known",
+    ));
+    lines.push(filter_row(
+        3,
+        cursor,
+        checkbox(filter.show_discovered),
+        "🔍 Discovered",
+    ));
+
+    lines.push(Line::from(""));
+    lines.push(section_title("Sort by"));
+    lines.push(filter_row(
+        4,
+        cursor,
+        radio(filter.sort == RepeaterSort::LastHeard),
+        "Last heard",
+    ));
+    lines.push(filter_row(
+        5,
+        cursor,
+        radio(filter.sort == RepeaterSort::Name),
+        "Name",
+    ));
+    lines.push(filter_row(
+        6,
+        cursor,
+        radio(filter.sort == RepeaterSort::Distance),
+        "Distance to observer",
+    ));
+
+    lines.push(Line::from(""));
+    lines.push(section_title("Options"));
+    lines.push(filter_row(
+        7,
+        cursor,
+        checkbox(filter.group_by_type),
+        "Group by type before sorting",
+    ));
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[↑/↓] Move  [Enter/Space] Toggle  [f/Esc] Close",
+        Style::default().fg(MUTED),
+    )));
+
+    let popup = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(block("🔽 Filter & sort"));
     frame.render_widget(popup, area);
 }
 
@@ -2224,6 +2370,106 @@ mod render_tests {
         assert!(text.contains("Known"));
         assert!(!text.contains("Managed"));
         assert!(!text.contains("Supervised"));
+    }
+
+    #[test]
+    fn draw_repeaters_panel_marks_the_active_sort_column() {
+        for (sort, expected_header, other_headers) in [
+            (RepeaterSort::LastHeard, "Seen ▾", ["Name ▾", "Position ▾"]),
+            (RepeaterSort::Name, "Name ▾", ["Seen ▾", "Position ▾"]),
+            (RepeaterSort::Distance, "Position ▾", ["Name ▾", "Seen ▾"]),
+        ] {
+            let mut app = App::new();
+            app.repeater_filter.sort = sort;
+
+            let text = render(&mut app, 140, 20);
+
+            assert!(
+                text.contains(expected_header),
+                "expected {expected_header:?} for {sort:?}, got:\n{text}"
+            );
+            for other in other_headers {
+                assert!(
+                    !text.contains(other),
+                    "did not expect {other:?} for {sort:?}, got:\n{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn draw_repeaters_panel_header_has_no_filtered_indicator_by_default() {
+        let mut app = App::new();
+        app.snapshot.contacts = vec![contact("aabbccddeeff", false)];
+
+        let text = render(&mut app, 140, 20);
+
+        assert!(text.contains("Repeaters (1)"));
+        assert!(!text.contains("filtered"));
+    }
+
+    #[test]
+    fn draw_repeaters_panel_header_shows_filtered_indicator_when_a_type_is_hidden() {
+        let mut app = App::new();
+        app.snapshot.contacts = vec![contact("aabbccddeeff", false)];
+        app.repeater_filter.show_known = false;
+
+        let text = render(&mut app, 140, 20);
+
+        assert!(text.contains("filtered"));
+    }
+
+    #[test]
+    fn draw_repeater_filter_popup_shows_all_three_sections() {
+        let mut app = App::new();
+        app.open_repeater_filter();
+
+        let text = render(&mut app, 140, 40);
+
+        assert!(text.contains("Filter by type"));
+        assert!(text.contains("Managed"));
+        assert!(text.contains("Supervised"));
+        assert!(text.contains("Known"));
+        assert!(text.contains("Discovered"));
+        assert!(text.contains("Sort by"));
+        assert!(text.contains("Last heard"));
+        assert!(text.contains("Name"));
+        assert!(text.contains("Distance to observer"));
+        assert!(text.contains("Options"));
+        assert!(text.contains("Group by type before sorting"));
+    }
+
+    #[test]
+    fn draw_repeater_filter_popup_highlights_the_focused_row() {
+        let mut app = App::new();
+        app.open_repeater_filter();
+        app.repeater_filter_cursor = 0; // "Managed" filter row -- only
+                                        // appears once with no contacts in
+                                        // the snapshot behind the popup.
+
+        let buffer = render_buffer(&mut app, 140, 40);
+
+        assert_eq!(
+            fg_of_text(&buffer, "Managed"),
+            Some(Color::White),
+            "the focused row should render in the highlighted style"
+        );
+        let (x, y) = (
+            text_col(&buffer, "Managed").expect("Managed row"),
+            text_row(&buffer, "Managed").expect("Managed row"),
+        );
+        assert_eq!(buffer[(x, y)].bg, Color::Rgb(0x2a, 0x3a, 0x4a));
+    }
+
+    #[test]
+    fn draw_repeater_filter_popup_only_shows_on_the_dashboard_page() {
+        let mut app = App::new();
+        app.open_repeater_filter();
+        app.page = Page::PacketLog;
+
+        let text = render(&mut app, 140, 40);
+
+        assert!(!text.contains("Filter by type"));
     }
 
     #[test]

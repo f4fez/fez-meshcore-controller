@@ -14,6 +14,7 @@
 
 pub mod app;
 mod packet_group;
+pub(crate) mod repeater_filter;
 mod ui;
 
 use std::io::Stdout;
@@ -54,6 +55,7 @@ pub async fn run(config: &Config) -> Result<()> {
     tokio::spawn(ipc_task(config.daemon.socket_path.clone(), ui_tx, cmd_rx));
 
     let mut app = App::new();
+    app.repeater_filter = repeater_filter::load_repeater_filter_prefs();
     let mut term_events = EventStream::new();
 
     let result = run_loop(
@@ -105,6 +107,9 @@ async fn run_loop(
                             KeyCode::Esc if app.help_open => {
                                 app.help_open = false;
                             }
+                            KeyCode::Esc if app.repeater_filter_open => {
+                                app.close_repeater_filter();
+                            }
                             KeyCode::Esc if app.packet_detail.is_some() => {
                                 app.close_packet_detail();
                             }
@@ -113,6 +118,15 @@ async fn run_loop(
                             }
                             KeyCode::Esc => app.should_quit = true,
                             _ if app.help_open => {}
+                            _ if app.repeater_filter_open => match key.code {
+                                KeyCode::Down => app.select_next_filter_row(),
+                                KeyCode::Up => app.select_prev_filter_row(),
+                                KeyCode::Enter | KeyCode::Char(' ') => {
+                                    app.toggle_selected_filter_row();
+                                }
+                                KeyCode::Char('f') => app.close_repeater_filter(),
+                                _ => {}
+                            },
                             _ => match app.page {
                                 Page::Dashboard => match key.code {
                                     KeyCode::Char('r') => {
@@ -149,6 +163,9 @@ async fn run_loop(
                                     }
                                     KeyCode::Char('d') => {
                                         confirm_or_arm_delete(app, cmd_tx).await;
+                                    }
+                                    KeyCode::Char('f') => {
+                                        app.open_repeater_filter();
                                     }
                                     KeyCode::Enter => {
                                         request_repeater_detail(app, cmd_tx).await;

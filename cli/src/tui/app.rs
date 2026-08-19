@@ -23,6 +23,9 @@ use fez_mesh_controller_core::region;
 use ratatui::widgets::ListState;
 
 use super::packet_group::{group_packets, PacketGroup};
+use super::repeater_filter::{
+    repeater_group, save_repeater_filter_prefs, sort_repeaters, RepeaterFilter, RepeaterSort,
+};
 
 /// The repeater detail popup's content — see [`App::repeater_detail`].
 pub struct RepeaterDetailView {
@@ -93,6 +96,17 @@ pub struct App {
     /// list (the right-hand column) — reset whenever the popup is (re)opened.
     pub neighbours_list_state: ListState,
 
+    /// The Repeaters panel's active filter/sort configuration, configured
+    /// through the `f`-key popup (see [`Self::repeater_filter_open`]).
+    /// Persists for the whole TUI session — not reset on a fresh `Snapshot`.
+    pub repeater_filter: RepeaterFilter,
+    /// Whether the filter/sort popup is open.
+    pub repeater_filter_open: bool,
+    /// Which of the popup's 8 focusable rows (4 type checkboxes + 3 sort
+    /// options + the group-by-type checkbox) is focused — see
+    /// [`Self::toggle_selected_filter_row`].
+    pub repeater_filter_cursor: usize,
+
     /// Each configured region's precomputed transport key (name, key),
     /// derived once whenever a fresh `Snapshot` arrives (see
     /// [`Self::apply_snapshot`]) rather than per packet — see
@@ -124,6 +138,9 @@ impl App {
             help_open: false,
             repeater_detail: None,
             neighbours_list_state: ListState::default(),
+            repeater_filter: RepeaterFilter::default(),
+            repeater_filter_open: false,
+            repeater_filter_cursor: 0,
             region_keys: Vec::new(),
             channel_keys: channel::precompute_channel_keys(&[]),
         }
@@ -139,17 +156,19 @@ impl App {
     }
 
     /// Repeaters and room servers (the "Repeaters" panel's scope — plain
-    /// chat clients and sensors are excluded), sorted the way they're
-    /// displayed (most recently seen first), so table row indices line up
-    /// with selection/action logic.
+    /// chat clients and sensors are excluded), filtered and sorted per
+    /// [`Self::repeater_filter`] (default: everything shown, most recently
+    /// seen first) — table row indices line up with selection/action logic.
     pub fn sorted_contacts(&self) -> Vec<&ContactDto> {
         let mut contacts: Vec<&ContactDto> = self
             .snapshot
             .contacts
             .iter()
             .filter(|c| is_repeater_or_room(c.contact_type))
+            .filter(|c| self.repeater_filter.shows(repeater_group(c)))
             .collect();
-        contacts.sort_by_key(|c| std::cmp::Reverse(c.last_advert_unix));
+        let observer_position = self.snapshot.self_info.as_ref().map(|s| (s.lat, s.lon));
+        sort_repeaters(&mut contacts, &self.repeater_filter, observer_position);
         contacts
     }
 
@@ -367,6 +386,70 @@ impl App {
         };
         self.neighbours_list_state.select(Some(prev));
     }
+
+    /// Number of focusable rows in the filter/sort popup: 4 type
+    /// checkboxes + 3 sort options + 1 group-by-type checkbox.
+    const REPEATER_FILTER_ROW_COUNT: usize = 8;
+
+    /// Opens the filter/sort popup (`f` key). Closes the repeater detail
+    /// popup if it was open, so only one Dashboard popup shows at a time —
+    /// mirroring how F1's help popup closes the packet detail one.
+    pub fn open_repeater_filter(&mut self) {
+        self.repeater_detail = None;
+        self.repeater_filter_open = true;
+    }
+
+    /// Closes the filter/sort popup and persists its settings (see
+    /// `repeater_filter::save_repeater_filter_prefs`) so they survive a
+    /// TUI restart. Best-effort: a write failure is surfaced as a status
+    /// message rather than blocking the close.
+    pub fn close_repeater_filter(&mut self) {
+        self.repeater_filter_open = false;
+        if let Err(err) = save_repeater_filter_prefs(&self.repeater_filter) {
+            self.last_status = Some(format!(
+                "⚠️  failed to save repeater filter settings: {err}"
+            ));
+        }
+    }
+
+    /// Moves the filter/sort popup's focus to the next row, wrapping.
+    pub fn select_next_filter_row(&mut self) {
+        self.repeater_filter_cursor =
+            (self.repeater_filter_cursor + 1) % Self::REPEATER_FILTER_ROW_COUNT;
+    }
+
+    /// Moves the filter/sort popup's focus to the previous row, wrapping.
+    pub fn select_prev_filter_row(&mut self) {
+        self.repeater_filter_cursor = self
+            .repeater_filter_cursor
+            .checked_sub(1)
+            .unwrap_or(Self::REPEATER_FILTER_ROW_COUNT - 1);
+    }
+
+    /// Applies the currently focused row's action: flips a type's
+    /// visibility (rows 0-3), picks a sort order (rows 4-6), or flips
+    /// "group by type" (row 7). The filtered/sorted list can change shape
+    /// as a result, so the contact table's selection is reset to avoid
+    /// pointing at a since-shifted or now-hidden row.
+    pub fn toggle_selected_filter_row(&mut self) {
+        match self.repeater_filter_cursor {
+            0 => self.repeater_filter.show_managed = !self.repeater_filter.show_managed,
+            1 => self.repeater_filter.show_supervised = !self.repeater_filter.show_supervised,
+            2 => self.repeater_filter.show_known = !self.repeater_filter.show_known,
+            3 => self.repeater_filter.show_discovered = !self.repeater_filter.show_discovered,
+            4 => self.repeater_filter.sort = RepeaterSort::LastHeard,
+            5 => self.repeater_filter.sort = RepeaterSort::Name,
+            6 => self.repeater_filter.sort = RepeaterSort::Distance,
+            7 => self.repeater_filter.group_by_type = !self.repeater_filter.group_by_type,
+            _ => {}
+        }
+        let selection = if self.sorted_contacts().is_empty() {
+            None
+        } else {
+            Some(0)
+        };
+        self.contacts_state.select(selection);
+    }
 }
 
 /// Estimated interval (seconds) between this contact's two most recent
@@ -485,5 +568,100 @@ mod tests {
             advert_entry(1, 100, "ffeeddccbbaa"),
         ];
         assert_eq!(contact_advert_interval_secs(&packets, &c), None);
+    }
+
+    // --- repeater filter/sort -----------------------------------------------
+
+    #[test]
+    fn sorted_contacts_hides_a_filtered_out_group() {
+        let mut app = App::new();
+        app.snapshot.contacts = vec![
+            ContactDto {
+                repeater_status: Some(fez_mesh_controller_core::RepeaterStatus::Known),
+                ..contact("aabbccddeeff")
+            },
+            ContactDto {
+                repeater_status: Some(fez_mesh_controller_core::RepeaterStatus::Managed),
+                ..contact("112233445566")
+            },
+        ];
+        app.repeater_filter.show_known = false;
+
+        let contacts = app.sorted_contacts();
+
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].public_key_prefix_hex, "112233445566");
+    }
+
+    #[test]
+    fn sorted_contacts_sorts_by_distance_using_self_info() {
+        let mut app = App::new();
+        app.snapshot.self_info = Some(fez_mesh_controller_core::mesh::SelfInfoDto {
+            lat: 48.8566,
+            lon: 2.3522,
+            ..Default::default()
+        });
+        app.snapshot.contacts = vec![
+            ContactDto {
+                lat: 51.5074,
+                lon: -0.1278,
+                ..contact("far")
+            },
+            ContactDto {
+                lat: 48.86,
+                lon: 2.35,
+                ..contact("near")
+            },
+        ];
+        app.repeater_filter.sort = RepeaterSort::Distance;
+
+        let contacts = app.sorted_contacts();
+
+        assert_eq!(
+            contacts
+                .iter()
+                .map(|c| c.public_key_prefix_hex.as_str())
+                .collect::<Vec<_>>(),
+            vec!["near", "far"]
+        );
+    }
+
+    #[test]
+    fn toggle_selected_filter_row_flips_the_right_field() {
+        let mut app = App::new();
+        app.repeater_filter_cursor = 0;
+        app.toggle_selected_filter_row();
+        assert!(!app.repeater_filter.show_managed);
+
+        app.repeater_filter_cursor = 7;
+        app.toggle_selected_filter_row();
+        assert!(app.repeater_filter.group_by_type);
+
+        app.repeater_filter_cursor = 5;
+        app.toggle_selected_filter_row();
+        assert_eq!(app.repeater_filter.sort, RepeaterSort::Name);
+    }
+
+    #[test]
+    fn filter_row_cursor_wraps_at_both_ends() {
+        let mut app = App::new();
+        app.repeater_filter_cursor = 7;
+        app.select_next_filter_row();
+        assert_eq!(app.repeater_filter_cursor, 0);
+
+        app.select_prev_filter_row();
+        assert_eq!(app.repeater_filter_cursor, 7);
+    }
+
+    #[test]
+    fn open_repeater_filter_closes_the_repeater_detail_popup() {
+        let mut app = App::new();
+        app.open_repeater_detail_pending("aabbccddeeff".to_string(), "Repeater A".to_string());
+        assert!(app.repeater_detail.is_some());
+
+        app.open_repeater_filter();
+
+        assert!(app.repeater_detail.is_none());
+        assert!(app.repeater_filter_open);
     }
 }
